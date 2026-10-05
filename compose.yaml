@@ -1,0 +1,43 @@
+name: ai
+# Open WebUI：始终随 compose 启动，连接网关的 OpenAI 兼容 API
+# 所有服务显式绑定 0.0.0.0，局域网内任意设备可直接访问
+services:
+  # 模型网关：8000 端口唯一入口，暴露全部已下载模型，按需加载/空闲卸载（不动视频）
+  gateway:
+    image: ai-gateway:local
+    build:
+      context: .
+      dockerfile: docker/gateway/Dockerfile
+    container_name: ai-gateway
+    restart: unless-stopped
+    ports: ["0.0.0.0:8000:8000"]
+    environment:
+      - HOST_ROOT=${HOST_ROOT:-/home/pc/AI}
+      - PRELOAD=${LLM_NAME:-qwen3.8-27b}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./models.json:/opt/models.json:ro
+      # 容器内路径必须等于宿主机路径：网关要把该路径原样传给后端容器的 bind
+      - ${HOST_ROOT:-/home/pc/AI}/models/llm:${HOST_ROOT:-/home/pc/AI}/models/llm:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ai-open-webui
+    restart: unless-stopped
+    ports: ["0.0.0.0:3000:8080"]
+    environment:
+      - OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1
+      - OPENAI_API_KEY=${LLM_API_KEY:-sk-local}
+      - WEBUI_AUTH=false
+      - HOST=0.0.0.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui-data:/app/backend/data
+volumes:
+  open-webui-data:

@@ -1,0 +1,247 @@
+{
+  "meta": {
+    "gpu_mem_gb": 96,
+    "single_llm_budget_gb": 38,
+    "dual_llm_util": 0.88,
+    "video_reserve_gb": 8,
+    "coexist_video_reserve_gb": 46,
+    "safety_gap_gb": 4
+  },
+  "llm": {
+    "qwen3.8-27b": {
+      "repo": "Qwen/Qwen3.8-27B",
+      "engine": "vllm",
+      "min_gpus": 1,
+      "variants": {
+        "bf16": 54,
+        "fp8": 28
+      },
+      "ctx_default": 65536,
+      "desc": "日常默认：新一代通用+编程均衡，原生多模态，Apache-2.0",
+      "max_ctx": 262144,
+      "menu_brief": "[视觉·图像] 【日常全能】看图/长文档/写作/编程都行，256K上下文，速度与质量均衡",
+      "think": true,
+      "repo_fp8": "Qwen/Qwen3.8-27B-FP8",
+      "gw": {
+        "gpus": "1",
+        "util": 0.92,
+        "max_len": 262144
+      }
+    },
+    "qwen3.6-35b-a3b": {
+      "repo": "Qwen/Qwen3.6-35B-A3B",
+      "engine": "vllm",
+      "min_gpus": 1,
+      "variants": {
+        "bf16": 70,
+        "fp8": 37
+      },
+      "repo_fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "ctx_default": 262144,
+      "max_ctx": 262144,
+      "desc": "新一代全能+编程主力：SWE-bench 73.4%，原生视觉/视频，262K上下文，仅激活3B速度快",
+      "menu_brief": "[视觉·图+视频] 【编程主力】SWE-bench 73.4%，单卡~150tok/s飞快，还能与视频并行",
+      "think": true,
+      "gw": {
+        "gpus": "1",
+        "util": 0.92,
+        "max_len": 262144
+      }
+    },
+    "qwen3-coder-next": {
+      "repo": "Qwen/Qwen3-Coder-Next",
+      "repo_fp8": "Qwen/Qwen3-Coder-Next-FP8",
+      "engine": "vllm",
+      "min_gpus": 1,
+      "variants": {
+        "bf16": 159,
+        "fp8": 80
+      },
+      "ctx_default": 262144,
+      "max_ctx": 262144,
+      "desc": "编程真继任者：Qwen3-Next架构(80B级/激活~3B)，官方FP8仅80GB单卡可跑，替代480B-UD1.8",
+      "menu_brief": "[纯文本] 【编程极限】480B的正统继任，官方FP8仅80GB单卡可跑，agentic编程最强",
+      "think": false,
+      "gw": {
+        "gpus": "1",
+        "util": 0.92,
+        "max_len": 262144
+      }
+    },
+    "qwen3.8-flash-next": {
+      "repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "engine": "vllm",
+      "min_gpus": 2,
+      "variants": {
+        "fp8": 125
+      },
+      "ctx_default": 262144,
+      "desc": "双卡旗舰：125B MoE 每 token 激活 6B + 51B 嵌入可卸内存；新架构需 vLLM 最新版",
+      "arch_risk": "Qwen3.8-Flash 为 GDN/QSA 新架构，vLLM 不支持时会提示改用 qwen3-235b-fp8",
+      "max_ctx": 262144,
+      "menu_brief": "[纯文本] 【综合旗舰】最新一代125B，能力天花板，但独占双卡(视频暂停,x8下偏慢)",
+      "think": true,
+      "gw": {
+        "gpus": "0,1",
+        "util": 0.92,
+        "max_len": 262144
+      }
+    },
+    "qwen3-coder-30b-a3b": {
+      "repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "engine": "vllm",
+      "min_gpus": 1,
+      "variants": {
+        "bf16": 61,
+        "fp8": 16
+      },
+      "ctx_default": 131072,
+      "desc": "编程专精：agentic 编码专训，MoE 激活仅 3B，速度快",
+      "max_ctx": 262144,
+      "menu_brief": "[纯文本] 【备选】已被3.6-35B全面替代，仅作后备",
+      "think": false,
+      "gw": {
+        "gpus": "1",
+        "util": 0.92,
+        "max_len": 262144
+      }
+    }
+  },
+  "video": {
+    "wan2.2-t2v": {
+      "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "includes": [
+        "*t2v_high_noise*",
+        "*t2v_low_noise*"
+      ],
+      "dest": "diffusion_models",
+      "vram_480p_fp8": 32,
+      "vram_720p_bf16": 65,
+      "desc": "Wan2.2 文生视频 A14B（高噪+低噪双模型）"
+    },
+    "wan2.2-i2v": {
+      "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "includes": [
+        "*i2v*"
+      ],
+      "dest": "diffusion_models",
+      "vram_480p_fp8": 32,
+      "vram_720p_bf16": 65,
+      "desc": "Wan2.2 图生视频 A14B"
+    },
+    "wan2.2-s2v": {
+      "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "includes": [
+        "*s2v*"
+      ],
+      "dest": "diffusion_models",
+      "fallback_repo": "Wan-AI/Wan2.2-S2V-14B",
+      "vram_480p_fp8": 34,
+      "vram_720p_bf16": 68,
+      "desc": "Wan2.2-S2V 对口型：单图+音频生成说话/唱歌视频"
+    },
+    "infinitetalk": {
+      "repo": "Kijai/WanVideo_comfy",
+      "includes": [
+        "*InfiniteTalk*"
+      ],
+      "dest": "diffusion_models",
+      "extra": {
+        "wan2.1-i2v-480p": {
+          "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+          "includes": [
+            "*i2v_480p_14B_bf16*"
+          ],
+          "dest": "diffusion_models"
+        },
+        "wan2.1-vae": {
+          "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+          "includes": [
+            "split_files/vae/*"
+          ],
+          "dest": "vae"
+        },
+        "clip-vision-h": {
+          "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+          "includes": [
+            "split_files/clip_vision/*"
+          ],
+          "dest": "clip_vision"
+        },
+        "lightx2v-lora": {
+          "repo": "Kijai/WanVideo_comfy",
+          "includes": [
+            "*LightX2V*",
+            "*lightx2v*"
+          ],
+          "dest": "loras"
+        }
+      },
+      "vram_480p_fp8": 34,
+      "vram_720p_bf16": 68,
+      "desc": "InfiniteTalk：V2V 配音、双人对话、无限时长（基于 Wan2.1 I2V）"
+    },
+    "ltx-2": {
+      "repo": "Lightricks/LTX-Video",
+      "includes": [
+        "*ltx-2*",
+        "*LTX-2*"
+      ],
+      "dest": "checkpoints",
+      "license": true,
+      "vram_480p_fp8": 18,
+      "vram_720p_bf16": 34,
+      "desc": "LTX-2 快速草稿（速度向；需先在 HuggingFace 接受协议）"
+    }
+  },
+  "common": {
+    "umt5-xxl": {
+      "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "includes": [
+        "split_files/text_encoders/*umt5*"
+      ],
+      "dest": "text_encoders",
+      "desc": "UMT5-XXL 文本编码器（Wan 系共享）"
+    },
+    "wan-vae": {
+      "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "includes": [
+        "split_files/vae/*"
+      ],
+      "dest": "vae",
+      "desc": "Wan 2.1/2.2 VAE"
+    },
+    "clip-vision-h": {
+      "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "includes": [
+        "split_files/clip_vision/*"
+      ],
+      "dest": "clip_vision",
+      "desc": "CLIP ViT-H 视觉编码器"
+    },
+    "wav2vec2-zh": {
+      "repo": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn",
+      "includes": [
+        "*"
+      ],
+      "dest": "wav2vec/wav2vec2-large-xlsr-53-chinese-zh-cn",
+      "desc": "Wav2Vec2 中文音频编码器（对口型用）"
+    }
+  },
+  "image": {
+    "qwen-image": {
+      "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+      "version": "2512",
+      "variant": "fp8_e4m3fn",
+      "size_gb": 30,
+      "dest": {
+        "diffusion_models": "qwen_image_2512_fp8_e4m3fn.safetensors",
+        "text_encoders": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "desc": "Qwen-Image 2512 文生图（FP8 均衡版）：中文文字渲染强，1328² 原生，20步",
+      "workflow": "data/workflows/qwen_image_t2i_api.json",
+      "cli": "scripts/gen_image.py"
+    }
+  }
+}

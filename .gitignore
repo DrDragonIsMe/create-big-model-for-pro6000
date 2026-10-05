@@ -1,0 +1,21 @@
+# 机密（绝不提交）
+.env
+.hf_token
+
+# 由 scripts/menu.py 每次启动自动生成
+compose.selected.yaml
+
+# 模型与运行时数据：manage.sh download 可重新下载，运行时自动产生
+models/
+data/input/
+data/output/
+data/abtest/
+data/vllm-cache/
+.jobs/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 本机部署报告（含局域网地址等机器特定信息，如需公开可手动加入）
+部署报告.md
