@@ -24,7 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def post(path, payload, timeout=1800):
     req = urllib.request.Request(GW + path, json.dumps(payload).encode(),
                                  {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with OPENER.open(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 def reasoning_of(m):

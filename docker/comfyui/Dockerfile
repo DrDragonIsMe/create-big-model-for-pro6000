@@ -27,6 +27,10 @@ RUN cd /opt/ComfyUI/custom_nodes \
     && pip install -r ComfyUI-GGUF/requirements.txt \
     && pip install -r ComfyUI-VideoHelperSuite/requirements.txt
 
+# transformers 5.x wav2vec2 hidden_states 兼容补丁（InfiniteTalk 必需，2026-10-08 重建丢失后固化）
+COPY patch_wav2vec.py /tmp/patch_wav2vec.py
+RUN python /tmp/patch_wav2vec.py /opt/ComfyUI/custom_nodes/ComfyUI-WanVideoWrapper/multitalk/wav2vec2.py
+
 # sageattention >=2.2 才完整支持 Blackwell(sm_120)；装不上则运行时回退 PyTorch SDPA
 RUN (pip install "sageattention>=2.2.0" \
       || pip install --index-url https://mirrors.aliyun.com/pypi/simple/ "sageattention>=2.2.0" \

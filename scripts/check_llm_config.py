@@ -8,7 +8,8 @@
 2. 工具调用格式  — 模板是否输出 <function= XML 格式（gateway 固定 qwen3_xml parser）。
                   非 XML 格式（如 hermes JSON）会报警告，需改 gateway 的 parser。
 3. max_ctx      — 与 config.json 的 max_position_embeddings（含 YaRN 换算）对齐。
-4. gw.max_len   — 不得超过模型实际上限。
+4. gw.max_len   — 不得超过模型实际上限；gw.extra_args 里配置了 YaRN
+                  --hf-overrides 时，上限按扩展后（original × factor）计算。
 
 用法：
   python3 scripts/check_llm_config.py          # 只报告
@@ -28,6 +29,21 @@ def native_max_ctx(cfg):
     if rs.get("rope_type") == "yarn" and rs.get("factor"):
         return int(rs.get("original_max_position_embeddings", mpe) * rs["factor"])
     return mpe
+
+def yarn_override_limit(d):
+    """gw.extra_args 的 --hf-overrides 里配了 YaRN 时，返回扩展后上限，否则 0。"""
+    args = d.get("gw", {}).get("extra_args") or []
+    for i, a in enumerate(args):
+        if a == "--hf-overrides" and i + 1 < len(args):
+            try:
+                ov = json.loads(args[i + 1])
+            except Exception:
+                return 0
+            rs = (ov.get("text_config", {}).get("rope_parameters")
+                  or ov.get("rope_scaling") or {})
+            if rs.get("rope_type") == "yarn" and rs.get("factor"):
+                return int(rs.get("original_max_position_embeddings", 0) * rs["factor"])
+    return 0
 
 def check_model(name, d, fix, man):
     """返回问题数"""
@@ -78,11 +94,12 @@ def check_model(name, d, fix, man):
                     d["max_ctx"] = limit
                 problems += 1
             gw_len = int(d.get("gw", {}).get("max_len", 0))
-            if gw_len > limit:
-                log(f"[{name}] gw.max_len {gw_len} 超过模型上限 {limit}"
+            eff_limit = max(limit, yarn_override_limit(d))
+            if gw_len > eff_limit:
+                log(f"[{name}] gw.max_len {gw_len} 超过模型上限 {eff_limit}"
                     + (" → 已修正" if fix else ""))
                 if fix:
-                    d.setdefault("gw", {})["max_len"] = limit
+                    d.setdefault("gw", {})["max_len"] = eff_limit
                 problems += 1
     if "gw" not in d:
         log(f"[{name}] 提示: 缺少 gw 段（gpus/util/max_len），网关将用默认值")

@@ -25,7 +25,14 @@
       "gw": {
         "gpus": "1",
         "util": 0.92,
-        "max_len": 262144
+        "max_len": 900000,
+        "env": {
+          "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+        },
+        "extra_args": [
+          "--hf-overrides",
+          "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}"
+        ]
       }
     },
     "qwen3.6-35b-a3b": {
@@ -45,7 +52,14 @@
       "gw": {
         "gpus": "1",
         "util": 0.92,
-        "max_len": 262144
+        "max_len": 1010000,
+        "env": {
+          "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+        },
+        "extra_args": [
+          "--hf-overrides",
+          "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}"
+        ]
       }
     },
     "qwen3-coder-next": {
@@ -84,11 +98,19 @@
       "gw": {
         "gpus": "0,1",
         "util": 0.92,
-        "max_len": 262144
+        "max_len": 1000000,
+        "env": {
+          "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+        },
+        "extra_args": [
+          "--hf-overrides",
+          "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}"
+        ]
       }
     },
     "qwen3-coder-30b-a3b": {
       "repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "repo_fp8": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
       "engine": "vllm",
       "min_gpus": 1,
       "variants": {
@@ -103,7 +125,14 @@
       "gw": {
         "gpus": "1",
         "util": 0.92,
-        "max_len": 262144
+        "max_len": 524288,
+        "env": {
+          "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+        },
+        "extra_args": [
+          "--hf-overrides",
+          "{\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 2.0, \"original_max_position_embeddings\": 262144}}"
+        ]
       }
     }
   },
@@ -192,6 +221,49 @@
       "vram_480p_fp8": 18,
       "vram_720p_bf16": 34,
       "desc": "LTX-2 快速草稿（速度向；需先在 HuggingFace 接受协议）"
+    },
+    "minimax-h3": {
+      "repo": "Comfy-Org/MiniMax-H3",
+      "includes": [
+        "*fl2va_pruned_fp8_scaled*",
+        "*ref2va_pruned_fp8_scaled*"
+      ],
+      "dest": "diffusion_models",
+      "extra": {
+        "qwen3vl-32b-encoder": {
+          "repo": "Comfy-Org/MiniMax-H3",
+          "includes": [
+            "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+          ],
+          "dest": "text_encoders"
+        },
+        "h3-video-vae": {
+          "repo": "Comfy-Org/MiniMax-H3",
+          "includes": [
+            "vae/minimax_h3_video_vae_fp16.safetensors"
+          ],
+          "dest": "vae"
+        },
+        "h3-audio-vae": {
+          "repo": "Comfy-Org/MiniMax-H3",
+          "includes": [
+            "vae/minimax_h3_audio_vae_fp32.safetensors"
+          ],
+          "dest": "vae"
+        },
+        "h3-turbo-loras": {
+          "repo": "Comfy-Org/MiniMax-H3",
+          "includes": [
+            "loras/*"
+          ],
+          "dest": "loras"
+        }
+      },
+      "vram_480p_fp8": 55,
+      "vram_720p_bf16": 85,
+      "desc": "MiniMax H3 文生/图生视频：33B 全模态，原生 32kHz 立体声，最长 15 秒",
+      "workflow": "data/workflows/minimax_h3_t2v_api.json",
+      "cli": "scripts/gen_video.py"
     }
   },
   "common": {

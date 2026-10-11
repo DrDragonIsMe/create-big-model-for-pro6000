@@ -43,7 +43,7 @@ def post(url, payload):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
-        return json.load(urllib.request.urlopen(req, timeout=60))
+        return json.load(OPENER.open(req, timeout=60))
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:800]
         sys.exit(f"HTTP {e.code}: {body}")
@@ -90,7 +90,7 @@ def main():
     # 5) 轮询
     t0 = time.time()
     while time.time() - t0 < 2400:
-        h = json.load(urllib.request.urlopen(f"{COMFY}/history/{pid}", timeout=30))
+        h = json.load(OPENER.open(f"{COMFY}/history/{pid}", timeout=30))
         if pid in h:
             outs = h[pid]["outputs"]
             for n, o in outs.items():

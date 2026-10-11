@@ -30,10 +30,10 @@ for n, d in man["llm"].items():
     print(f"  {'★' if has(f'models/llm/{n}') else ' '} {n:<24} {vs:<18} {d['engine']}, min_gpus={d['min_gpus']}  {d['desc']}")
 print("== 视频 ==")
 for n, d in man["video"].items():
-    print(f"  {'★' if has(f'models/comfy/{d[\"dest\"]}') else ' '} {n:<24} 480p:{d['vram_480p_fp8']}GB 720p:{d['vram_720p_bf16']}GB  {d['desc']}")
+    print(f"  {'★' if has('models/comfy/' + d['dest']) else ' '} {n:<24} 480p:{d['vram_480p_fp8']}GB 720p:{d['vram_720p_bf16']}GB  {d['desc']}")
 print("== 共享组件 ==")
 for n, d in man["common"].items():
-    print(f"  {'★' if has(f'models/comfy/{d[\"dest\"]}') else ' '} {n:<24} -> comfy/{d['dest']}")
+    print(f"  {'★' if has('models/comfy/' + d['dest']) else ' '} {n:<24} -> comfy/{d['dest']}")
 EOF
   ;;
 

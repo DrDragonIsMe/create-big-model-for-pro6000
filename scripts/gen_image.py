@@ -9,6 +9,9 @@
 import argparse, json, os, sys, time
 import urllib.request
 
+# 本机 ComfyUI 直连：系统代理的 no_proxy 用 CIDR 写法，urllib 不认识，会误走代理导致 502
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 API = os.environ.get("COMFY_API", "http://127.0.0.1:8188")
 WF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                   "data/workflows/qwen_image_t2i_api.json")
@@ -18,14 +21,14 @@ def submit(wf):
     data = json.dumps({"prompt": wf}).encode()
     req = urllib.request.Request(f"{API}/prompt", data=data,
                                  headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req).read()).get("prompt_id")
+    return json.loads(OPENER.open(req).read()).get("prompt_id")
 
 
 def wait(pid, timeout=1800):
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
-            h = json.loads(urllib.request.urlopen(f"{API}/history/{pid}").read())
+            h = json.loads(OPENER.open(f"{API}/history/{pid}").read())
             if pid in h:
                 st = h[pid].get("status", {})
                 if st.get("status_str") == "error":

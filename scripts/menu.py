@@ -315,7 +315,7 @@ def write_compose(env, llm_def):
       - {ROOT}/models/comfy:/opt/ComfyUI/models
       - {ROOT}/data:/data
     command: >-
-      python3 main.py --listen 0.0.0.0 --port 8188
+      python3 main.py --listen 0.0.0.0 --port 8188 --highvram
       --output-directory /data/output --input-directory /data/input
     deploy:
       resources:
@@ -324,6 +324,10 @@ def write_compose(env, llm_def):
             - driver: nvidia
               device_ids: {yq_devices(env['COMFY_DEVICES'].split(','))}
               capabilities: [gpu]""")
+    # 无视频时 LLM 后端全由网关动态拉起，selected 里没有服务；
+    # 空映射写成 services: {}——裸 "services:" 会被 compose 以 "services must be a mapping" 拒绝
+    if len(lines) == 1:
+        lines[0] = "services: {}"
     with open("compose.selected.yaml", "w") as f:
         f.write("\n".join(lines) + "\n")
 
