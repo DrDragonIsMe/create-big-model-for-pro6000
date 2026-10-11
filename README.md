@@ -37,6 +37,8 @@ python3 scripts/gen_video.py "提示词"   # MiniMax H3 文生视频（--turbo �
 
 ## 新机器一键初始化
 
+完整部署流程（硬件要求 / 快速部署 / 手动分步 / 模型管理 / 踩坑）见 **`部署文档.md`**。
+
 ```bash
 ./scripts/init.sh                     # 交互模式（可选模型）
 ./scripts/init.sh --minimal           # 最小安装（27B + H3，~120GB）
@@ -129,6 +131,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - `models/llm` — 文本模型 ｜ `models/comfy` — 视频模型（ComfyUI 目录结构）
 - `scripts/` — init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
 - `模型切换说明.md` — 文本/视频切换与管理接口（客户端操作依据）
+- `部署文档.md` — 通用部署指南（硬件要求 / 一键或手动部署 / 踩坑）
 - `data/output` — 生成结果输出目录
 
 ## 注意
