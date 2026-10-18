@@ -1,0 +1,17 @@
+{
+  "name": "dracula",
+  "colors": {
+    "header": {"fg": 235, "bg": 99},
+    "border": 67,
+    "dim": 243,
+    "accent": 117,
+    "ok": 113,
+    "warn": 214,
+    "crit": 204,
+    "mem": 124,
+    "cpu": 113,
+    "disk": 208,
+    "model": 141
+  },
+  "gpu": [99, 141, 117, 124]
+}

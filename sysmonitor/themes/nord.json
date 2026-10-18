@@ -1,0 +1,17 @@
+{
+  "name": "nord",
+  "colors": {
+    "header": {"fg": 234, "bg": 137},
+    "border": 67,
+    "dim": 102,
+    "accent": 117,
+    "ok": 150,
+    "warn": 180,
+    "crit": 167,
+    "mem": 109,
+    "cpu": 150,
+    "disk": 173,
+    "model": 147
+  },
+  "gpu": [137, 147, 117, 109]
+}

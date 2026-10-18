@@ -1,0 +1,17 @@
+{
+  "name": "tokyo-night",
+  "colors": {
+    "header": {"fg": 0, "bg": 111},
+    "border": 238,
+    "dim": 60,
+    "accent": 117,
+    "ok": 149,
+    "warn": 179,
+    "crit": 210,
+    "mem": 116,
+    "cpu": 149,
+    "disk": 215,
+    "model": 141
+  },
+  "gpu": [111, 141, 117, 116]
+}

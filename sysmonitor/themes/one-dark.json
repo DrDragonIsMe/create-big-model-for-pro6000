@@ -1,0 +1,17 @@
+{
+  "name": "one-dark",
+  "colors": {
+    "header": {"fg": 234, "bg": 66},
+    "border": 240,
+    "dim": 242,
+    "accent": 75,
+    "ok": 113,
+    "warn": 172,
+    "crit": 167,
+    "mem": 109,
+    "cpu": 113,
+    "disk": 173,
+    "model": 141
+  },
+  "gpu": [66, 141, 75, 109]
+}

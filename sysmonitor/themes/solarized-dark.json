@@ -1,0 +1,17 @@
+{
+  "name": "solarized-dark",
+  "colors": {
+    "header": {"fg": 234, "bg": 33},
+    "border": 66,
+    "dim": 65,
+    "accent": 38,
+    "ok": 108,
+    "warn": 136,
+    "crit": 124,
+    "mem": 73,
+    "cpu": 108,
+    "disk": 130,
+    "model": 141
+  },
+  "gpu": [33, 141, 38, 73]
+}

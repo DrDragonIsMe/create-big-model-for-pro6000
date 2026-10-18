@@ -1,0 +1,17 @@
+{
+  "name": "catppuccin-mocha",
+  "colors": {
+    "header": {"fg": 235, "bg": 147},
+    "border": 238,
+    "dim": 246,
+    "accent": 117,
+    "ok": 152,
+    "warn": 222,
+    "crit": 210,
+    "mem": 116,
+    "cpu": 152,
+    "disk": 216,
+    "model": 141
+  },
+  "gpu": [147, 141, 117, 116]
+}

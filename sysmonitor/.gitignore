@@ -1,0 +1,7 @@
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 截图输出
+sysmon_screenshot.txt

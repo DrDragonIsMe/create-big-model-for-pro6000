@@ -1,0 +1,17 @@
+{
+  "name": "gruvbox-dark",
+  "colors": {
+    "header": {"fg": 233, "bg": 94},
+    "border": 95,
+    "dim": 245,
+    "accent": 73,
+    "ok": 142,
+    "warn": 172,
+    "crit": 167,
+    "mem": 72,
+    "cpu": 142,
+    "disk": 173,
+    "model": 141
+  },
+  "gpu": [94, 141, 73, 72]
+}
