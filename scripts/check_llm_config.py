@@ -31,7 +31,8 @@ def native_max_ctx(cfg):
     return mpe
 
 def yarn_override_limit(d):
-    """gw.extra_args 的 --hf-overrides 里配了 YaRN 时，返回扩展后上限，否则 0。"""
+    """gw.extra_args 里配了 YaRN 时，返回扩展后上限，否则 0。
+    vLLM 走 --hf-overrides JSON；llama.cpp 走 --rope-scale N + --yarn-orig-ctx M。"""
     args = d.get("gw", {}).get("extra_args") or []
     for i, a in enumerate(args):
         if a == "--hf-overrides" and i + 1 < len(args):
@@ -43,6 +44,16 @@ def yarn_override_limit(d):
                   or ov.get("rope_scaling") or {})
             if rs.get("rope_type") == "yarn" and rs.get("factor"):
                 return int(rs.get("original_max_position_embeddings", 0) * rs["factor"])
+    # llama.cpp YaRN：--rope-scale N [--yarn-orig-ctx M]
+    try:
+        i = args.index("--rope-scale")
+        factor = float(args[i + 1])
+        if "--yarn-orig-ctx" in args:
+            orig = int(args[args.index("--yarn-orig-ctx") + 1])
+            if orig:
+                return int(orig * factor)
+    except Exception:
+        pass
     return 0
 
 def check_model(name, d, fix, man):
@@ -66,8 +77,12 @@ def check_model(name, d, fix, man):
         if os.path.exists(tc):
             tpl = json.load(open(tc, encoding="utf-8")).get("chat_template") or ""
     if not tpl:
-        log(f"[{name}] 警告: 找不到 chat_template，无法检测 think/工具格式")
-        problems += 1
+        if d.get("engine") == "llamacpp":
+            # GGUF 目录只有量化文件，think/工具格式以 models.json 声明为准，跳过校准
+            pass
+        else:
+            log(f"[{name}] 警告: 找不到 chat_template，无法检测 think/工具格式")
+            problems += 1
     else:
         # --- think ---
         actual_think = ("enable_thinking" in tpl) or ("<think>" in tpl)
@@ -101,6 +116,18 @@ def check_model(name, d, fix, man):
                 if fix:
                     d.setdefault("gw", {})["max_len"] = eff_limit
                 problems += 1
+    elif d.get("engine") == "llamacpp":
+        # GGUF 无 config.json：max_ctx / gw.max_len 以 models.json 声明为准；
+        # extra_args 配了 YaRN（--rope-scale）时按扩展后上限放行
+        gw_len = int(d.get("gw", {}).get("max_len", 0))
+        max_ctx = int(d.get("max_ctx", d.get("ctx_default", 0)))
+        eff_limit = max(max_ctx, yarn_override_limit(d))
+        if max_ctx and gw_len > eff_limit:
+            log(f"[{name}] gw.max_len {gw_len} 超过模型上限 {eff_limit}"
+                + (" → 已修正" if fix else ""))
+            if fix:
+                d.setdefault("gw", {})["max_len"] = eff_limit
+            problems += 1
     if "gw" not in d:
         log(f"[{name}] 提示: 缺少 gw 段（gpus/util/max_len），网关将用默认值")
     if not problems:

@@ -104,12 +104,15 @@ def compute(args, man, gpu_count, gpu_mem):
             star = "★" if llm_downloaded(n) else " "
             vs = " / ".join(f"{v}:{gb}GB" for v, gb in d["variants"].items())
             fit = pick_variant(d, budget)
-            mark = "" if fit else "  ✗ 当前卡数下单卡放不下（需双卡旗舰）"
+            full_cap = gmem - meta["safety_gap_gb"] - 2
+            full_fit = pick_variant(d, full_cap) if (gpu_count == 1 and not fit) else None
+            selectable = bool(fit) or bool(full_fit)
+            mark = "" if fit else ("  ⚠ 独占单卡（视频不可用）" if full_fit else "  ✗ 单卡放不下")
             risk = " ⚠" if d.get("arch_risk") else ""
             dep = " ✗已弃用" if d.get("deprecated") else ""
             brief = d.get("menu_brief", d.get("desc", ""))
             print(f"  {i}) {star} {n:<24} {vs:<20} {brief}{risk}{dep}{mark}")
-            if fit and not d.get("deprecated"):
+            if selectable and not d.get("deprecated"):
                 avail.append(n)
         while True:
             c = input("输入编号或名称 > ").strip()
@@ -141,14 +144,17 @@ def compute(args, man, gpu_count, gpu_mem):
         else:
             vbudget = round(gmem * meta["dual_llm_util"])
         variant = pick_variant(d, vbudget)
+        if variant is None and gpu_count == 1:
+            # 单卡独占：single 预算内装不下，退而求其次吃满整卡（视频不可共存）
+            variant = pick_variant(d, gmem - meta["safety_gap_gb"] - 2)
         if variant is None:
             sys.exit(f"错误：{llm_name} 的所有变体都超过当前显存预算，请换模型")
     vram = d["variants"][variant]
     engine = d["engine"]
     # 单卡/双卡分工模式下，非旗舰模型的变体必须单卡放得下
-    if gpu_count == 1 and vram > meta["single_llm_budget_gb"]:
-        sys.exit(f"错误：单卡共享模式要求 LLM ≤ {meta['single_llm_budget_gb']}GB，"
-                 f"{llm_name}:{variant} 为 {vram}GB，请换 FP8 变体或其他模型")
+    if gpu_count == 1 and vram > gmem - meta["safety_gap_gb"] - 2:
+        sys.exit(f"错误：单卡可用显存约 {gmem - meta['safety_gap_gb'] - 2}GB，"
+                 f"{llm_name}:{variant} 为 {vram}GB，请换更小的量化版或其他模型")
     if gpu_count >= 2 and d["min_gpus"] == 1 and vram > round(gmem * meta["dual_llm_util"]):
         sys.exit(f"错误：{llm_name}:{variant}（{vram}GB）单卡放不下，请选双卡旗舰模型")
 
@@ -157,13 +163,21 @@ def compute(args, man, gpu_count, gpu_mem):
     comfy_devices, llm_devices, tp = "0", "0", 1
     mem_util, tensor_split = None, None
     if gpu_count == 1:
-        mode = "single"
-        if vram > meta["single_llm_budget_gb"]:
-            sys.exit(f"错误：单卡共享模式要求 LLM ≤ {meta['single_llm_budget_gb']}GB，"
-                     f"{llm_name}:{variant} 为 {vram}GB，请换 FP8 变体或其他模型")
-        llm_devices = "0"
-        mem_util = round((vram + meta["safety_gap_gb"]) / gmem, 2)
-        free_video = gmem - vram - meta["safety_gap_gb"] - 2
+        if vram <= meta["single_llm_budget_gb"]:
+            mode = "single"
+            llm_devices = "0"
+            mem_util = round((vram + meta["safety_gap_gb"]) / gmem, 2)
+            free_video = gmem - vram - meta["safety_gap_gb"] - 2
+        elif vram <= gmem - meta["safety_gap_gb"] - 2:
+            # 单卡独占旗舰：模型吃满整卡，视频不可共存（与双卡旗舰同语义）
+            mode = "flagship"
+            llm_devices = "0"
+            mem_util = round((vram + meta["safety_gap_gb"]) / gmem, 2)
+            comfy_enabled = 0
+            free_video = 0
+        else:
+            sys.exit(f"错误：单卡可用显存约 {gmem - meta['safety_gap_gb'] - 2}GB，"
+                     f"{llm_name}:{variant} 为 {vram}GB，装不下")
     elif vram <= round(gmem * meta["dual_llm_util"]):
         mode = "dual"
         llm_devices = "1"
@@ -200,7 +214,8 @@ def compute(args, man, gpu_count, gpu_mem):
         est_tokens = int(kv_gb * 15300)  # 本机实测 ~15.2K tokens/GB（27B@96GB 混合架构）
         max_len = max(32768, min(ctx_cap, est_tokens))
     else:
-        max_len = d["ctx_default"]
+        # llamacpp：上下文即 --ctx-size，直接按 models.json 的 gw.max_len（已按 KV 余量配好）
+        max_len = int(d.get("gw", {}).get("max_len") or d["ctx_default"])
 
     # ---------- 第 2 级：视频（依赖 LLM 余量，✗ 灰化） ----------
     videos = man["video"]

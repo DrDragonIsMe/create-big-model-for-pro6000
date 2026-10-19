@@ -71,6 +71,10 @@ elif name in man["llm"]:
     else:
         tasks.append({"mode": "llm", "name": name, "repo": d["repo"],
                       "includes": d.get("gguf_include") and [d["gguf_include"]] or None})
+        # GGUF 模型的多模态投影器（mmproj），与主分片同仓库，进同一目录
+        if d.get("mmproj_include"):
+            tasks.append({"mode": "llm", "name": name, "repo": d["repo"],
+                          "includes": [d["mmproj_include"]]})
 else:
     sys.exit(f"错误：清单里没有 '{name}'，可用 manage.sh list 查看")
 print(json.dumps({"tasks": tasks}, ensure_ascii=False))
@@ -82,10 +86,9 @@ EOF
     -v "$PWD/models:/models" -v "$JOB:/job.json:ro" -v "$PWD/scripts:/opt:ro" \
     -e HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
     -e HF_TOKEN="${HF_TOKEN:-}" -e HF_HUB_ENABLE_HF_TRANSFER=1 \
-    -e HF_HUB_DISABLE_XET=1 \
     -e HF_HOME=/models/.hf-cache -e HOME=/tmp -e PIP_CACHE_DIR=/tmp/pip-cache \
     -e PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-    python:3.12-slim bash -c "pip install -q huggingface_hub hf_transfer && python3 /opt/hf_fetch.py /job.json"
+    python:3.12-slim bash -c "pip install -q huggingface_hub hf_transfer hf_xet && python3 /opt/hf_fetch.py /job.json"
   rm -f "$JOB"
   echo "==> 完成: $name"
   # LLM 下完后以模型文件为准自动校准 models.json（think / max_ctx / 工具格式）

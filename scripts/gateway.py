@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """AI 模型网关（常驻能力，非临时补救）
 
-暴露两种兼容 API（端口 8000）：
+暴露三种兼容 API（端口 8000）：
 • OpenAI   — /v1/models, /v1/chat/completions（原有）
 • Anthropic — /v1/messages, /v1/messages/count_tokens, /v1/messages/{model}（新增）
+• 管理     — /v1/gateway/status（状态）、/v1/gateway/unload_all（腾显存）、
+             /v1/gateway/switch（远程切换文本/视频，等价 start.sh --switch）
 
 内部规则：
 1. /v1/models 暴露全部已下载模型，而不是只暴露当前加载的那个
 2. 客户端按模型名请求：未加载 → 自动加载（请求挂起等待就绪）
 3. 显存放得下就并存（不限一卡一个，按模型名路由）：每卡可用空间按已加载模型的
    完整预算 util×total 扣减（含 KV cache 预留），新模型不侵占老模型的 KV 空间
-4. 任何卡都放不下时：卸载其它【空闲】的文本模型（in_flight==0，按最久未用）；
+4. 任何卡都放不下时：卸载其它【空闲】的模型（in_flight==0，文本按最久未用）；
    正忙的模型绝不驱逐，直接返回 503 让客户端稍后重试
-5. 永远不碰视频服务（ai-comfyui）与 WebUI；被视频挡住时返回明确 503，不静默降配
+5. 视频模型与文本模型平等：文本请求缺显存时，空闲的 ComfyUI（队列无任务，含模型
+   加载中判定）会被自动卸载其已加载模型（POST /free）让位；ComfyUI 有任务在跑则
+   503 等任务结束。卸载只释放模型权重，容器保留，下次视频任务自动重载。
 6. 上下文长度一律按模型原生上限（models.json 的 gw.max_len）配满，不降档
 7. 卸载只发生在"需要腾显存"时，不设空闲定时器
 
 运行环境：ai-gateway 容器，挂载 docker.sock 管理后端容器，--gpus all 提供 nvidia-smi。
-后端容器命名 ai-vllm-<model>，仅加入 ai_default 内网，不暴露宿主机端口。
+后端容器命名 ai-vllm-<model> / ai-llamacpp-<model>，仅加入 ai_default 内网，不暴露宿主机端口。
 所有 docker/nvidia-smi 同步调用均经 asyncio.to_thread 包裹，不阻塞事件循环。
 """
-import asyncio, json, os, subprocess, time
+import asyncio, fnmatch, json, os, re, subprocess, time, urllib.request
 from contextlib import asynccontextmanager
 
 import docker
@@ -31,9 +35,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 MODELS_JSON = os.environ.get("MODELS_JSON", "/opt/models.json")
 HOST_ROOT = os.environ.get("HOST_ROOT", "/home/pc/AI")
 VLLM_IMAGE = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:latest")
+LLAMACPP_IMAGE = os.environ.get("LLAMACPP_IMAGE", "ghcr.io/ggml-org/llama.cpp:server-cuda")
 NETWORK = os.environ.get("GW_NETWORK", "ai_default")
 PRELOAD = [m for m in os.environ.get("PRELOAD", "").split(",") if m]
 NEED_MARGIN_MB = 512  # vLLM 要求 空闲 >= util×total，再加安全余量，避免放行后启动崩溃
+COMFY_HOST = os.environ.get("COMFY_HOST", "host.docker.internal")  # 网关访问 ComfyUI 的宿主地址
 
 log = lambda *a: print("[gateway]", *a, flush=True)
 
@@ -42,6 +48,8 @@ http = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0))
 
 ops_lock = asyncio.Lock()      # 加载/卸载串行化
 backends = {}                  # name -> {container, gpus, util, in_flight, last_used, status}
+token_metrics_cache = {}       # name -> {time, prompt_total, generation_total, rate, metrics_ok, live}
+_no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 # ---------- 同步原语（全部经 to_thread 调用） ----------
@@ -72,19 +80,73 @@ def gpu_free():
     return r
 
 
+def comfy_containers():
+    """所有已知 ComfyUI 实例实况（含 stopped / 不存在）：
+    {container: {exists, status, port, gpus}}。port 为宿主端口；gpus 为该实例占用的 GPU。"""
+    out = {}
+    for cname in ("ai-comfyui", "ai-comfyui-gpu1"):
+        try:
+            c = dcli.containers.get(cname)
+        except docker.errors.NotFound:
+            out[cname] = {"exists": False, "status": None, "port": None, "gpus": []}
+            continue
+        port = None
+        for binds in (c.attrs.get("NetworkSettings", {}).get("Ports") or {}).values():
+            if binds:
+                port = binds[0].get("HostPort")
+                break
+        gpus = set()
+        for r in (c.attrs.get("HostConfig", {}).get("DeviceRequests") or []):
+            gpus.update(int(x) for x in (r.get("DeviceIDs") or []))
+        out[cname] = {"exists": True, "status": c.status, "port": port,
+                      "gpus": sorted(gpus)}
+    return out
+
+
+def comfy_instances():
+    """返回运行中的 ComfyUI 实例 [{container, port, gpus}]。
+    port 为宿主端口（网关经 COMFY_HOST 访问）；gpus 为该实例占用的 GPU。"""
+    out = []
+    for cname, info in comfy_containers().items():
+        if not info["exists"] or info["status"] != "running":
+            continue
+        out.append({"container": cname, "port": info["port"],
+                    "gpus": set(info["gpus"])})
+    return out
+
+
 def comfy_gpus():
-    """视频服务占用的 GPU（仅用于错误提示，绝不卸载它）"""
+    """视频服务占用的 GPU 集合（仅用于错误提示）"""
+    return {g for inst in comfy_instances() for g in inst["gpus"]}
+
+
+def comfy_queue_busy(port):
+    """ComfyUI 队列有任务（running/pending，含模型加载中）→ True。
+    访问不到（如容器刚起）按 busy 处理，避免误卸。"""
+    if not port:
+        return True
     try:
-        c = dcli.containers.get("ai-comfyui")
-        if c.status != "running":
-            return set()
-        req = c.attrs["HostConfig"].get("DeviceRequests") or []
-        ids = set()
-        for r in req:
-            ids.update(int(x) for x in (r.get("DeviceIDs") or []))
-        return ids
+        with urllib.request.urlopen(f"http://{COMFY_HOST}:{port}/queue", timeout=5) as r:
+            d = json.loads(r.read())
+        return bool(d.get("queue_running") or d.get("queue_pending"))
     except Exception:
-        return set()
+        return True
+
+
+def comfy_unload(port):
+    """卸载 ComfyUI 已加载模型（POST /free），进程保留，下次视频任务自动重载"""
+    if not port:
+        return
+    try:
+        req = urllib.request.Request(
+            f"http://{COMFY_HOST}:{port}/free",
+            data=json.dumps({"unload_models": True, "free_memory": True}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+        log(f"已卸载视频模型（{COMFY_HOST}:{port}/free）")
+    except Exception as e:
+        log(f"卸载视频模型失败（{COMFY_HOST}:{port}）: {e}")
 
 
 def _remove_container(name):
@@ -106,7 +168,374 @@ def _container_state(name):
         return None, ""
 
 
-def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env=None):
+def _http_get_text(url, timeout=0.8):
+    with _no_proxy_opener.open(url, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+_PROM_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\.|[^"\\])*)"')
+_PREFILL_RE = re.compile(
+    r"prompt processing, n_tokens\s*=\s*(\d+),\s*progress\s*=\s*([\d.]+),\s*"
+    r"t\s*=\s*([\d.]+)\s*s\s*/\s*([\d.]+) tokens per second"
+)
+
+
+def _llamacpp_prefill(backend):
+    """从 llama-server 日志尾部解析 prompt prefill 实时进度与吞吐。
+
+    prefill 阶段 /metrics 的 prompt/generation counter 都要等请求结束才更新，
+    但日志每秒打印 'prompt processing, n_tokens=..., progress=..., x tokens/second'。
+    """
+    try:
+        c = dcli.containers.get(backend["container"])
+        logs = c.logs(tail=300, since=int(time.time()) - 30).decode(errors="replace")
+    except Exception:
+        return None
+    matches = list(_PREFILL_RE.finditer(logs))
+    if not matches:
+        return None
+    m = matches[-1]
+    return {"tokens": int(m.group(1)), "progress": float(m.group(2)),
+            "elapsed": float(m.group(3)), "rate": float(m.group(4))}
+
+
+
+def _parse_prometheus_metrics(text, wanted):
+    """提取 Prometheus counter 中每个 label 组合的最大值。"""
+    wanted = set(wanted)
+    samples = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "{" in line:
+            name, rest = line.split("{", 1)
+            labels_text, value_text = rest.rsplit("}", 1)
+            labels = dict(_PROM_LABEL_RE.findall(labels_text))
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name, value_text, labels = parts[0], parts[1], {}
+        if name not in wanted:
+            continue
+        try:
+            value = float(value_text.split()[0])
+        except (ValueError, IndexError):
+            continue
+        key = (name, tuple(sorted(labels.items())))
+        samples[key] = max(samples.get(key, value), value)
+    return list(samples.values())
+
+
+def _metric_total(text, names):
+    values = _parse_prometheus_metrics(text, names)
+    return sum(values) if values else None
+
+
+def _token_state(name):
+    now = time.time()
+    st = token_metrics_cache.setdefault(name, {"time": now, "prompt_total": 0.0,
+                                               "generation_total": 0.0,
+                                               "generation_rate": 0.0,
+                                               "prompt_rate": 0.0,
+                                               "metrics_ok": False, "live_seen": 0.0,
+                                               "live_start": None})
+    if st.get("live_start") and now > st["live_start"]:
+        st["generation_rate"] = max(0.0, st.get("live_seen", 0.0) /
+                                    max(now - st["live_start"], 1e-6))
+    return st
+
+
+def begin_live_tokens(name):
+    st = _token_state(name)
+    st["live_base_total"] = st.get("generation_total") or 0.0
+    st["live_start"] = time.time()
+    st["live_seen"] = 0.0
+    st["generation_rate"] = 0.0
+
+
+def add_live_tokens(name, count):
+    if count <= 0:
+        return
+    st = _token_state(name)
+    if st.get("live_start") is None:
+        st["live_start"] = time.time()
+    st["live_seen"] = st.get("live_seen", 0.0) + count
+    st["metrics_ok"] = True
+
+
+def finish_live_tokens(name, prompt_delta=None, generation_delta=None):
+    st = _token_state(name)
+    if generation_delta is not None:
+        st["generation_total"] = (st.get("live_base_total",
+                                         st.get("generation_total") or 0.0)
+                                  + float(generation_delta))
+    if prompt_delta is not None:
+        st["prompt_total"] = (st.get("prompt_total") or 0.0) + float(prompt_delta)
+    st["live_start"] = None
+    st["live_seen"] = 0.0
+    st["generation_rate"] = 0.0
+    st["metrics_ok"] = True
+
+
+def _sse_json_events(chunk):
+    text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            yield json.loads(payload)
+        except Exception:
+            continue
+
+
+def count_sse_tokens(name, chunk):
+    """从 OpenAI SSE 增量中实时估算 token；最终 usage chunk 负责校准。"""
+    for event in _sse_json_events(chunk):
+        usage = event.get("usage") or {}
+        completion = usage.get("completion_tokens")
+        if isinstance(completion, (int, float)):
+            st = _token_state(name)
+            confirmed = max(float(completion), st.get("live_seen", 0.0))
+            finish_live_tokens(name, usage.get("prompt_tokens"), confirmed)
+            continue
+        for choice in event.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                add_live_tokens(name, 1)
+            if delta.get("reasoning_content"):
+                add_live_tokens(name, 1)
+            for tool in delta.get("tool_calls") or []:
+                fn = tool.get("function") or {}
+                if fn.get("arguments"):
+                    add_live_tokens(name, 1)
+
+
+def _fetch_backend_metrics(backend):
+    text = _http_get_text(f"http://{backend['container']}:8000/metrics")
+    if backend.get("engine") == "llamacpp":
+        prompt = _metric_total(text, (
+            "llamacpp:prompt_tokens_total", "llama:prompt_tokens_total",
+            "llamacpp:preprocessed_tokens_total", "llama:preprocessed_tokens_total",
+            "llamacpp:tokens_processed_total", "llama:tokens_processed_total",
+        ))
+        generated = _metric_total(text, (
+            "llamacpp:tokens_predicted_total", "llama:tokens_predicted_total",
+            "llamacpp:predicted_tokens_total", "llama:predicted_tokens_total",
+            "llamacpp:generation_tokens_total", "llama:generation_tokens_total",
+            "llamacpp:tokens_generated_total", "llama:tokens_generated_total",
+        ))
+    else:
+        prompt = _metric_total(text, (
+            "vllm:prompt_tokens_total", "vllm:prompt_tokens",
+        ))
+        generated = _metric_total(text, (
+            "vllm:generation_tokens_total", "vllm:generation_tokens",
+        ))
+    if generated is None:
+        raise ValueError("generation token not found")
+    prefill = None
+    if backend.get("engine") == "llamacpp":
+        prefill = _llamacpp_prefill(backend)
+    return prompt, generated, prefill
+
+
+def _apply_backend_metrics(name, backend, metrics=None, error=False):
+    now = time.time()
+    item = _token_state(name)
+    if error:
+        item.update({"time": now, "metrics_ok": False})
+        if not item.get("live_start"):
+            item["generation_rate"] = 0.0
+        return item
+    prompt, generated, prefill = metrics
+    if prompt is not None:
+        item["prompt_total"] = prompt
+    item["metrics_ok"] = True
+    if prefill:
+        prev_tokens = item.get("prefill_tokens")
+        prev_seen = item.get("prefill_seen_at")
+        growing = prev_seen and prefill["tokens"] > (prev_tokens or 0)
+        first_seen_active = prev_seen is None and backend.get("in_flight", 0) > 0
+        active = bool(growing or first_seen_active)
+        if prefill["progress"] >= 0.999 and backend.get("in_flight", 0) == 0:
+            active = False  # prefill 已完成且请求结束：最后一帧不再显示 prefill
+        item["prefill_tokens"] = prefill["tokens"]
+        item["prefill_progress"] = prefill["progress"]
+        item["prefill_rate"] = prefill["rate"]
+        item["prefill_elapsed"] = prefill["elapsed"]
+        item["prefill_active"] = active
+        item["prefill_seen_at"] = now
+        # llama.cpp：prefill 速率来自 slot 日志（parallel=1 时与 decode 互斥）
+        item["prompt_rate"] = float(prefill["rate"] or 0.0) if active else 0.0
+    elif item.get("prefill_active") and (now - item.get("prefill_seen_at", 0)) > 10:
+        item["prefill_active"] = False
+        item["prefill_rate"] = 0.0
+        item["prompt_rate"] = 0.0
+    elif backend.get("engine") == "llamacpp":
+        item.setdefault("prompt_rate", 0.0)
+        if not item.get("prefill_active"):
+            item["prompt_rate"] = 0.0
+    if backend.get("engine") == "llamacpp":
+        total = max(float(generated), item.get("generation_total") or 0.0)
+        if item.get("live_start"):
+            item["live_base_total"] = max(item.get("live_base_total", 0.0),
+                                          float(generated))
+            total = max(total, item["live_base_total"] + item.get("live_seen", 0.0))
+        item["generation_total"] = total
+        if not item.get("live_start"):
+            item["generation_rate"] = 0.0
+    else:
+        # vLLM continuous batching：prefill 与 decode 可并发，
+        # 用 prompt_tokens_total / generation_tokens_total 各自差分得到独立速率
+        last_time = item.get("counter_time")
+        last_generated = item.get("counter_total")
+        last_prompt = item.get("counter_prompt")
+        item["counter_time"] = now
+        item["counter_total"] = generated
+        item["counter_prompt"] = prompt
+        if last_generated is not None and generated >= last_generated and last_time:
+            dt = now - last_time
+            item["generation_rate"] = (generated - last_generated) / dt if dt > 0 else 0.0
+        else:
+            item["generation_rate"] = 0.0
+        if last_prompt is not None and prompt is not None and prompt >= last_prompt and last_time:
+            dt = now - last_time
+            item["prompt_rate"] = (prompt - last_prompt) / dt if dt > 0 else 0.0
+        else:
+            item["prompt_rate"] = 0.0
+        item["generation_total"] = generated
+    item["time"] = now
+    return item
+
+
+async def sample_all_backend_tokens():
+    alive = set(backends)
+    for dead in set(token_metrics_cache) - alive:
+        token_metrics_cache.pop(dead, None)
+    names = [n for n, b in backends.items() if b.get("status") in ("ready", "adopted")]
+    if not names:
+        return {}
+
+    async def one(name):
+        try:
+            metrics = await asyncio.to_thread(_fetch_backend_metrics, backends[name])
+            return name, _apply_backend_metrics(name, backends[name], metrics=metrics)
+        except Exception:
+            return name, _apply_backend_metrics(name, backends[name], error=True)
+
+    return dict(await asyncio.gather(*(one(n) for n in names)))
+
+
+def _find_gguf(dirname, pattern=None):
+    """在模型目录里找 GGUF 主文件（多分片返回第一个 shard，llama.cpp 会自动续载）"""
+    root = os.path.join(HOST_ROOT, "models/llm", dirname)
+    cands = []
+    for dp, _, files in os.walk(root):
+        for f in sorted(files):
+            if not f.endswith(".gguf"):
+                continue
+            if f.startswith("mmproj-") or f.startswith("imatrix"):
+                continue
+            cands.append(os.path.join(dp, f))
+    if not cands:
+        raise RuntimeError(f"模型 {dirname} 目录下找不到 .gguf 文件")
+    if pattern:
+        for c in cands:
+            if fnmatch.fnmatch(os.path.basename(c), pattern) \
+                    or fnmatch.fnmatch(c.replace(root + os.sep, ""), pattern):
+                return c
+    return cands[0]
+
+
+_SHARD_RE = re.compile(r"^(?P<prefix>.*)-(\d+)-of-(?P<n>\d+)\.gguf$", re.IGNORECASE)
+
+
+def _gguf_weights_gb(dirname, gguf_include=None):
+    """模型权重总占用（GiB，1024 进制）：GGUF 全分片 + mmproj。
+
+    只做文件大小求和（网关挂载了 /models），不解析 GGUF 二进制。
+    多分片按 `-NNNNN-of-MMMMM.gguf` 命名约定求同一组全部分片。
+    """
+    first = _find_gguf(dirname, gguf_include)
+    d = os.path.dirname(first)
+    base = os.path.basename(first)
+    m = _SHARD_RE.match(base)
+    if m:
+        n = int(m.group("n"))
+        prefix = m.group("prefix")
+        want = {f"{prefix}-{i:05d}-of-{n:05d}.gguf" for i in range(1, n + 1)}
+        files = [os.path.join(d, f) for f in os.listdir(d) if f in want]
+        if not files:  # 兜底：前缀下所有匹配分片
+            files = [os.path.join(d, f) for f in os.listdir(d)
+                     if _SHARD_RE.match(f) and _SHARD_RE.match(f).group("prefix") == prefix]
+    else:
+        files = [first]
+    total = sum(os.path.getsize(f) for f in files)
+    mmproj = _find_mmproj(dirname)
+    if mmproj and os.path.exists(mmproj):
+        total += os.path.getsize(mmproj)
+    return total / 1024 ** 3
+
+
+def plan_llamacpp(gpus, weights_gb, max_len, gw=None):
+    """按当前硬件为 llama.cpp 后端规划并发参数（纯函数，不启动容器）。
+
+    返回 {parallel, ctx_size, per_slot_ctx, kv_budget_gb, weights_gb, cache_type}。
+    依据：KV cache 是 llama.cpp 用"权重占满后剩余显存"自动封顶的共享池，
+    --parallel N 不增加显存，只把 ctx-size 逻辑平分到 N 个 slot。
+    将来加卡：gpus 含多张卡时 total 取各卡之和，KV 预算近似翻倍 → slot 自动增多。
+    """
+    gw = gw or {}
+    util = float(gw.get("util", 0.92))
+    reserved_gb = float(gw.get("reserved_gb", 1.5))
+    slot_kv_gb = float(gw.get("slot_kv_gb", 3.0))
+    max_parallel = max(1, int(gw.get("max_parallel", 4)))
+    min_slot_ctx = int(gw.get("min_slot_ctx", 65536))
+
+    free = gpu_free()
+    total_gb = sum(free[g]["total"] for g in gpus if g in free) / 1024.0
+    kv_budget_gb = max(0.0, total_gb * util - float(weights_gb) - reserved_gb)
+
+    # 硬覆盖：parallel=N 指定则用之；parallel_auto=false 强制单 slot
+    forced = gw.get("parallel")
+    if forced is not None:
+        n = max(1, int(forced))
+    elif gw.get("parallel_auto") is False:
+        n = 1
+    else:
+        n = int(kv_budget_gb // slot_kv_gb) if slot_kv_gb > 0 else 1
+        n = max(1, min(max_parallel, n))
+        # 上下文地板：平分后每个 slot 不得小于 min_slot_ctx，否则下调 n
+        while n > 1 and max_len // n < min_slot_ctx:
+            n -= 1
+
+    cache_type = gw.get("kv_quant")  # 如 "q8_0"；默认 None = FP16，不自动量化
+    return {
+        "parallel": n,
+        "ctx_size": int(max_len),
+        "per_slot_ctx": int(max_len) // n,
+        "kv_budget_gb": round(kv_budget_gb, 2),
+        "weights_gb": round(float(weights_gb), 2),
+        "total_gb": round(total_gb, 2),
+        "cache_type": cache_type,
+        "tight": kv_budget_gb < slot_kv_gb,
+    }
+
+def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env=None,
+                 engine="vllm", gguf_include=None, plan=None):
+    kwargs = {}
+    if len(gpus) > 1:
+        kwargs["ipc_mode"] = "host"
+    if engine == "llamacpp":
+        _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args, kwargs,
+                      plan=plan)
+        return
     tp = len(gpus)
     cmd = [f"/models/{dirname}", "--served-model-name", name,
            "--tensor-parallel-size", str(tp),
@@ -123,9 +552,6 @@ def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env
     log(f"加载 {name}: dir={dirname} gpus={gpus} tp={tp} util={util} max_len={max_len} think={think}"
         + (f" extra_args={extra_args}" if extra_args else ""))
     _remove_container(f"ai-vllm-{name}")
-    kwargs = {}
-    if tp > 1:
-        kwargs["ipc_mode"] = "host"
     # 编译/JIT 缓存持久化到宿主机：容器每次重建，不挂载则 torch.compile 每次重跑（~30s）
     cache_host = f"{HOST_ROOT}/data/vllm-cache"
     os.makedirs(cache_host, exist_ok=True)
@@ -144,12 +570,83 @@ def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env
         **kwargs)
 
 
+def _find_mmproj(dirname):
+    """在模型目录顶层找多模态投影器 mmproj-*.gguf，没有返回 None"""
+    root = os.path.join(HOST_ROOT, "models/llm", dirname)
+    if not os.path.isdir(root):
+        return None
+    for f in sorted(os.listdir(root)):
+        if f.startswith("mmproj-") and f.endswith(".gguf"):
+            return os.path.join(root, f)
+    return None
+
+
+def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=None,
+                  kwargs=None, plan=None):
+    """启动 llama.cpp 后端（llama-server，OpenAI 兼容）。GGUF 多分片只传第一个文件，
+    llama.cpp 按命名约定自动续载其余分片。flag 以 2026 版 llama-server --help 实测为准：
+    -ngl 默认 auto（按显存自动分层）；工具调用由默认启用的 Jinja 聊天解析自动提取；
+    思考模型用 --reasoning-format deepseek 把思考放进 message.reasoning_content；
+    YaRN 扩上下文（如 --rope-scaling yarn --rope-scale 4.0）经 extra_args 透传。
+    --parallel / KV 量化由 plan（plan_llamacpp 按硬件自动规划）决定。"""
+    gguf = _find_gguf(dirname, gguf_include)
+    plan = plan or {"parallel": 1, "ctx_size": int(max_len), "per_slot_ctx": int(max_len),
+                    "cache_type": None, "kv_budget_gb": None, "weights_gb": None,
+                    "total_gb": None, "tight": False}
+    cmd = ["-m", f"/models/{dirname}/{os.path.relpath(gguf, os.path.join(HOST_ROOT, 'models/llm', dirname))}",
+           "--host", "0.0.0.0", "--port", "8000",
+           "--metrics",
+           "--ctx-size", str(plan["ctx_size"]),
+           "--parallel", str(plan["parallel"])]
+    if plan.get("cache_type"):
+        # KV cache 量化（默认不开；models.json gw.kv_quant 显式指定才加）
+        cmd += ["--cache-type-k", str(plan["cache_type"]),
+                "--cache-type-v", str(plan["cache_type"])]
+    if think:
+        # 思考模型：正文与推理分开返回（非思考模型不需要，强制反而可能吞正文）
+        cmd += ["--reasoning-format", "deepseek"]
+    mmproj = _find_mmproj(dirname)
+    if mmproj:
+        # 多模态投影器：图像/视频走同一 mtmd 管线（--video-fps 控制取帧率）
+        cmd += ["--mmproj",
+                f"/models/{dirname}/{os.path.relpath(mmproj, os.path.join(HOST_ROOT, 'models/llm', dirname))}"]
+    if extra_args:
+        # 如 YaRN 扩上下文（models.json 里按模型配置，与 vLLM 的 --hf-overrides 同源字段）
+        cmd += extra_args
+    log(f"加载 {name}（llamacpp）: gguf={gguf} mmproj={mmproj} gpus={gpus} max_len={max_len} think={think}"
+        + f" | 自动规划 parallel={plan['parallel']} 每slot_ctx={plan['per_slot_ctx']}"
+        + (f" 显存={plan.get('total_gb')}GB 权重={plan.get('weights_gb')}GB"
+           f" KV预算={plan.get('kv_budget_gb')}GB" if plan.get("total_gb") else "")
+        + (f" KV量化={plan['cache_type']}" if plan.get("cache_type") else "")
+        + (f" extra_args={extra_args}" if extra_args else ""))
+    if plan.get("tight") and plan["parallel"] <= 1 and not plan.get("cache_type"):
+        log(f"{name}: KV 预算紧张仅够单 slot；如需更高并发，可在 models.json 的 "
+            f"gw 设 kv_quant=q8_0（KV 显存减半，轻微精度影响）或加卡")
+    _remove_container(f"ai-llamacpp-{name}")
+    # 镜像自带的 HEALTHCHECK 探测 8080，而我们跑 8000——覆盖为 8000，避免误报 unhealthy
+    hc = docker.types.Healthcheck(
+        test=["CMD", "curl", "-f", "http://localhost:8000/health"],
+        interval=30000000000, timeout=5000000000, retries=3, start_period=30000000000)
+    dcli.containers.run(
+        LLAMACPP_IMAGE, command=cmd, name=f"ai-llamacpp-{name}", detach=True,
+        device_requests=[docker.types.DeviceRequest(
+            device_ids=[str(g) for g in gpus], capabilities=[["gpu"]])],
+        network=NETWORK, shm_size="16g",
+        environment={},
+        healthcheck=hc,
+        volumes={f"{HOST_ROOT}/models/llm": {"bind": "/models", "mode": "rw"}},
+        **kwargs)
+
+
 # ---------- 调度 ----------
 
 def evict_idle(need):
-    """need: {gpu: 需要空闲MB}。卸载空闲文本后端直到满足；返回仍不满足的 gpu 列表"""
+    """need: {gpu: 需要空闲MB}。卸载空闲文本后端（LRU）与空闲 ComfyUI 的已加载模型
+    直到满足；返回仍不满足的 gpu 列表。busy（in_flight>0 / 加载中 / 视频队列有任务）
+    的模型绝不驱逐。"""
     evicted = False
-    deadline = time.time() + 60  # 强杀容器后显存释放有延迟，最多等 60s
+    unloaded_comfy = set()  # 本轮回已调过 /free 的实例，避免重复卸载刷日志
+    deadline = time.time() + 90  # 强杀容器/卸载模型后显存释放有延迟，最多等 90s
     while True:
         free = gpu_free()
         lacking = [g for g, mb in need.items() if free.get(g, {}).get("free", 0) < mb]
@@ -160,23 +657,37 @@ def evict_idle(need):
              if b["in_flight"] == 0 and b["status"] in ("ready", "adopted")
              and any(g in lacking for g in b["gpus"])],
             key=lambda kv: kv[1]["last_used"])
-        if not cands:
-            if evicted and time.time() < deadline:
-                time.sleep(2)
+        if cands:
+            vname, victim = cands[0]
+            log(f"卸载空闲模型 {victim['container']}（释放 GPU {victim['gpus']}）")
+            _remove_container(victim["container"])
+            backends.pop(vname, None)
+            evicted = True
+            continue
+        # 文本都卸完还不够：卸载占用 lacking 卡的空闲 ComfyUI 模型（与文本平等）
+        freed = False
+        for inst in comfy_instances():
+            if not any(g in lacking for g in inst["gpus"]):
                 continue
-            return lacking
-        vname, victim = cands[0]
-        log(f"卸载空闲模型 {victim['container']}（释放 GPU {victim['gpus']}）")
-        _remove_container(victim["container"])
-        backends.pop(vname, None)
-        evicted = True
+            if comfy_queue_busy(inst["port"]):
+                continue  # 视频有任务在跑/加载中：绝不驱逐
+            if inst["port"] in unloaded_comfy:
+                continue
+            comfy_unload(inst["port"])
+            unloaded_comfy.add(inst["port"])
+            freed = True
+        evicted = evicted or freed
+        if evicted and time.time() < deadline:
+            time.sleep(2)
+            continue
+        return lacking
 
 
-async def wait_ready(name, timeout=900):
-    url = f"http://ai-vllm-{name}:8000/v1/models"
+async def wait_ready(name, cname, timeout=900):
+    url = f"http://{cname}:8000/v1/models"
     t0 = time.time()
     while time.time() - t0 < timeout:
-        st, tail = await asyncio.to_thread(_container_state, f"ai-vllm-{name}")
+        st, tail = await asyncio.to_thread(_container_state, cname)
         if st is None:
             raise RuntimeError("后端容器消失")
         if st != "running":
@@ -252,7 +763,7 @@ async def ensure_loaded(name, man):
         if b and b["status"] in ("loading", "adopted"):
             # 认领的/加载中的后端：先等健康确认；确认不了才重建
             try:
-                await wait_ready(name, timeout=180)
+                await wait_ready(name, b["container"], timeout=180)
                 b["status"] = "ready"
                 b["last_used"] = time.time()
                 log(f"{name} 健康确认通过")
@@ -261,11 +772,13 @@ async def ensure_loaded(name, man):
                 await asyncio.to_thread(_remove_container, b["container"])
                 backends.pop(name, None)
         d = man[name]
+        engine = d.get("engine", "vllm")
         gw = d.get("gw", {})
         gpus = [int(x) for x in gw.get("gpus", "1").split(",")]
         util = float(gw.get("util", 0.92))
         max_len = int(gw.get("max_len", d.get("max_ctx", d.get("ctx_default", 32768))))
         think = bool(d.get("think"))
+        cname = f"ai-{engine}-{name}"
         dirname = model_dir(name)
         if not dirname:
             raise RuntimeError(f"模型 {name} 未下载")
@@ -316,6 +829,16 @@ async def ensure_loaded(name, man):
                     for g in b["gpus"]:
                         if g in pot:
                             pot[g] += int(b.get("util", 0.92) * free[g]["total"])
+            # 视频与文本平等：占用目标卡且队列空闲的 ComfyUI 可被卸载，
+            # 卸载后该卡可用 = 总量 - 文本预算占用
+            for inst in await asyncio.to_thread(comfy_instances):
+                if any(g in pot for g in inst["gpus"]) \
+                        and not await asyncio.to_thread(comfy_queue_busy, inst["port"]):
+                    for g in inst["gpus"]:
+                        if g in pot:
+                            occ = sum(int(b.get("util", 0.92) * free[g]["total"])
+                                      for b in backends.values() if g in b["gpus"])
+                            pot[g] = max(pot[g], free[g]["total"] - occ)
             if evictable is None and all(pot[g] >= need[g] for g in gs):
                 evictable = (gs, need)
 
@@ -334,28 +857,45 @@ async def ensure_loaded(name, man):
                     f"模型 {bn} 正在处理请求（{backends[bn]['in_flight']} 个进行中），"
                     f"各卡显存已按预算分配给已加载模型，装不下 {name}。"
                     f"请等待 {bn} 完成后重试")
-            vg = await asyncio.to_thread(comfy_gpus)
-            vg &= set(all_gs)
             avail = budget_avail(all_gs)
             detail = ", ".join(
                 f"GPU{g} 可用 {avail[g]//1024}GB / 需要 {need_of([g])[g]//1024}GB"
                 for g in all_gs)
-            msg = f"显存不足：{detail}。已卸载所有空闲文本模型仍不够。"
-            if vg:
-                msg += (f" GPU {sorted(vg)} 被视频服务 ai-comfyui 占用（规则：不动视频）。"
-                        f" 如需运行 {name}，请先手动停止视频：docker stop ai-comfyui")
-            raise ResourceError(msg)
+            # 视频任务在跑/排队（含模型加载中）且占目标卡：等它结束，不驱逐繁忙服务
+            busy_comfy = [inst for inst in await asyncio.to_thread(comfy_instances)
+                          if inst["gpus"] & set(all_gs)
+                          and await asyncio.to_thread(comfy_queue_busy, inst["port"])]
+            if busy_comfy:
+                b = busy_comfy[0]
+                raise ResourceError(
+                    f"显存不足：{detail}。GPU {sorted(b['gpus'])} 上视频服务 "
+                    f"{b['container']} 有任务在运行/排队（含模型加载中），"
+                    f"按平等原则不驱逐繁忙服务。请等待视频任务结束后重试，"
+                    f"视频空闲时网关会自动卸载其模型让位")
+            raise ResourceError(
+                f"显存不足：{detail}。已卸载所有可卸载的空闲模型（文本与空闲视频）"
+                f"仍不够——真实显存不足，请换更小的模型/变体")
 
         if chosen[0] != gpus:
             log(f"{name}: 配置的 GPU{gpus} 放不下，改放 GPU{chosen[0]}（与已加载模型并存）")
         gpus = chosen[0]
 
+        # llama.cpp：按当前硬件（GPU 数/显存、权重体积）自动规划 --parallel 等
+        plan = None
+        if engine == "llamacpp":
+            weights_gb = await asyncio.to_thread(_gguf_weights_gb, dirname,
+                                                 d.get("gguf_include"))
+            plan = await asyncio.to_thread(plan_llamacpp, gpus, weights_gb, max_len, gw)
+
         await asyncio.to_thread(_run_backend, name, dirname, gpus, util, max_len,
-                                think, gw.get("extra_args"), gw.get("env"))
-        backends[name] = {"container": f"ai-vllm-{name}", "gpus": gpus, "util": util,
-                          "in_flight": 0, "last_used": time.time(), "status": "loading"}
+                                think, gw.get("extra_args"), gw.get("env"),
+                                engine, d.get("gguf_include"), plan)
+        backends[name] = {"container": cname, "gpus": gpus, "util": util,
+                          "in_flight": 0, "last_used": time.time(), "status": "loading",
+                          "engine": engine,
+                          "slots": plan["parallel"] if plan else None}
         try:
-            await wait_ready(name)
+            await wait_ready(name, cname)
         except Exception:
             backends.pop(name, None)
             raise
@@ -380,15 +920,31 @@ app = FastAPI(lifespan=lifespan)
 def adopt_existing():
     """网关重启后认领还活着的后端容器（标 adopted，可被卸载；首次请求时先等健康检查）"""
     for c in dcli.containers.list(all=True, filters={"status": ["running"]}):
-        if not c.name.startswith("ai-vllm-"):
+        engine = None
+        if c.name.startswith("ai-vllm-"):
+            engine, name = "vllm", c.name[len("ai-vllm-"):]
+        elif c.name.startswith("ai-llamacpp-"):
+            engine, name = "llamacpp", c.name[len("ai-llamacpp-"):]
+        else:
             continue
         try:
-            name = c.name[len("ai-vllm-"):]
             req = c.attrs["HostConfig"].get("DeviceRequests") or []
             gpus = [int(x) for r in req for x in (r.get("DeviceIDs") or [])]
+            slots = None
+            if engine == "llamacpp":
+                # 从已运行容器命令行恢复 --parallel，便于 sysmon 显示并发上限
+                argv = c.attrs.get("Config", {}).get("Cmd") or []
+                for i, a in enumerate(argv):
+                    if a in ("--parallel", "-np") and i + 1 < len(argv):
+                        try:
+                            slots = int(argv[i + 1])
+                        except ValueError:
+                            pass
+                        break
             backends[name] = {"container": c.name, "gpus": gpus, "util": 0.92,
-                              "in_flight": 0, "last_used": time.time(), "status": "adopted"}
-            log(f"认领现有后端 {name} gpus={gpus}（待健康确认）")
+                              "in_flight": 0, "last_used": time.time(),
+                              "status": "adopted", "engine": engine, "slots": slots}
+            log(f"认领现有后端 {name} gpus={gpus} engine={engine} slots={slots}（待健康确认）")
         except Exception as e:
             log(f"认领 {c.name} 失败（忽略，不影响网关启动）: {e}")
 
@@ -408,16 +964,37 @@ async def list_models():
 
 @app.get("/v1/gateway/status")
 async def status():
-    return {"backends": {k: dict(v) for k, v in backends.items()},
+    token_stats = await sample_all_backend_tokens()
+    out_backends = {}
+    for name, backend in backends.items():
+        item = dict(backend)
+        stat = token_stats.get(name)
+        if stat:
+            item["tokens"] = {
+                "prompt_total": stat.get("prompt_total"),
+                "generation_total": stat.get("generation_total"),
+                "generation_rate": stat.get("generation_rate", 0.0),
+                "prompt_rate": stat.get("prompt_rate", 0.0),
+                "updated_at": stat.get("time"),
+                "metrics_ok": stat.get("metrics_ok", False),
+                "prefill_active": stat.get("prefill_active", False),
+                "prefill_tokens": stat.get("prefill_tokens"),
+                "prefill_progress": stat.get("prefill_progress"),
+                "prefill_rate": stat.get("prefill_rate", 0.0),
+                "prefill_elapsed": stat.get("prefill_elapsed"),
+            }
+        else:
+            item["tokens"] = None
+        out_backends[name] = item
+    return {"backends": out_backends,
             "gpu_free": await asyncio.to_thread(gpu_free),
             "comfy_gpus": sorted(await asyncio.to_thread(comfy_gpus))}
 
 
-@app.post("/v1/gateway/unload_all")
-async def unload_all():
+async def _unload_idle_backends():
     """卸载所有空闲文本后端（in_flight==0），正忙的跳过。
-    网关保持常驻：下一个请求仍会按需自动加载对应模型。
-    与 evict_idle 同一原则——绝不驱逐在处理的模型，绝不碰视频服务。"""
+    与 evict_idle 同一原则——绝不驱逐在处理的模型；视频模型由 evict 流程按需卸载。
+    返回 (unloaded, busy)。"""
     unloaded, busy = [], []
     async with ops_lock:
         for name, b in list(backends.items()):
@@ -430,7 +1007,87 @@ async def unload_all():
             await asyncio.to_thread(_remove_container, b["container"])
             backends.pop(name, None)
             unloaded.append(name)
+    return unloaded, busy
+
+
+@app.post("/v1/gateway/unload_all")
+async def unload_all():
+    """卸载所有空闲文本后端（in_flight==0），正忙的跳过。
+    网关保持常驻：下一个请求仍会按需自动加载对应模型。"""
+    unloaded, busy = await _unload_idle_backends()
     return {"unloaded": unloaded, "busy": busy,
+            "gpu_free": await asyncio.to_thread(gpu_free)}
+
+
+@app.post("/v1/gateway/switch")
+async def gateway_switch(request: Request):
+    """远程切换"显存归谁"（等价 start.sh --switch，供局域网客户端直接调用）。
+
+    body: {"target": "video" | "llm", "model": "..."}
+      video: 启动 ComfyUI（已存在即拉起；ai-comfyui 容器缺失返回 409，提示先在
+             宿主机用 start.sh 初始化视频配置）+ 卸载全部空闲文本后端把显存让给视频
+      llm:   文本模式就绪确认（懒加载：不预热不占显存，模型等请求到达自动加载）；
+             model 可选，传了会校验是否在 models.json 清单中
+    网关与 Open WebUI 常驻不动，切换只决定"显存归谁"，不需要重启网关。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    target = body.get("target", "")
+    if target not in ("video", "llm", "text"):
+        return JSONResponse({"error": {"message": "target 必须是 video | llm",
+                                       "type": "invalid_request_error"}}, status_code=400)
+
+    comfy = await asyncio.to_thread(comfy_containers)
+
+    if target in ("llm", "text"):
+        model = body.get("model") or ""
+        if model:
+            man = await asyncio.to_thread(load_manifest)
+            if model not in man:
+                return JSONResponse({"error": {"message": f"模型 '{model}' 不存在",
+                                               "type": "invalid_model_error"}}, status_code=400)
+        return {"target": "llm", "model": model or None,
+                "backends": {k: dict(v) for k, v in backends.items()},
+                "comfy": comfy, "gpu_free": await asyncio.to_thread(gpu_free)}
+
+    # ---- video ----
+    if not comfy.get("ai-comfyui", {}).get("exists"):
+        return JSONResponse({"error": {"message":
+            "ai-comfyui 容器不存在，无法切到视频。请先在宿主机执行 "
+            "./scripts/start.sh --llm <模型> --video <视频模型> -y "
+            "初始化视频配置（--clean 后同样需要）",
+            "type": "switch_error"}}, status_code=409)
+
+    def _start_container(cname):
+        dcli.containers.get(cname).start()
+
+    started, already, skipped = [], [], []
+    for cname, info in comfy.items():
+        if not info["exists"]:
+            continue  # ai-comfyui-gpu1 缺失不擅自创建（与 start.sh 同规则）
+        if info["status"] == "running":
+            already.append(cname)
+            continue
+        try:
+            await asyncio.to_thread(_start_container, cname)
+            log(f"switch video: 已启动 {cname}")
+            started.append(cname)
+        except Exception as e:
+            log(f"switch video: 启动 {cname} 失败: {e}")
+            skipped.append({"container": cname, "error": str(e)})
+
+    # 卸载空闲文本后端，把显存让给视频（正忙的跳过并列出）
+    unloaded, busy = await _unload_idle_backends()
+    return {"target": "video",
+            "started": started, "already_running": already, "skipped": skipped,
+            "unloaded": unloaded, "busy": busy,
+            "comfy": await asyncio.to_thread(comfy_containers),
             "gpu_free": await asyncio.to_thread(gpu_free)}
 
 
@@ -455,6 +1112,23 @@ async def proxy(name, request: Request):
     qs = request.url.query
     url = f"http://{b['container']}:8000{request.url.path}" + (f"?{qs}" if qs else "")
     headers = {"content-type": request.headers.get("content-type", "application/json")}
+    client_stream = False
+    live_tokens = False
+    if request.method == "POST" and request.url.path == "/v1/chat/completions" \
+            and b.get("engine") == "llamacpp":
+        try:
+            payload = json.loads(body)
+            if isinstance(payload, dict):
+                client_stream = bool(payload.get("stream"))
+                payload["stream"] = True
+                opts = payload.setdefault("stream_options", {})
+                if isinstance(opts, dict):
+                    opts["include_usage"] = True
+                body = json.dumps(payload, ensure_ascii=False).encode()
+                live_tokens = True
+                begin_live_tokens(name)
+        except Exception:
+            live_tokens = False
     try:
         req = http.build_request(request.method, url, content=body, headers=headers)
         r = await http.send(req, stream=True)
@@ -494,16 +1168,90 @@ async def proxy(name, request: Request):
                                  headers={"content-type": r.headers.get(
                                      "content-type", "application/json")})
 
+    if live_tokens and not client_stream:
+        try:
+            return await _buffered_openai_response(name, r)
+        finally:
+            b["in_flight"] -= 1
+            b["last_used"] = time.time()
+
     async def gen():
         try:
             async for chunk in r.aiter_raw():
+                if live_tokens:
+                    count_sse_tokens(name, chunk)
                 yield chunk
         finally:
             await r.aclose()
+            if live_tokens and _token_state(name).get("live_start"):
+                finish_live_tokens(name)
             b["in_flight"] -= 1
             b["last_used"] = time.time()
     return StreamingResponse(gen(), status_code=r.status_code,
                              headers={"content-type": r.headers.get("content-type", "application/json")})
+
+
+async def _buffered_openai_response(name, r):
+    if r.status_code >= 400:
+        err = await r.aread()
+        await r.aclose()
+        try:
+            payload = json.loads(err or b"{}")
+        except Exception:
+            payload = {"error": {"message": err.decode(errors="replace")[:500]}}
+        return JSONResponse(payload, status_code=r.status_code,
+                            headers={"content-type": r.headers.get("content-type", "application/json")})
+
+    message = {"role": "assistant", "content": "", "reasoning_content": ""}
+    tool_parts = {}
+    finish_reason = None
+    response_id = model = fingerprint = None
+    usage = {}
+    try:
+        async for raw in r.aiter_raw():
+            count_sse_tokens(name, raw)
+            for event in _sse_json_events(raw):
+                response_id = event.get("id", response_id)
+                model = event.get("model", model)
+                fingerprint = event.get("system_fingerprint", fingerprint)
+                if event.get("usage"):
+                    usage = event["usage"]
+                for choice in event.get("choices") or []:
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        message["content"] += delta["content"]
+                    if delta.get("reasoning_content"):
+                        message["reasoning_content"] += delta["reasoning_content"]
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        part = tool_parts.setdefault(idx, {"id": "", "type": "function",
+                                                           "function": {"name": "", "arguments": ""}})
+                        part["id"] = tc.get("id", part["id"])
+                        fn = tc.get("function") or {}
+                        part["function"]["name"] += fn.get("name") or ""
+                        part["function"]["arguments"] += fn.get("arguments") or ""
+    finally:
+        await r.aclose()
+
+    if message["reasoning_content"]:
+        message["reasoning_content"] = message.pop("reasoning_content")
+    else:
+        message.pop("reasoning_content", None)
+    if tool_parts:
+        message["tool_calls"] = [tool_parts[k] for k in sorted(tool_parts)]
+    data = {
+        "id": response_id or f"chatcmpl-{name}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or name,
+        "system_fingerprint": fingerprint,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason or "stop",
+                     "logprobs": None}],
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    return JSONResponse(data, status_code=200,
+                        headers={"content-type": "application/json"})
 
 
 # ============================================================

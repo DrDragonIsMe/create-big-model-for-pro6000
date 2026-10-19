@@ -108,6 +108,35 @@
         ]
       }
     },
+    "qwen3.8-flash-next-iq3s": {
+      "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "engine": "llamacpp",
+      "min_gpus": 1,
+      "variants": {
+        "iq3s": 84
+      },
+      "gguf_include": "*IQ3_S*",
+      "mmproj_include": "*mmproj*",
+      "ctx_default": 262144,
+      "max_ctx": 262144,
+      "think": true,
+      "desc": "旗舰单卡版：GSQ-RCO IQ3_S 83.6G + mmproj，llama.cpp 加载，独占单卡（~200B MoE，支持图/视频，视频不可共存）",
+      "menu_brief": "[视觉·图+视频] 【旗舰单卡】200B级 IQ3_S 84G，单卡 96GB 独占，无视频共存",
+      "gw": {
+        "gpus": "1",
+        "util": 0.92,
+        "max_len": 1048576,
+        "extra_args": [
+          "--rope-scaling",
+          "yarn",
+          "--rope-scale",
+          "4.0",
+          "--yarn-orig-ctx",
+          "262144"
+        ],
+        "parallel": 1
+      }
+    },
     "qwen3-coder-30b-a3b": {
       "repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
       "repo_fp8": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",

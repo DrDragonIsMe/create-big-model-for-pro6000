@@ -8,7 +8,10 @@
 cd ~/AI
 ./scripts/start.sh          # 交互菜单：选 LLM（未下载自动先下载，已下载自动校准）→ 灰化不可用视频项 → 启动
 ./scripts/start.sh --switch video   # 快速切到视频服务（卸文本、起 ComfyUI）
-./scripts/start.sh --switch llm     # 快速切回文本服务（停 ComfyUI、预热模型）
+./scripts/start.sh --switch llm     # 快速切回文本服务（懒加载：不预热，请求到了自动加载）
+# 远程切换（局域网客户端无需 SSH，等价 --switch）：
+curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"video"}'
+curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"llm"}'
 ./scripts/start.sh --down           # 停止全部服务（只停不删；--clean 才删容器）
 ./scripts/manage.sh list    # 查看模型清单与下载状态
 ./scripts/manage.sh download <名称>       # 下载模型主仓库（LLM 或视频）
@@ -29,7 +32,7 @@ python3 scripts/gen_video.py "提示词"   # MiniMax H3 文生视频（--turbo �
 - LLM API（OpenAI 兼容）: http://localhost:8000/v1/chat/completions
 - ComfyUI 图形界面: http://localhost:8188（第二实例 8189）
 
-文本模型 ↔ 视频的切换、`--switch` 快速切换、显存腾挪、管理接口（`status` / `unload_all`）见 **`模型切换说明.md`**。
+文本模型 ↔ 视频的切换、`--switch` 快速切换（含远程 `gateway/switch` 接口）、显存腾挪、管理接口（`status` / `unload_all` / `switch`）见 **`模型切换说明.md`**。
 
 ## 插拔显卡后
 
@@ -73,6 +76,7 @@ sudo ./scripts/install-prereqs.sh   # ① Docker + NVIDIA Container Toolkit（�
 | 模型 | 实际上限 | 说明 |
 |---|---|---|
 | qwen3.8-flash-next | 1M | 官方 YaRN factor 4.0（混合注意力，KV 开销小） |
+| qwen3.8-flash-next-iq3s | 1M | llama.cpp 引擎 + YaRN factor 4.0（`--rope-scaling yarn`），与 vLLM 旗舰同语义；实测单卡 96GB 显存 85GB 可跑 |
 | qwen3.6-35b-a3b | 1.01M | 官方 YaRN factor 4.0；需 FP8 变体（bf16 下 KV 余量不够） |
 | qwen3.8-27b | 900K | 官方 YaRN factor 4.0；vLLM 实测 KV 上限 907088，1M 差 ~6GB |
 | qwen3-coder-30b-a3b | 512K | 稠密注意力 KV 开销大，factor 2.0；需 FP8 变体（bf16 下 512K 放不下） |
@@ -87,14 +91,15 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 | 模式 | 触发 | 说明 |
 |---|---|---|
 | 双卡分工 | 2 张卡（默认） | LLM 默认占 GPU1，视频占 GPU0，真并行；视频未用时第二个 LLM 可放 GPU0 并存（按模型名路由） |
-| 双卡旗舰 | 2 张卡 + 选大模型 | 480B/235B/Flash-Next 占双卡，start.sh 会自动停止运行中的 ComfyUI 腾显存（有任务在跑先提示确认）；下次选回视频时自动拉起 |
+| 双卡旗舰 | 2 张卡 + 选大模型 | qwen3.8-flash-next 占双卡，start.sh 会自动停止运行中的 ComfyUI 腾显存（有任务在跑先提示确认）；下次选回视频时自动拉起 |
 | 单卡共享 | 1 张卡 | LLM 限 ≤38GB（FP8），与视频分时共享显存 |
+| 单卡独占 | 1 张卡 + 选旗舰 | qwen3.8-flash-next-iq3s（GGUF 84G，llama.cpp）吃满整卡，视频自动灰化；`--switch video` 自动降回 27B 共存 |
 
 ## 已部署能力速查
 
 以下所有模型文件均已下载，**无需额外下载**即可使用。`start.sh` 和 `manage.sh` 检测到文件存在时会自动跳过下载。
 
-### 文本大模型（LLM，网关 vLLM）
+### 文本大模型（LLM，网关 vLLM / llama.cpp 双引擎）
 
 | 模型 | 精度 | 大小 | 卡数 | 默认推荐 |
 |---|---|---|---|---|
@@ -106,6 +111,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 | qwen3-coder-30b-a3b | FP8 | 30G | 1 卡 | ✅ |
 | qwen3-coder-30b-a3b | BF16 | 57G | 1 卡 | 备用 |
 | qwen3.8-flash-next | FP8 | 173G | 2 卡 | ✅ 需独占双卡 |
+| qwen3.8-flash-next-iq3s | GGUF IQ3_S + mmproj | 84G+0.9G | 1 卡（llama.cpp） | ✅ 单卡独占（200B 级旗舰单卡版，支持图像/视频理解） |
 
 ### 视频/图像模型（ComfyUI）
 
@@ -143,4 +149,4 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - 自动卸载只由文本请求触发；视频请求直连 ComfyUI 不经过网关，跑大视频任务前需手动腾显存：`curl -X POST http://localhost:8000/v1/gateway/unload_all`（正忙/加载中的模型跳过并在 `busy` 字段列出，网关保持常驻、请求来了自动重载）
 - 详细设计见方案文档（plans/miles-morales-siryn-batgirl.md）
 
-**存储空间**：LLM 模型共 ~448G（8 个变体），ComfyUI 视频模型共 ~434G，HF 缓存 ~332K。总计约 **882GB**。所有文件均已下载完毕，`manage.sh download` 检测到已有文件时会自动跳过。
+**存储空间**：LLM 模型共 ~532G（9 个变体），ComfyUI 视频模型共 ~434G，HF 缓存 ~330K。总计约 **966GB**。所有文件均已下载完毕，`manage.sh download` 检测到已有文件时会自动跳过。
