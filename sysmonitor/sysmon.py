@@ -865,7 +865,7 @@ def render(stdscr, interval, gateway=DEFAULT_GATEWAY, theme_warn=None):
             return
         elif key == ord("T"):  # 切换主题
             import theme as _theme
-            all_themes = [DEFAULT_THEME_NAME] + _list_available_themes()
+            all_themes = [_theme.DEFAULT_THEME_NAME] + _theme._list_available_themes()
             current_name = (THEME or {}).get("name")
             idx = (all_themes.index(current_name) + 1) % len(all_themes) if current_name in all_themes else 0
             new_theme = all_themes[idx]

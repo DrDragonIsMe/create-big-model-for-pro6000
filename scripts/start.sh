@@ -44,6 +44,11 @@ show_help() {
   # 局域网远程切换（客户端无需 SSH，网关常驻）:
   curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"video"}'
   curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"llm","model":"qwen3.8-27b"}'
+  # 客户端 agent 首次连接先学习网关能力/协商协议（GPU 数量、按卡加载、状态轮询）:
+  curl http://<服务器IP>:8000/v1/gateway/capabilities    # 说明接口：能力、协商步骤、模型目录
+  curl http://<服务器IP>:8000/v1/gateway/gpus            # GPU 发现：数量、每卡占用、谁占了卡
+  # 把模型加载到指定 GPU（wait=false 异步，返回 request_id 轮询 ops/{id}）:
+  curl -X POST http://<服务器IP>:8000/v1/gateway/load -H 'Content-Type: application/json' -d '{"model":"qwen3.8-27b","gpus":[0],"wait":false}'
 
 一键启动命令（全部可启动模型；缺文件会自动先下载；★=已下载 ○=未下载）:
 HELPEOF

@@ -12,6 +12,11 @@ cd ~/AI
 # 远程切换（局域网客户端无需 SSH，等价 --switch）：
 curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"video"}'
 curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"llm"}'
+# 客户端 agent 首次连接先学习网关能力/协商协议（GPU 数量、按卡加载、状态轮询）：
+curl http://<服务器IP>:8000/v1/gateway/capabilities    # 说明接口：能力、协商步骤、模型目录
+curl http://<服务器IP>:8000/v1/gateway/gpus            # GPU 发现：数量、每卡占用、谁占了卡
+# 把模型加载到指定 GPU（wait=false 异步返回 request_id，轮询 ops/{id} 拿加载状态）：
+curl -X POST http://<服务器IP>:8000/v1/gateway/load -H 'Content-Type: application/json' -d '{"model":"qwen3.8-27b","gpus":[0],"wait":false}'
 ./scripts/start.sh --down           # 停止全部服务（只停不删；--clean 才删容器）
 ./scripts/manage.sh list    # 查看模型清单与下载状态
 ./scripts/manage.sh download <名称>       # 下载模型主仓库（LLM 或视频）
@@ -20,6 +25,7 @@ curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: appli
 ./scripts/manage.sh check [--fix]  # 按模型文件校准清单（think/上下文/工具格式）
 ./scripts/manage.sh verify  # 通过网关逐模型实测：正文非空 + 工具调用解析
 python3 scripts/gen_video.py "提示词"   # MiniMax H3 文生视频（--turbo 加速，--first/--last 首/尾帧）
+python3 sysmonitor/sysmon.py            # 实时监控 GPU/吞吐/slots/显存（按 T 切换主题）
 ```
 
 非交互启动示例：
@@ -32,7 +38,7 @@ python3 scripts/gen_video.py "提示词"   # MiniMax H3 文生视频（--turbo �
 - LLM API（OpenAI 兼容）: http://localhost:8000/v1/chat/completions
 - ComfyUI 图形界面: http://localhost:8188（第二实例 8189）
 
-文本模型 ↔ 视频的切换、`--switch` 快速切换（含远程 `gateway/switch` 接口）、显存腾挪、管理接口（`status` / `unload_all` / `switch`）见 **`模型切换说明.md`**。
+文本模型 ↔ 视频的切换、`--switch` 快速切换（含远程 `gateway/switch` 接口）、显存腾挪、管理接口（`status` / `unload_all` / `switch`）、以及客户端 agent 的细粒度协商接口（`capabilities` 说明接口 / `gpus` GPU 发现 / `load` 指定 GPU 加载 / `ops` 状态轮询 / `unload` 按模型卸载）见 **`模型切换说明.md`**。
 
 ## 插拔显卡后
 
@@ -111,7 +117,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 | qwen3-coder-30b-a3b | FP8 | 30G | 1 卡 | ✅ |
 | qwen3-coder-30b-a3b | BF16 | 57G | 1 卡 | 备用 |
 | qwen3.8-flash-next | FP8 | 173G | 2 卡 | ✅ 需独占双卡 |
-| qwen3.8-flash-next-iq3s | GGUF IQ3_S + mmproj | 84G+0.9G | 1 卡（llama.cpp） | ✅ 单卡独占（200B 级旗舰单卡版，支持图像/视频理解） |
+| qwen3.8-flash-next-iq3s | GGUF IQ3_S + mmproj | 84G+0.9G | 1 卡（llama.cpp） | ✅ 单卡独占（parallel=2 自动规划，200B 级旗舰单卡版，支持图像/视频理解） |
 
 ### 视频/图像模型（ComfyUI）
 
@@ -136,6 +142,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - `models.json` — 模型清单（显存/卡数/下载源），新增模型唯一入口
 - `models/llm` — 文本模型 ｜ `models/comfy` — 视频模型（ComfyUI 目录结构）
 - `scripts/` — init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
+- `sysmonitor/` — 实时监控（curses/文本/截图 + 7 套主题，T 热键切换）
 - `模型切换说明.md` — 文本/视频切换与管理接口（客户端操作依据）
 - `部署文档.md` — 通用部署指南（硬件要求 / 一键或手动部署 / 踩坑）
 - `data/output` — 生成结果输出目录
@@ -146,6 +153,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - 下载走 hf-mirror 镜像站；LTX-2 需先在 HuggingFace 网页接受协议
 - 网关会钳制过大的 `max_tokens`（vLLM 对 prompt+输出超上下文一律 400，客户端会误判为"上下文溢出"提前 compact）；钳制设有保底预算（思考模型 16384 / 非思考 4096），低于保底说明上下文真满了，放开让 vLLM 原生 400 透传触发 compact，避免思考模型预算被钳光后只吐 thinking 报错
 - 多模型放置策略：装得下就并存（每卡按已加载模型的 util 预算扣减，为其保留 KV cache 空间）；任何卡都装不下才卸最久未用的空闲模型；正忙的模型绝不驱逐，直接返回 503 让客户端稍后重试
+- 客户端 agent 细粒度协商（2026-10-20 新增）：首次连接先 `GET /v1/gateway/capabilities` 学习能力与协议 → `GET /v1/gateway/gpus` 查 GPU 数量与占用 → `POST /v1/gateway/load {"model":...,"gpus":[0],"wait":false}` 指定 GPU 异步加载 → 轮询 `GET /v1/gateway/ops/{id}` 拿加载/切换状态（`transitions[]`）。推理请求也可带 `X-Gateway-Load-Async:1`（+可选 `X-Gateway-GPUs:0`）免预加载、202 异步协商。详见 `模型切换说明.md` 第五节。
 - 自动卸载只由文本请求触发；视频请求直连 ComfyUI 不经过网关，跑大视频任务前需手动腾显存：`curl -X POST http://localhost:8000/v1/gateway/unload_all`（正忙/加载中的模型跳过并在 `busy` 字段列出，网关保持常驻、请求来了自动重载）
 - 详细设计见方案文档（plans/miles-morales-siryn-batgirl.md）
 

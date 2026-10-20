@@ -6,6 +6,13 @@
 • Anthropic — /v1/messages, /v1/messages/count_tokens, /v1/messages/{model}（新增）
 • 管理     — /v1/gateway/status（状态）、/v1/gateway/unload_all（腾显存）、
              /v1/gateway/switch（远程切换文本/视频，等价 start.sh --switch）
+• 协商     — /v1/gateway/capabilities（说明接口，供客户端 agent 首次连接时学习）、
+             /v1/gateway/gpus（GPU 发现：数量/容量/占用/利用率）、
+             /v1/gateway/load（把模型加载到指定 GPU，wait=false 异步返回 request_id）、
+             /v1/gateway/unload（按模型细粒度卸载）、/v1/gateway/ops[/{id}]（操作状态轮询）。
+             推理请求还可带 X-Gateway-Load-Async:1（+可选 X-Gateway-GPUs:0）走 202 异步协商，
+             网关把 loading→ready / failed 状态机（transitions）返回给客户端。
+             详见 GET /v1/gateway/capabilities 的 negotiation 一节。
 
 内部规则：
 1. /v1/models 暴露全部已下载模型，而不是只暴露当前加载的那个
@@ -51,6 +58,66 @@ backends = {}                  # name -> {container, gpus, util, in_flight, last
 token_metrics_cache = {}       # name -> {time, prompt_total, generation_total, rate, metrics_ok, live}
 _no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+# 异步操作状态机（load/switch/unload）：客户端拿到 request_id 后轮询 GET /v1/gateway/ops/{id}，
+# 直到 status 收敛到 success/failed。transitions 记录每个 stage 变更，供客户端展示"切换/加载"进度。
+ops = {}          # request_id -> op dict
+ops_seq = 0
+OP_TTL = 3600     # 最近 1h 的操作保留（轮询结束即弃），防内存无限增长
+
+
+def _new_op(kind, model=None):
+    global ops_seq
+    ops_seq += 1
+    rid = f"{int(time.time() * 1000):x}-{ops_seq:04x}"
+    now = time.time()
+    op = {"request_id": rid, "kind": kind, "model": model, "status": "queued",
+          "stage": "queued", "detail": "已排队", "target_gpus": None,
+          "error": None, "error_type": None,
+          "created_at": now, "updated_at": now,
+          "transitions": [{"stage": "queued", "detail": "已排队", "at": now}]}
+    ops[rid] = op
+    _prune_ops()
+    return op
+
+
+def _prune_ops():
+    now = time.time()
+    for rid in [r for r, o in ops.items() if now - o["created_at"] > OP_TTL]:
+        ops.pop(rid, None)
+
+
+def _op_update(op, status=None, stage=None, detail="", error=None, error_type=None,
+               target_gpus=None):
+    op["status"] = status or op["status"]
+    op["stage"] = stage or op["stage"]
+    if detail:
+        op["detail"] = detail
+    if error is not None:
+        op["error"] = error
+    if error_type is not None:
+        op["error_type"] = error_type
+    if target_gpus is not None:
+        op["target_gpus"] = sorted(target_gpus)
+    op["updated_at"] = time.time()
+    op["transitions"].append({"stage": op["stage"], "detail": op["detail"],
+                              "at": op["updated_at"]})
+
+
+def _op_snapshot(op):
+    """操作快照（同步）：带当前后端实况；gpu_free 由端点另取（避免在事件循环内跑 nvidia-smi）。"""
+    snap = dict(op)
+    snap["transitions"] = list(op["transitions"])
+    name = op.get("model")
+    b = backends.get(name)
+    if name and b:
+        snap["backend"] = {"model": name, "container": b["container"],
+                           "gpus": list(b["gpus"]), "engine": b.get("engine"),
+                           "status": b["status"], "in_flight": b["in_flight"],
+                           "slots": b.get("slots")}
+    else:
+        snap["backend"] = None
+    return snap
+
 
 # ---------- 同步原语（全部经 to_thread 调用） ----------
 
@@ -77,6 +144,25 @@ def gpu_free():
     for line in out.stdout.strip().splitlines():
         i, free, total = [int(x) for x in line.split(",")]
         r[i] = {"free": free, "total": total}
+    return r
+
+
+def gpu_info():
+    """GPU 发现：{index: {index, total_mb, free_mb, used_mb, util_pct}}（含利用率）"""
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,memory.total,memory.free,memory.used,utilization.gpu",
+         "--format=csv,noheader,nounits"], capture_output=True, text=True)
+    r = {}
+    for line in out.stdout.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 5:
+            continue
+        try:
+            i, total, free, used, util = (int(p) for p in parts[:5])
+        except ValueError:
+            continue
+        r[i] = {"index": i, "total_mb": total, "free_mb": free,
+                "used_mb": used, "util_pct": util}
     return r
 
 
@@ -752,7 +838,7 @@ def clamp_max_tokens(name, man, body):
     return json.dumps(payload).encode()
 
 
-async def ensure_loaded(name, man):
+async def ensure_loaded(name, man, want_gpus=None, op=None):
     b = backends.get(name)
     if b and b["status"] == "ready":
         return b
@@ -762,6 +848,10 @@ async def ensure_loaded(name, man):
             return b
         if b and b["status"] in ("loading", "adopted"):
             # 认领的/加载中的后端：先等健康确认；确认不了才重建
+            if op:
+                _op_update(op, status="running", stage="loading",
+                           detail=f"{name} 已在加载/认领中，等待健康确认…",
+                           target_gpus=b["gpus"])
             try:
                 await wait_ready(name, b["container"], timeout=180)
                 b["status"] = "ready"
@@ -784,9 +874,21 @@ async def ensure_loaded(name, man):
             raise RuntimeError(f"模型 {name} 未下载")
 
         free = await asyncio.to_thread(gpu_free)
-        # 卡数适配：models.json 按双卡布局配置（LLM 在 GPU1），
-        # 单卡机上配置的卡不存在时回落到现有卡，否则全部请求 503
-        if any(g not in free for g in gpus):
+        if want_gpus:
+            # 客户端指定 GPU：硬性放置，不做静默改道；卡不存在/张数不足直接报错
+            missing = [g for g in want_gpus if g not in free]
+            if missing:
+                raise RuntimeError(
+                    f"请求的 GPU {missing} 不存在，本机只有 {sorted(free)}")
+            min_gpus = int(d.get("min_gpus", 1))
+            if len(want_gpus) < min_gpus:
+                raise RuntimeError(
+                    f"{name} 至少需要 {min_gpus} 张 GPU（min_gpus={min_gpus}），"
+                    f"收到 {len(want_gpus)} 张 {want_gpus}")
+            gpus = want_gpus
+        elif any(g not in free for g in gpus):
+            # 卡数适配：models.json 按双卡布局配置（LLM 在 GPU1），
+            # 单卡机上配置的卡不存在时回落到现有卡，否则全部请求 503
             if len(gpus) == 1 and free:
                 fb = sorted(free)[-1]
                 log(f"{name}: 配置的 GPU{gpus[0]} 不存在，改用 GPU{fb}")
@@ -800,8 +902,9 @@ async def ensure_loaded(name, man):
         # nvidia-smi 瞬时 free：给已加载模型完整保留其 KV cache 空间（vLLM 的
         # KV pool 就在 util 预算内），新模型不得侵占；同时取实际 free 下限，
         # 不遗漏 ComfyUI 等非网关管理的占用。
+        # 客户端指定 GPU 时只尝试该组卡（硬约束）；否则允许回落到其它空闲卡并存。
         cand_sets = [gpus]
-        if len(gpus) == 1:
+        if want_gpus is None and len(gpus) == 1:
             cand_sets += [[g] for g in sorted(free) if g not in gpus]
 
         def need_of(gs):
@@ -879,6 +982,10 @@ async def ensure_loaded(name, man):
         if chosen[0] != gpus:
             log(f"{name}: 配置的 GPU{gpus} 放不下，改放 GPU{chosen[0]}（与已加载模型并存）")
         gpus = chosen[0]
+        if op:
+            _op_update(op, status="running", stage="loading",
+                       detail=f"放置 GPU {sorted(gpus)}，启动后端容器…",
+                       target_gpus=gpus)
 
         # llama.cpp：按当前硬件（GPU 数/显存、权重体积）自动规划 --parallel 等
         plan = None
@@ -902,6 +1009,10 @@ async def ensure_loaded(name, man):
         backends[name]["status"] = "ready"
         backends[name]["last_used"] = time.time()
         log(f"{name} 就绪")
+        if op:
+            _op_update(op, status="running", stage="ready",
+                       detail=f"{name} 后端就绪（GPU {sorted(gpus)}）",
+                       target_gpus=gpus)
         return backends[name]
 
 
@@ -963,7 +1074,7 @@ async def list_models():
 
 
 @app.get("/v1/gateway/status")
-async def status():
+async def status(request: Request):
     token_stats = await sample_all_backend_tokens()
     out_backends = {}
     for name, backend in backends.items():
@@ -986,8 +1097,13 @@ async def status():
         else:
             item["tokens"] = None
         out_backends[name] = item
+    model = request.query_params.get("model")
+    if model:
+        # 单模型过滤：客户端轮询某个模型是否加载完成（status ready / unloaded）
+        out_backends = {model: out_backends[model]} if model in out_backends else {}
     return {"backends": out_backends,
             "gpu_free": await asyncio.to_thread(gpu_free),
+            "gpu_count": len(await asyncio.to_thread(gpu_free)),
             "comfy_gpus": sorted(await asyncio.to_thread(comfy_gpus))}
 
 
@@ -1019,54 +1135,19 @@ async def unload_all():
             "gpu_free": await asyncio.to_thread(gpu_free)}
 
 
-@app.post("/v1/gateway/switch")
-async def gateway_switch(request: Request):
-    """远程切换"显存归谁"（等价 start.sh --switch，供局域网客户端直接调用）。
-
-    body: {"target": "video" | "llm", "model": "..."}
-      video: 启动 ComfyUI（已存在即拉起；ai-comfyui 容器缺失返回 409，提示先在
-             宿主机用 start.sh 初始化视频配置）+ 卸载全部空闲文本后端把显存让给视频
-      llm:   文本模式就绪确认（懒加载：不预热不占显存，模型等请求到达自动加载）；
-             model 可选，传了会校验是否在 models.json 清单中
-    网关与 Open WebUI 常驻不动，切换只决定"显存归谁"，不需要重启网关。
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": {"message": "请求体不是合法 JSON",
-                                       "type": "invalid_request_error"}}, status_code=400)
-    if not isinstance(body, dict):
-        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象",
-                                       "type": "invalid_request_error"}}, status_code=400)
-    target = body.get("target", "")
-    if target not in ("video", "llm", "text"):
-        return JSONResponse({"error": {"message": "target 必须是 video | llm",
-                                       "type": "invalid_request_error"}}, status_code=400)
-
-    comfy = await asyncio.to_thread(comfy_containers)
-
+async def _do_switch(target, model):
+    """执行切换（同步可等/异步后台共用）：llm=确认文本模式，video=拉起 ComfyUI+卸载空闲文本后端。
+    校验（target 合法性、llm 的 model 是否存在、video 的 comfy 容器是否就绪）由调用方先做。"""
     if target in ("llm", "text"):
-        model = body.get("model") or ""
-        if model:
-            man = await asyncio.to_thread(load_manifest)
-            if model not in man:
-                return JSONResponse({"error": {"message": f"模型 '{model}' 不存在",
-                                               "type": "invalid_model_error"}}, status_code=400)
         return {"target": "llm", "model": model or None,
                 "backends": {k: dict(v) for k, v in backends.items()},
-                "comfy": comfy, "gpu_free": await asyncio.to_thread(gpu_free)}
-
-    # ---- video ----
-    if not comfy.get("ai-comfyui", {}).get("exists"):
-        return JSONResponse({"error": {"message":
-            "ai-comfyui 容器不存在，无法切到视频。请先在宿主机执行 "
-            "./scripts/start.sh --llm <模型> --video <视频模型> -y "
-            "初始化视频配置（--clean 后同样需要）",
-            "type": "switch_error"}}, status_code=409)
+                "comfy": await asyncio.to_thread(comfy_containers),
+                "gpu_free": await asyncio.to_thread(gpu_free)}
 
     def _start_container(cname):
         dcli.containers.get(cname).start()
 
+    comfy = await asyncio.to_thread(comfy_containers)
     started, already, skipped = [], [], []
     for cname, info in comfy.items():
         if not info["exists"]:
@@ -1091,11 +1172,384 @@ async def gateway_switch(request: Request):
             "gpu_free": await asyncio.to_thread(gpu_free)}
 
 
+@app.post("/v1/gateway/switch")
+async def gateway_switch(request: Request):
+    """远程切换"显存归谁"（等价 start.sh --switch，供局域网客户端直接调用）。
+
+    body: {"target": "video" | "llm", "model": "...", "wait": true}
+      video: 启动 ComfyUI（已存在即拉起；ai-comfyui 容器缺失返回 409，提示先在
+             宿主机用 start.sh 初始化视频配置）+ 卸载全部空闲文本后端把显存让给视频
+      llm:   文本模式就绪确认（懒加载：不预热不占显存，模型等请求到达自动加载）；
+             model 可选，传了会校验是否在 models.json 清单中
+      wait:  true（默认）= 同步执行完返回结果；false = 立即 202 返回 request_id，
+             客户端轮询 GET /v1/gateway/ops/{request_id} 直到 status=success/failed
+    网关与 Open WebUI 常驻不动，切换只决定"显存归谁"，不需要重启网关。
+    返回体含 _op（切换操作状态机：switching → done / failed）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    target = body.get("target", "")
+    if target not in ("video", "llm", "text"):
+        return JSONResponse({"error": {"message": "target 必须是 video | llm",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    wait = body.get("wait", True)
+    model = body.get("model") or ""
+
+    # 同步预校验：llm 的 model 是否存在；video 的 comfy 容器是否就绪
+    if target in ("llm", "text") and model:
+        man = await asyncio.to_thread(load_manifest)
+        if model not in man:
+            return JSONResponse({"error": {"message": f"模型 '{model}' 不存在",
+                                           "type": "invalid_model_error"}}, status_code=400)
+    if target == "video":
+        comfy = await asyncio.to_thread(comfy_containers)
+        if not comfy.get("ai-comfyui", {}).get("exists"):
+            return JSONResponse({"error": {"message":
+                "ai-comfyui 容器不存在，无法切到视频。请先在宿主机执行 "
+                "./scripts/start.sh --llm <模型> --video <视频模型> -y "
+                "初始化视频配置（--clean 后同样需要）",
+                "type": "switch_error"}}, status_code=409)
+
+    op = _new_op("switch", model or None)
+    _op_update(op, status="running", stage="switching", detail=f"切换目标 {target}")
+
+    async def _run_switch_op(op, target, model):
+        try:
+            result = await _do_switch(target, model)
+            _op_update(op, status="success", stage="done", detail=f"已切换到 {target}")
+            return result
+        except Exception as e:
+            _op_update(op, status="failed", stage="failed", detail=str(e), error=str(e),
+                       error_type="switch_error")
+            return None
+
+    if wait is False:
+        asyncio.create_task(_run_switch_op(op, target, model))
+        return JSONResponse({"status": "accepted", "target": target,
+                             "op": await _op_response(op)}, status_code=202)
+
+    result = await _run_switch_op(op, target, model)
+    result["op"] = await _op_response(op)
+    if op["status"] == "failed":
+        return JSONResponse({"error": {"message": op["error"], "type": "switch_error"},
+                             "op": result["op"]}, status_code=409)
+    return result
+
+
+async def _run_load(op, model, man, want_gpus):
+    """执行一次加载并把状态写回 op（同步可等/异步后台共用）。"""
+    _op_update(op, status="running", stage="loading",
+               detail=f"准备加载 {model}", target_gpus=want_gpus)
+    try:
+        b = await ensure_loaded(model, man, want_gpus=want_gpus, op=op)
+        _op_update(op, status="success", stage="ready",
+                   detail=f"{model} 就绪 on GPU {sorted(b['gpus'])}",
+                   target_gpus=b["gpus"])
+        return b
+    except ResourceError as e:
+        _op_update(op, status="failed", stage="failed", detail=str(e), error=str(e),
+                   error_type="insufficient_resources")
+    except Exception as e:
+        _op_update(op, status="failed", stage="failed", detail=f"加载失败: {e}", error=str(e),
+                   error_type="backend_error")
+    return None
+
+
+async def _op_response(op):
+    """操作快照（异步）：附上实时 GPU 空闲情况，供客户端判断下一步放哪。"""
+    snap = _op_snapshot(op)
+    snap["gpu_free"] = await asyncio.to_thread(gpu_free)
+    return snap
+
+
+async def _gpu_discovery():
+    """GPU 拓扑 + 每卡占用明细（谁占了这张卡）。"""
+    info = await asyncio.to_thread(gpu_info)
+    free = await asyncio.to_thread(gpu_free)
+    by_gpu = {}
+    for idx in sorted(info):
+        d = info[idx]
+        d["free_mb"] = free.get(idx, {}).get("free", d["free_mb"])
+        d["llm_backends"] = [
+            {"model": k, "container": v["container"], "gpus": list(v["gpus"]),
+             "engine": v.get("engine"), "status": v["status"], "in_flight": v["in_flight"]}
+            for k, v in backends.items() if idx in v["gpus"]]
+        by_gpu[idx] = d
+    comfy = {}
+    for cname, cinfo in (await asyncio.to_thread(comfy_containers)).items():
+        comfy[cname] = {"exists": cinfo["exists"], "status": cinfo["status"],
+                        "port": cinfo["port"], "gpus": list(cinfo["gpus"])}
+    return {"gpu_count": len(by_gpu), "gpus": by_gpu, "comfy": comfy,
+            "updated_at": time.time()}
+
+
+@app.get("/v1/gateway/gpus")
+async def gateway_gpus():
+    """GPU 发现：数量、每卡容量/实时占用/利用率，以及谁占用了这张卡。
+    客户端据此决定把模型加载到哪张卡（配合 POST /v1/gateway/load 的 gpus 字段）。"""
+    return await _gpu_discovery()
+
+
+@app.get("/v1/gateway/capabilities")
+async def gateway_capabilities():
+    """说明接口：供客户端 agent 首次连接时学习网关能力与协商协议。
+    返回支持的 API 风格、协商步骤、GPU 拓扑、模型目录（含加载状态）与注意事项。"""
+    man = await asyncio.to_thread(load_manifest)
+    models = {}
+    for name in man:
+        if not model_dir(name):
+            continue
+        d = man[name]
+        gw = d.get("gw", {})
+        b = backends.get(name)
+        models[name] = {
+            "engine": d.get("engine", "vllm"),
+            "min_gpus": int(d.get("min_gpus", 1)),
+            "context_window": int(gw.get("max_len", d.get("max_ctx",
+                                                          d.get("ctx_default", 32768)))),
+            "think": bool(d.get("think")),
+            "desc": d.get("desc", ""),
+            "loaded": bool(b and b["status"] == "ready"),
+            "backend_status": b["status"] if b else "unloaded",
+            "gpus": list(b["gpus"]) if b else None,
+        }
+    gpus = await _gpu_discovery()
+    return {
+        "name": "ai-gateway",
+        "version": "2.0",
+        "description": "局域网 AI 模型网关：OpenAI / Anthropic / Responses 兼容推理 + 按 GPU 协商加载。",
+        "protocol": "gateway-negotiation-v1",
+        "capabilities": {
+            "gpu_discovery": True,
+            "gpu_selection": True,
+            "async_load": True,
+            "load_status_polling": True,
+            "per_model_unload": True,
+            "video_switch": True,
+            "api_styles": ["openai-chat", "anthropic-messages", "openai-responses"],
+        },
+        "endpoints": [
+            {"method": "GET", "path": "/v1/gateway/capabilities",
+             "purpose": "本说明接口：网关能力、协商协议、GPU 拓扑与模型目录"},
+            {"method": "GET", "path": "/v1/gateway/gpus",
+             "purpose": "GPU 发现：数量、每卡容量/占用/利用率、谁占用了卡"},
+            {"method": "POST", "path": "/v1/gateway/load",
+             "purpose": "加载模型到指定 GPU；wait=false 异步返回 request_id 供轮询"},
+            {"method": "GET", "path": "/v1/gateway/ops/{request_id}",
+             "purpose": "查询加载/切换/卸载操作状态（轮询直到 status=success/failed）"},
+            {"method": "GET", "path": "/v1/gateway/ops",
+             "purpose": "最近操作列表（load/switch/unload）"},
+            {"method": "POST", "path": "/v1/gateway/unload",
+             "purpose": "按模型细粒度卸载释放显存"},
+            {"method": "POST", "path": "/v1/gateway/switch",
+             "purpose": "切换显存归属 text/video；wait=false 异步"},
+            {"method": "GET", "path": "/v1/gateway/status",
+             "purpose": "实时状态：各后端 in_flight/tokens、GPU 空闲、ComfyUI（支持 ?model= 过滤）"},
+            {"method": "GET", "path": "/v1/models",
+             "purpose": "OpenAI 兼容模型列表（含 loaded 标记）"},
+            {"method": "POST", "path": "/v1/chat/completions",
+             "purpose": "OpenAI 推理（未加载自动加载；带 X-Gateway-Load-Async 可 202 异步协商）"},
+            {"method": "POST", "path": "/v1/messages",
+             "purpose": "Anthropic Messages 推理"},
+            {"method": "POST", "path": "/v1/responses",
+             "purpose": "Responses API（自动识别 Anthropic / OpenAI 格式）"},
+        ],
+        "negotiation": {
+            "discover_gpus": "GET /v1/gateway/gpus  → 得到 gpu_count 与每卡 free_mb / 占用者",
+            "load_on_gpu": "POST /v1/gateway/load  body={'model':..., 'gpus':[0], 'wait':false}",
+            "poll_status": "GET /v1/gateway/ops/{request_id}  → 直到 status=success/failed",
+            "inference": "模型 ready 后正常调 /v1/chat/completions（GPU 已固化在该模型后端）",
+            "async_on_demand": "推理请求带 header X-Gateway-Load-Async:1（可选 X-Gateway-GPUs:0）→ 202 + request_id，轮询后再发",
+            "switch": "POST /v1/gateway/switch {'target':'video'|'llm','wait':false} 异步切换显存归属",
+        },
+        "gpus": gpus,
+        "models": models,
+        "notes": [
+            "gpus 字段传数组，如 [0] 或 [0,1]；多卡模型必须给足 min_gpus 张卡",
+            "load 的 gpus 为硬性指定：指定卡放不下时返回 503 并说明各卡可用量，不做静默改道",
+            "显存不足时网关会先卸载空闲模型让位（in_flight==0 的最久未用；正忙的绝不驱逐）",
+            "后端状态取值：unloaded / adopted / loading / ready；op.status：queued/running/success/failed",
+        ],
+    }
+
+
+@app.post("/v1/gateway/load")
+async def gateway_load(request: Request):
+    """把指定模型加载到指定 GPU（细粒度协商入口）。
+
+    body:
+      model: 模型名（models.json 中的 key）
+      gpus:  [0] 或 [0,1]；可选，缺省按 models.json gw.gpus 自动放置（可能回落其它空闲卡）
+      wait:  true（默认）= 同步等待就绪后返回最终状态；
+             false = 立即 202 返回 request_id，客户端轮询 GET /v1/gateway/ops/{request_id}
+    说明：
+      gpus 为硬性指定：指定卡放不下时返回 503 并给出各卡可用量，不会静默改道。
+      显存不足时网关会先卸载空闲模型让位（in_flight==0 的最久未用；正忙的绝不驱逐）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    model = body.get("model", "")
+    if not model:
+        return JSONResponse({"error": {"message": "缺少 model 字段",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    man = await asyncio.to_thread(load_manifest)
+    if model not in man:
+        return JSONResponse({"error": {"message": f"模型 '{model}' 不存在",
+                                       "type": "invalid_model_error"}}, status_code=404)
+    if not model_dir(model):
+        return JSONResponse({"error": {"message": f"模型 '{model}' 未下载",
+                                       "type": "invalid_model_error"}}, status_code=404)
+
+    gpus = body.get("gpus")
+    if gpus is not None:
+        if (not isinstance(gpus, list) or not gpus
+                or not all(isinstance(g, int) and g >= 0 for g in gpus)):
+            return JSONResponse({"error": {"message":
+                "gpus 必须是非负整数数组，如 [0] 或 [0,1]",
+                "type": "invalid_request_error"}}, status_code=400)
+        gpus = sorted(set(gpus))
+        min_gpus = int(man[model].get("min_gpus", 1))
+        if len(gpus) < min_gpus:
+            return JSONResponse({"error": {"message":
+                f"{model} 至少需要 {min_gpus} 张 GPU（min_gpus={min_gpus}），"
+                f"收到 {len(gpus)} 张 {gpus}",
+                "type": "invalid_request_error"}}, status_code=400)
+        free = await asyncio.to_thread(gpu_free)
+        missing = [g for g in gpus if g not in free]
+        if missing:
+            return JSONResponse({"error": {"message":
+                f"请求的 GPU {missing} 不存在，本机只有 {sorted(free)}",
+                "type": "invalid_request_error"}}, status_code=400)
+    wait = body.get("wait", True)
+
+    # 已加载：直接返回当前状态（幂等）
+    b = backends.get(model)
+    if b and b["status"] == "ready":
+        op = _new_op("load", model)
+        _op_update(op, status="success", stage="ready",
+                   detail=f"{model} 已就绪 on GPU {sorted(b['gpus'])}",
+                   target_gpus=b["gpus"])
+        return JSONResponse(await _op_response(op), status_code=200)
+
+    op = _new_op("load", model)
+    if wait is False:
+        asyncio.create_task(_run_load(op, model, man, gpus))
+        return JSONResponse({"status": "accepted", "model": model,
+                             "op": await _op_response(op)}, status_code=202)
+
+    await _run_load(op, model, man, gpus)
+    if op["status"] == "success":
+        return JSONResponse(await _op_response(op), status_code=200)
+    code = 503 if op.get("error_type") == "insufficient_resources" else 502
+    return JSONResponse({"error": {"message": op["error"],
+                                   "type": op.get("error_type", "backend_error")},
+                         "op": await _op_response(op)}, status_code=code)
+
+
+@app.post("/v1/gateway/unload")
+async def gateway_unload(request: Request):
+    """按模型细粒度卸载，释放其占用显存（unload_all 的单模型版本）。
+    body: {"model": "..."}。仅卸载空闲后端（in_flight==0）；正忙/加载中返回 409。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    model = body.get("model", "")
+    if not model:
+        return JSONResponse({"error": {"message": "缺少 model 字段",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    b = backends.get(model)
+    if not b:
+        return JSONResponse({"status": "unloaded", "model": model,
+                             "detail": "模型未加载，无需卸载",
+                             "gpu_free": await asyncio.to_thread(gpu_free)}, status_code=200)
+    if b["in_flight"] > 0 or b["status"] == "loading":
+        return JSONResponse({"error": {"message":
+            f"{model} 正忙（in_flight={b['in_flight']}, status={b['status']}），拒绝卸载。"
+            f"等请求结束或加载完成后重试",
+            "type": "busy_error"}}, status_code=409)
+
+    op = _new_op("unload", model)
+    _op_update(op, status="running", stage="unloading",
+               detail=f"卸载 {b['container']}（释放 GPU {sorted(b['gpus'])}）")
+    async with ops_lock:
+        b = backends.get(model)
+        if b and b["in_flight"] == 0 and b["status"] != "loading":
+            await asyncio.to_thread(_remove_container, b["container"])
+            backends.pop(model, None)
+            _op_update(op, status="success", stage="unloaded", detail=f"{model} 已卸载")
+        else:
+            _op_update(op, status="failed", stage="failed",
+                       detail=f"{model} 状态已变化（in_flight={b and b['in_flight']}, "
+                              f"status={b and b['status']}），卸载取消", error="busy")
+    return JSONResponse(await _op_response(op), status_code=200)
+
+
+@app.get("/v1/gateway/ops")
+async def gateway_ops_list():
+    """最近操作列表（load/switch/unload），按创建时间倒序，保留最近 1h。"""
+    recent = sorted(ops.values(), key=lambda o: o["created_at"], reverse=True)[:20]
+    return {"ops": [await _op_response(o) for o in recent]}
+
+
+@app.get("/v1/gateway/ops/{request_id}")
+async def gateway_ops_get(request_id: str):
+    """轮询操作状态：GET /v1/gateway/ops/{request_id}
+    返回 op：{request_id, kind, model, status, stage, detail, target_gpus, error,
+              transitions[], backend, gpu_free}。
+    status 收敛到 success / failed 即终态；transitions 记录了每次 stage 变更。"""
+    op = ops.get(request_id)
+    if not op:
+        return JSONResponse({"error": {"message":
+            f"未知操作 {request_id}（可能已超过保留期 {int(OP_TTL // 60)} 分钟）",
+            "type": "not_found"}}, status_code=404)
+    return await _op_response(op)
+
+
 async def proxy(name, request: Request):
     man = await asyncio.to_thread(load_manifest)
     if name not in man or not model_dir(name):
         return JSONResponse({"error": {"message": f"模型 '{name}' 不存在或未下载",
                                        "type": "invalid_request_error"}}, status_code=404)
+    # 异步协商：客户端可带 X-Gateway-Load-Async:1（+ 可选 X-Gateway-GPUs:0）让未加载模型的
+    # 首请求不挂起等待，改为 202 返回 request_id；轮询 GET /v1/gateway/ops/{id} 就绪后再发请求。
+    if not backends.get(name) or backends.get(name, {}).get("status") != "ready":
+        if (request.headers.get("x-gateway-load-async", "").lower() in ("1", "true")
+                or request.query_params.get("gateway_load_async") == "1"):
+            want_gpus = None
+            hg = request.headers.get("x-gateway-gpus", "")
+            if hg.strip():
+                try:
+                    want_gpus = sorted({int(x) for x in hg.split(",") if x.strip()})
+                except ValueError:
+                    return JSONResponse({"error": {"message":
+                        f"X-Gateway-GPUs 非法: '{hg}'（应为逗号分隔的 GPU 序号，如 0 或 0,1）",
+                        "type": "invalid_request_error"}}, status_code=400)
+            op = _new_op("load", name)
+            _op_update(op, status="running", stage="loading",
+                       detail=f"异步加载 {name}", target_gpus=want_gpus)
+            asyncio.create_task(_run_load(op, name, man, want_gpus))
+            return JSONResponse({"status": "accepted", "model": name,
+                                 "message": f"{name} 正在异步加载，轮询 "
+                                            "GET /v1/gateway/ops/{request_id} 直到 "
+                                            "status=success 后再请求。",
+                                 "op": await _op_response(op)}, status_code=202)
     try:
         b = await ensure_loaded(name, man)
     except ResourceError as e:
