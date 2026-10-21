@@ -1712,6 +1712,70 @@ async def _buffered_openai_response(name, r):
 # Anthropic Messages API 兼容层
 # ============================================================
 
+def _anthropic_image_to_openai(block: dict):
+    """将 Anthropic image 块转为 OpenAI image_url 块；无法转换时返回 None。
+
+    Anthropic: {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"..."}}
+               {"type":"image","source":{"type":"url","url":"https://..."}}
+    OpenAI:    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}
+    """
+    source = block.get("source") or {}
+    stype = source.get("type", "")
+    if stype == "base64":
+        media = source.get("media_type", "image/jpeg")
+        data = source.get("data", "")
+        if data:
+            return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}
+    elif stype == "url":
+        url = source.get("url", "")
+        if url:
+            return {"type": "image_url", "image_url": {"url": url}}
+    return None
+
+
+def _openai_image_to_anthropic(block: dict):
+    """将 OpenAI image_url 块转为 Anthropic image 块（Responses 往返转换用）。"""
+    iu = block.get("image_url") or {}
+    if isinstance(iu, str):
+        url = iu
+    else:
+        url = iu.get("url", "") if isinstance(iu, dict) else ""
+    if not url:
+        return None
+    if url.startswith("data:"):
+        try:
+            header, _, data = url.partition(",")
+            media = header[5:].split(";")[0] if header.startswith("data:") else "image/jpeg"
+            if data:
+                return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
+        except Exception:
+            return None
+        return None
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _tool_result_content_text(content):
+    """Anthropic tool_result 的 content 可能是字符串或块列表，压成纯文本。"""
+    if isinstance(content, list):
+        texts = []
+        for b in content:
+            if isinstance(b, dict):
+                if b.get("type") == "text" and b.get("text"):
+                    texts.append(b["text"])
+                elif b.get("type") == "image":
+                    img = _anthropic_image_to_openai(b)
+                    if img:
+                        texts.append(img["image_url"]["url"])
+                else:
+                    t = b.get("text")
+                    if t:
+                        texts.append(t)
+            else:
+                texts.append(str(b))
+        return "\n".join(texts)
+    return content or ""
+
+
 def _anthropic_to_openai(body: dict, manifest: dict) -> tuple[str, dict]:
     """将 Anthropic 请求体转为 OpenAI 格式。
 
@@ -1781,33 +1845,55 @@ def _anthropic_to_openai(body: dict, manifest: dict) -> tuple[str, dict]:
         if role == "user":
             c = msg.get("content", "")
             if isinstance(c, list):
-                # 查找是否有 tool_result
+                # 查找是否有 tool_result，同时收集 text / image 块
                 text_parts = []
+                image_parts = []
                 has_tool_result = False
                 for block in c:
                     if block.get("type") == "text" and block.get("text"):
                         text_parts.append(block["text"])
+                    elif block.get("type") == "image":
+                        img = _anthropic_image_to_openai(block)
+                        if img:
+                            image_parts.append(img)
                     elif block.get("type") == "tool_result":
                         has_tool_result = True
-                        break
                 if has_tool_result:
                     # 有 tool_result 时，直接透传 content blocks 给 OpenAI
                     # OpenAI 的 assistant 消息中 tool_call 已被提取，tool_result 由 user 承载
                     # 将 tool_result 转成 OpenAI tool_message
                     tool_results = [b for b in c if b.get("type") == "tool_result"]
                     other_parts = [b for b in c if b.get("type") != "tool_result"]
-                    if other_parts:
-                        texts = [b.get("text", "") for b in other_parts if b.get("type") == "text"]
-                        if texts:
-                            oa_msgs.append({"role": "user", "content": "\n".join(texts)})
+                    other_blocks = []
+                    for b in other_parts:
+                        if b.get("type") == "text" and b.get("text"):
+                            other_blocks.append({"type": "text", "text": b["text"]})
+                        elif b.get("type") == "image":
+                            img = _anthropic_image_to_openai(b)
+                            if img:
+                                other_blocks.append(img)
+                    if other_blocks:
+                        # 纯文本保持字符串形态，含图时用多模态块列表
+                        if all(b.get("type") == "text" for b in other_blocks):
+                            oa_msgs.append({"role": "user",
+                                            "content": "\n".join(b["text"] for b in other_blocks)})
+                        else:
+                            oa_msgs.append({"role": "user", "content": other_blocks})
                     for tr in tool_results:
                         oa_msgs.append({
                             "role": "tool",
                             "tool_call_id": tr.get("tool_use_id", f"call_{len(oa_msgs)}"),
-                            "content": tr.get("content", ""),
+                            "content": _tool_result_content_text(tr.get("content", "")),
                         })
-                elif text_parts:
-                    oa_msgs.append({"role": "user", "content": "\n".join(text_parts)})
+                elif text_parts or image_parts:
+                    if image_parts:
+                        blocks = []
+                        if text_parts:
+                            blocks.append({"type": "text", "text": "\n".join(text_parts)})
+                        blocks.extend(image_parts)
+                        oa_msgs.append({"role": "user", "content": blocks})
+                    else:
+                        oa_msgs.append({"role": "user", "content": "\n".join(text_parts)})
                 else:
                     oa_msgs.append({"role": "user", "content": str(c)})
             else:
@@ -2237,17 +2323,32 @@ def _responses_input_to_openai_items(input_items: list) -> list[dict]:
             elif isinstance(content, list):
                 # 内容块列表 — 转换为 OpenAI 格式
                 texts = []
+                images = []
                 for block in content:
                     if block.get("type") == "input_text":
                         texts.append(block.get("text", ""))
                     elif block.get("type") == "input_image":
-                        # OpenAI vision 格式
+                        # OpenAI vision 格式：image_url 为字符串或 {url:...} 对象
                         img_url = block.get("image_url", block.get("image", ""))
-                        texts.append(f"[图片: {img_url}]")
+                        if isinstance(img_url, dict):
+                            img_url = img_url.get("url", "")
+                        if img_url:
+                            entry = {"url": img_url}
+                            detail = block.get("detail")
+                            if detail:
+                                entry["detail"] = detail
+                            images.append({"type": "image_url", "image_url": entry})
                     elif block.get("type") == "document":
                         doc_url = block.get("document", "")
                         texts.append(f"[文档: {doc_url}]")
-                oa_msgs.append({"role": role, "content": "\n".join(texts) or ""})
+                if images:
+                    blocks = []
+                    if texts:
+                        blocks.append({"type": "text", "text": "\n".join(texts)})
+                    blocks.extend(images)
+                    oa_msgs.append({"role": role, "content": blocks})
+                else:
+                    oa_msgs.append({"role": role, "content": "\n".join(texts) or ""})
             i += 1
 
         elif item_type == "function_call":
@@ -2449,7 +2550,19 @@ def _responses_to_anthropic_messages(body: dict, manifest: dict) -> tuple[str, d
                 })
             anth_msgs.append({"role": "assistant", "content": parts if parts else ""})
         else:
-            anth_msgs.append({"role": role, "content": content})
+            if isinstance(content, list):
+                # 内容块列表：OpenAI image_url → Anthropic image（供 _anthropic_to_openai 再用）
+                anth_blocks = []
+                for b in content:
+                    if b.get("type") == "image_url":
+                        img = _openai_image_to_anthropic(b)
+                        if img:
+                            anth_blocks.append(img)
+                    else:
+                        anth_blocks.append(b)
+                anth_msgs.append({"role": role, "content": anth_blocks})
+            else:
+                anth_msgs.append({"role": role, "content": content})
     anth_body["messages"] = anth_msgs
 
     # tools

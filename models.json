@@ -90,10 +90,10 @@
         "fp8": 125
       },
       "ctx_default": 262144,
-      "desc": "双卡旗舰：125B MoE 每 token 激活 6B + 51B 嵌入可卸内存；新架构需 vLLM 最新版",
+      "desc": "双卡旗舰：125B MoE 每 token 激活 6B + 51B 嵌入可卸内存，原生多模态（图+视频）；新架构需 vLLM 最新版",
       "arch_risk": "Qwen3.8-Flash 为 GDN/QSA 新架构，vLLM 不支持时会提示改用 qwen3-235b-fp8",
       "max_ctx": 262144,
-      "menu_brief": "[纯文本] 【综合旗舰】最新一代125B，能力天花板，但独占双卡(视频暂停,x8下偏慢)",
+      "menu_brief": "[视觉·图+视频] 【综合旗舰】最新一代125B，能力天花板，但独占双卡(视频暂停,x8下偏慢)",
       "think": true,
       "gw": {
         "gpus": "0,1",
