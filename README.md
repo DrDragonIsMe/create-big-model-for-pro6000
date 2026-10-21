@@ -142,7 +142,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - `models.json` — 模型清单（显存/卡数/下载源），新增模型唯一入口
 - `models/llm` — 文本模型 ｜ `models/comfy` — 视频模型（ComfyUI 目录结构）
 - `scripts/` — init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
-- `sysmonitor/` — 实时监控（curses/文本/截图 + 7 套主题，T 热键切换）
+- `sysmonitor/` — 实时监控（curses/文本/截图 + 4 种负载图风格 + 7 套主题；详见 `sysmonitor/README.md`）
 - `模型切换说明.md` — 文本/视频切换与管理接口（客户端操作依据）
 - `部署文档.md` — 通用部署指南（硬件要求 / 一键或手动部署 / 踩坑）
 - `data/output` — 生成结果输出目录
