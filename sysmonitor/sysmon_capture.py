@@ -19,6 +19,7 @@ for i, name in enumerate(("COLOR_BLACK", "COLOR_RED", "COLOR_GREEN", "COLOR_YELL
                           "COLOR_BLUE", "COLOR_MAGENTA", "COLOR_CYAN", "COLOR_WHITE")):
     setattr(fc, name, i)
 fc.A_BOLD = 1
+fc.A_DIM = 4
 fc.COLORS = 256
 fc.A_NORMAL = 0
 fc.A_REVERSE = 2
@@ -72,7 +73,7 @@ def fake_wrapper(func, *args):
     scr = CaptureScratch(ROWS, COLS)
     import sysmon
     real_cpu = sysmon.psutil.cpu_percent
-    # 让每核/CPU 数值有波动，便于观察波形图
+    # 让每核/CPU 数值有波动，便于观察当前值仪表着色
     call_count = {'n': 0}
     def fake_cpu_percent(interval=None, percpu=False):
         v = real_cpu(interval=interval, percpu=percpu)
@@ -99,7 +100,7 @@ import sysmon
 sysmon.curses = fc          # 让 sysmon 模块内的所有 curses 调用都走假实现
 
 def fake_llm_models(gateway="", timeout=0.6):
-    import math, random
+    import random
     sysmon.GATEWAY_CONNECTED = True
     models = [
         {"name": "qwen3.6-35b-a3b", "engine": "vllm", "gpus": "1", "active": 2,
@@ -116,16 +117,9 @@ def fake_llm_models(gateway="", timeout=0.6):
          "rate": 0.0, "prompt_rate": 0.0, "slots": None, "metrics_ok": True,
          "idle": 1830.0, "prefill_elapsed": None},
     ]
-    # 预置 sparkline 历史，便于观察曲线渲染
+    # 速率随帧微抖，模拟实时数值变化
     for m in models:
-        g = sysmon._gen_hist.setdefault(m["name"], __import__("collections").deque(maxlen=60))
-        p = sysmon._prompt_hist.setdefault(m["name"], __import__("collections").deque(maxlen=60))
-        if not g:
-            n = 46
-            for i in range(n):
-                w = math.sin(i / 5) * 0.5 + 0.5
-                g.append(max(0.0, m["rate"] * (0.5 + w) + random.random() * 6))
-                p.append(max(0.0, m["prompt_rate"] * (0.4 + w)))
+        m["rate"] = max(0.0, m.get("rate", 0) + random.uniform(-6, 6)) if m.get("rate") else m.get("rate", 0.0)
     return models
 
 sysmon.get_llm_models = fake_llm_models

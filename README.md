@@ -25,7 +25,7 @@ curl -X POST http://<服务器IP>:8000/v1/gateway/load -H 'Content-Type: applica
 ./scripts/manage.sh check [--fix]  # 按模型文件校准清单（think/上下文/工具格式）
 ./scripts/manage.sh verify  # 通过网关逐模型实测：正文非空 + 工具调用解析
 python3 scripts/gen_video.py "提示词"   # MiniMax H3 文生视频（--turbo 加速，--first/--last 首/尾帧）
-python3 sysmonitor/sysmon.py            # 实时监控：GPU负载图4风格(C键切:面积/波柱/频谱/热力)+模型吞吐动画（q退出 Space暂停 A动画 T切主题）
+python3 sysmonitor/sysmon.py            # 实时监控：GPU/CPU/网速/磁盘IO/进程/模型吞吐，全当前值仪表（q退出 Space暂停 A动画 P进程排序 T切主题）
 ```
 
 非交互启动示例：
@@ -142,7 +142,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - `models.json` — 模型清单（显存/卡数/下载源），新增模型唯一入口
 - `models/llm` — 文本模型 ｜ `models/comfy` — 视频模型（ComfyUI 目录结构）
 - `scripts/` — init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
-- `sysmonitor/` — 实时监控（curses/文本/截图 + 4 种负载图风格 + 7 套主题；详见 `sysmonitor/README.md`）
+- `sysmonitor/` — 实时监控（curses/文本/截图；GPU/网速/磁盘IO/进程/模型吞吐 当前值仪表 + 7 套主题；详见 `sysmonitor/README.md`）
 - `模型切换说明.md` — 文本/视频切换与管理接口（客户端操作依据）
 - `部署文档.md` — 通用部署指南（硬件要求 / 一键或手动部署 / 踩坑）
 - `data/output` — 生成结果输出目录

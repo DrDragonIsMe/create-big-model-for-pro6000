@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""系统资源监控：CPU / 内存 / 磁盘 / GPU + LLM 模型吞吐（文本版，适合 ssh/日志）。
+"""系统资源监控：CPU / 内存 / 磁盘 / GPU / 网络 / 磁盘I/O / 进程 / LLM 模型吞吐（文本版，适合 ssh/日志）。
 
-LLM 面板含：阶段动画（Prompt 进度条 / 生成脉冲 / 加载转圈）、p/s 与 t/s 双速率
-sparkline 曲线、活动/排队、空闲时长、累计 tokens；表头汇总全局吞吐。
+只呈现当前值：所有百分比都是 ▰▱ 仪表条（绿<60 黄<85 红 压力分级，蓝=容量占用）。
+LLM 面板含：阶段动画（Prompt 进度条 / 生成脉冲 / 加载转圈）、当前 p/s 与 t/s 速率、
+slot 占用仪表+排队、空闲时长、累计 tokens；表头汇总全局吞吐。
 
 用法：
     python3 sysmon_text.py            # 输出一次快照
@@ -14,6 +15,7 @@ sparkline 曲线、活动/排队、空闲时长、累计 tokens；表头汇总�
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -21,7 +23,6 @@ import sys
 import time
 import unicodedata
 import urllib.request
-from collections import deque
 from datetime import datetime
 
 import psutil
@@ -31,19 +32,17 @@ DEFAULT_GATEWAY = os.environ.get("SYSMON_GATEWAY", "http://localhost:8000")
 GATEWAY = DEFAULT_GATEWAY
 ANIM = True                                  # --animate 时 spinner/脉冲动起来
 _llm_baseline = {}
-_gen_hist: dict[str, deque] = {}             # 每模型 t/s 历史（sparkline）
-_prompt_hist: dict[str, deque] = {}          # 每模型 p/s 历史（sparkline）
 _last_active: dict[str, float] = {}          # 每模型最后活动时刻
 GATEWAY_CONNECTED = False
-HISTORY_LEN = 60
-SPARK = "▁▂▃▄▅▆▇█"
 PULSE = "●○"
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 LOAD_SPIN = "◐◓◑◒"
+METER_ON = "▰"
+METER_OFF = "▱"
 _frame = 0
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# ── 语义配色（主题可换；默认 Tokyo Night）──
+# ── 语义配色（主题可换；默认 themes/catppuccin-mocha）──
 # 颜色由 theme.load_theme() 解析为 ANSI 码，存入下方 COL_*；逻辑见 theme.py
 import theme as _theme
 _THEME, _THEME_WARN = _theme.load_theme()
@@ -102,9 +101,17 @@ def pct_color(pct, warn=60, crit=85):
 
 
 def bar(pct, width=24):
-    filled = int(round(width * min(pct, 100) / 100))
-    color = pct_color(pct)
-    return c(color, "█" * filled) + dim("░" * (width - filled))
+    """当前值仪表条：▰=占用（按压力分级着色）/ ▱=余量（暗色）。"""
+    filled = int(round(width * min(max(pct, 0.0), 100) / 100))
+    return c(pct_color(pct), METER_ON * filled) + dim(METER_OFF * (width - filled))
+
+
+def meter(frac, width=6, color=None):
+    """迷你仪表（0..1）：用于 slot 占用等。"""
+    frac = min(max(float(frac), 0.0), 1.0)
+    filled = int(round(width * frac))
+    color = color or pct_color(frac * 100)
+    return c(color, METER_ON * filled) + dim(METER_OFF * (width - filled))
 
 
 def fmt_bytes(n):
@@ -150,51 +157,6 @@ def fmt_dur(secs):
     return f"{secs // 86400}d{(secs % 86400) // 3600:02d}h"
 
 
-def sparkline(hist, width):
-    """速率序列 -> 方块 sparkline（按序列内最大值归一）。"""
-    vals = [float(v) for v in hist][-width:]
-    if not vals:
-        return " " * width
-    m = max(vals)
-    if m <= 0:
-        return SPARK[0] * len(vals) + " " * (width - len(vals))
-    out = "".join(SPARK[min(7, int(v / m * 8 + 0.5))] for v in vals)
-    return out + " " * (width - len(out))
-
-
-DENSITY = " ░▒▓█"
-CHART_STYLES = ("area", "wave", "spectrum", "heat")
-CHART_STYLE = os.environ.get("SYSMON_CHART", "area")   # 文本版默认方块曲线（经典）
-if CHART_STYLE not in CHART_STYLES:
-    CHART_STYLE = "area"
-
-
-def spark_render(hist, width, base_col):
-    """按 CHART_STYLE 渲染速率曲线：spectrum=按水平绿→红着色；
-    heat=密度字符着色；area/wave=方块曲线 + 尾格亮色（当前值）。"""
-    vals = list(hist)[-width:]
-    if not vals:
-        return " " * max(0, width)
-    mx = max(float(v) for v in vals)
-    if CHART_STYLE == "spectrum" and USE_COLOR:
-        cells = []
-        for v in vals:
-            norm = float(v) / mx if mx > 0 else 0.0
-            cells.append(c(pct_color(norm * 100), SPARK[min(7, int(norm * 8 + 0.5))]))
-        return "".join(cells)
-    if CHART_STYLE == "heat" and USE_COLOR:
-        cells = []
-        for v in vals:
-            norm = float(v) / mx if mx > 0 else 0.0
-            glyph = DENSITY[min(4, int(norm * 4.999) + (1 if v > 0 else 0))]
-            cells.append(c(pct_color(norm * 100), glyph))
-        return "".join(cells)
-    text = sparkline(vals, width)
-    if USE_COLOR and mx > 0:
-        return text[:-1] + c(f"1;{base_col}", text[-1])
-    return text
-
-
 def progress_bar(frac, width=12):
     frac = max(0.0, min(1.0, frac or 0.0))
     n = int(round(frac * width))
@@ -206,7 +168,7 @@ def anim_char(seq, frame):
 
 
 def get_llm_models(timeout=0.8):
-    """读取网关状态，本地差分速率并维护 sparkline 历史与空闲时长。"""
+    """读取网关状态，本地差分当前速率并记录空闲时长。"""
     global GATEWAY_CONNECTED
     if not GATEWAY:
         GATEWAY_CONNECTED = False
@@ -242,8 +204,6 @@ def get_llm_models(timeout=0.8):
         rate = float(rate or 0.0)
         p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
 
-        _gen_hist.setdefault(name, deque(maxlen=HISTORY_LEN)).append(rate)
-        _prompt_hist.setdefault(name, deque(maxlen=HISTORY_LEN)).append(p_rate)
         active = b.get("in_flight", 0) or 0
         if active > 0 or rate > 0 or p_rate > 0:
             _last_active[name] = now
@@ -268,9 +228,8 @@ def get_llm_models(timeout=0.8):
             "metrics_ok": bool(tokens.get("metrics_ok")),
         })
     live = {m["name"] for m in models}
-    for gone in set(_gen_hist) - live:
-        _gen_hist.pop(gone, None)
-        _prompt_hist.pop(gone, None)
+    for gone in set(_llm_baseline) - live:
+        _llm_baseline.pop(gone, None)
         _last_active.pop(gone, None)
     models.sort(key=lambda m: (m["active"] <= 0, -(m["rate"] or 0), m["name"]))
     return models
@@ -283,6 +242,10 @@ def disp_width(s):
 
 def pad(s, width):
     return s + " " * max(0, width - disp_width(s))
+
+
+def rpad(s, width):
+    return " " * max(0, width - disp_width(s)) + s
 
 
 def section(title):
@@ -439,6 +402,117 @@ def get_gpu_procs():
     return procs
 
 
+_net_cache: dict[str, tuple] = {}
+_diskio_cache: dict[str, tuple] = {}
+_proc_cache: dict[int, psutil.Process] = {}
+_proc_ctime: dict[int, float] = {}
+_DISK_NAME_RE = re.compile(r"(nvme\d+n\d+|mmcblk\d+|sd[a-z]|vd[a-z]|hd[a-z])$")
+
+
+def get_net():
+    """各活动网卡当前 ↓入/↑出 速率与累计（差分；排除 lo/veth/br-/docker）。"""
+    now = time.time()
+    try:
+        per = psutil.net_io_counters(pernic=True)
+        stats = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+    except (AttributeError, OSError):
+        return []
+    out = []
+    for name, io in per.items():
+        if name.startswith(("lo", "veth", "br-", "docker", "virbr")):
+            continue
+        st = stats.get(name)
+        if st and not st.isup:
+            continue
+        prev = _net_cache.get(name)
+        rx = tx = 0.0
+        if prev:
+            dt = now - prev[2]
+            if dt > 0:
+                rx = max(0.0, (io.bytes_recv - prev[0]) / dt)
+                tx = max(0.0, (io.bytes_sent - prev[1]) / dt)
+        _net_cache[name] = (io.bytes_recv, io.bytes_sent, now)
+        ip = ""
+        for a in addrs.get(name, []):
+            if a.family == socket.AF_INET:
+                ip = a.address
+                break
+        out.append({"name": name, "rx": rx, "tx": tx,
+                    "rx_total": io.bytes_recv, "tx_total": io.bytes_sent,
+                    "link_mbps": (st.speed if st else 0), "ip": ip})
+    out.sort(key=lambda n: -(n["rx"] + n["tx"]))
+    return out
+
+
+def get_diskio():
+    """物理盘当前吞吐 / IOPS / util（busy_time 差分）。"""
+    now = time.time()
+    try:
+        per = psutil.disk_io_counters(perdisk=True)
+    except (AttributeError, OSError):
+        return []
+    out = []
+    for name, v in (per or {}).items():
+        if not _DISK_NAME_RE.fullmatch(name):
+            continue
+        prev = _diskio_cache.get(name)
+        r = w = ri = wi = util = 0.0
+        if prev:
+            dt = now - prev[0]
+            if dt > 0:
+                r = max(0.0, (v.read_bytes - prev[1]) / dt)
+                w = max(0.0, (v.write_bytes - prev[2]) / dt)
+                ri = max(0.0, (v.read_count - prev[3]) / dt)
+                wi = max(0.0, (v.write_count - prev[4]) / dt)
+                util = min(100.0, max(0.0, (v.busy_time - prev[5]) / (dt * 1000) * 100))
+        _diskio_cache[name] = (now, v.read_bytes, v.write_bytes,
+                               v.read_count, v.write_count, v.busy_time)
+        out.append({"name": name, "r_bps": r, "w_bps": w,
+                    "r_iops": ri, "w_iops": wi, "util": util})
+    out.sort(key=lambda d: -(d["util"] * 1e6 + d["r_bps"] + d["w_bps"]))
+    return out
+
+
+def get_procs():
+    """全系统进程当前指标（%CPU 跨采样差分；跳过内核线程）。"""
+    out = []
+    seen = set()
+    for pid in psutil.pids():
+        try:
+            p = _proc_cache.get(pid)
+            if p is None:
+                p = psutil.Process(pid)
+                cmd = [a for a in p.cmdline() if a.strip()]
+                if not cmd:
+                    continue
+                _proc_cache[pid] = p
+                _proc_ctime[pid] = p.create_time()
+                p.cpu_percent(None)
+                cpu = 0.0
+            else:
+                if p.create_time() != _proc_ctime.get(pid):
+                    _proc_cache.pop(pid, None)
+                    _proc_ctime.pop(pid, None)
+                    continue
+                cmd = [a for a in p.cmdline() if a.strip()]
+                if not cmd:
+                    continue
+                cpu = p.cpu_percent(None)
+            mi = p.memory_info()
+            out.append({"pid": pid, "cpu": cpu, "rss": mi.rss,
+                        "pmem": p.memory_percent(), "user": p.username()[:8],
+                        "cmd": " ".join(cmd)})
+            seen.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            _proc_cache.pop(pid, None)
+            _proc_ctime.pop(pid, None)
+    for dead in set(_proc_cache) - seen:
+        _proc_cache.pop(dead, None)
+        _proc_ctime.pop(dead, None)
+    return out
+
+
 def snapshot():
     """一轮数据采样（只在数据 tick 调用；动画帧复用快照，不碰 nvidia-smi/网关）。"""
     return {
@@ -446,6 +520,9 @@ def snapshot():
         "gpus": get_gpus(),
         "gpu_procs": get_gpu_procs(),
         "models": get_llm_models(),
+        "net": get_net(),
+        "diskio": get_diskio(),
+        "procs": get_procs(),
     }
 
 
@@ -600,22 +677,21 @@ def render_llm(snap):
 
     for m in models:
         slots = m.get("slots")
-        active_txt = f"{m['active']}/{slots}" if slots else str(m["active"])
         queueing = bool(slots and m["active"] > slots)
-        if queueing:
-            active = c(COL_WARN, f"⚠{active_txt}排队")
-        elif m["active"] > 0:
-            active = c(COL_OK, f"ACT {active_txt}")
+        if slots:
+            col = COL_WARN if queueing else (COL_OK if m["active"] > 0 else COL_MEM)
+            active = (dim("ACT ") + meter(m["active"] / slots, 6, col)
+                      + c(col, f" {m['active']}/{slots}")
+                      + (c(COL_WARN, f" ⚠+{m['active'] - slots}排队") if queueing else ""))
         else:
-            active = dim(f"ACT {active_txt}")
+            active = dim("ACT ") + c(COL_OK if m["active"] > 0 else COL_MEM,
+                                     str(m["active"]))
         model = c(COL_MODEL, shorten(m["name"], 30))
         p_rate = float(m.get("prompt_rate") or 0)
         t_rate = float(m.get("rate") or 0)
         prefill = bool(m.get("prefill_active"))
         loading = m["status"] == "loading"
         decoding = t_rate > 0 or (m["active"] > 0 and not prefill)
-        gspark = spark_render(_gen_hist.get(m["name"], ()), 12, COL_OK)
-        pspark = spark_render(_prompt_hist.get(m["name"], ()), 12, COL_WARN)
         ps = c(COL_WARN, f"{p_rate:7.0f} p/s") if p_rate > 0 else dim("    -- p/s")
         ts = c(COL_OK, f"{t_rate:7.1f} t/s") if t_rate > 0 else dim("    -- t/s")
         cum = dim(f"Σprompt {fmt_tokens(m.get('prompt_total'))} · "
@@ -638,15 +714,89 @@ def render_llm(snap):
             detail = dim(f"{idle_s}")
         lines.append(
             f"│ {model} {dim(pad(m['engine'], 5))} GPU{pad(m['gpus'], 4)} {active}"
-            f"  {pad(phase, 9)} {pad(detail, 22)} {pspark} {ps}  {gspark} {ts}  {cum}"
+            f"  {pad(phase, 9)} {pad(detail, 22)} {ps}  {ts}  {cum}"
         )
     lines.append(
         "│ " + c(COL_WARN, "p/s") + dim("=Prompt处理速率  ")
         + c(COL_OK, "t/s") + dim("=生成速率（两列独立，并发时可同时有值）  ")
-        + c(COL_OK, "▁▂▄█") + dim("=近%d次采样曲线  " % HISTORY_LEN)
+        + c(COL_MEM, "▰▱") + dim("=当前值仪表（绿<60 黄<85 红=压力分级 蓝=容量占用）  ")
         + dim("ACT=进行中/slot上限(超则⚠排队)  K=千tokens M=百万tokens  "
               "Σ=模型加载以来累计(换模型/重启清零)  空闲=距上次活动时长")
     )
+    return lines
+
+
+def render_net(snap):
+    lines = [section("网络（↓入 ↑出）")]
+    nics = snap["net"]
+    if not nics:
+        lines.append("│ " + dim("无活动网卡（已排除 lo/veth/docker）"))
+        return lines
+    rel = max([max(n["rx"], n["tx"]) for n in nics] + [1e5])
+    for n in nics[:3]:
+        scale = (n["link_mbps"] * 1_000_000 / 8) if n["link_mbps"] else rel
+        rx_pct = min(100.0, n["rx"] / scale * 100)
+        tx_pct = min(100.0, n["tx"] / scale * 100)
+        lines.append(
+            "│ " + dim(pad(n["name"], 12)) + " "
+            + c(pct_color(rx_pct), "↓" + rpad(fmt_bytes(n["rx"]) + "/s", 9)) + " "
+            + bar(rx_pct, 8) + "  "
+            + c(pct_color(tx_pct), "↑" + rpad(fmt_bytes(n["tx"]) + "/s", 9)) + " "
+            + bar(tx_pct, 8) + dim(f"  {n['ip']}")
+            + (dim(f"  link{n['link_mbps']}M") if n["link_mbps"] else "")
+        )
+    lines.append("│ " + dim(f"Σ累计（开机以来） ↓{fmt_bytes(sum(n['rx_total'] for n in nics))}"
+                            f"  ↑{fmt_bytes(sum(n['tx_total'] for n in nics))}"))
+    return lines
+
+
+def render_diskio(snap):
+    lines = [section("磁盘 I/O（util=繁忙度）")]
+    disks = snap["diskio"]
+    if not disks:
+        lines.append("│ " + dim("无物理盘 I/O 数据"))
+        return lines
+    for d in disks[:3]:
+        lines.append(
+            "│ " + dim(pad(d["name"], 9)) + " "
+            + c(pct_color(d["util"]), rpad(f"{d['util']:4.1f}%", 6)) + " "
+            + bar(d["util"], 10) + dim(
+                f"  读{fmt_bytes(d['r_bps'])}/s 写{fmt_bytes(d['w_bps'])}/s"
+                f" {d['r_iops'] + d['w_iops']:,.0f} io/s")
+        )
+    return lines
+
+
+def render_procs(snap):
+    """全系统进程 Top（显存→CPU 排序）；curses 版可用 P 键切换排序。"""
+    lines = [section("进程 Top")]
+    vmap = {}
+    for g in snap["gpus"]:
+        for pid, cmdline, model, mem_mb in snap["gpu_procs"].get(g["uuid"], []):
+            total = g["mem_total"] or 1.0
+            vmap[pid] = (cmdline, model, mem_mb, mem_mb / total * 100)
+    rows = [{**p, "vram": vmap[p["pid"]][2] if p["pid"] in vmap else None,
+             "vpct": vmap[p["pid"]][3] if p["pid"] in vmap else 0.0,
+             "model": vmap[p["pid"]][1] if p["pid"] in vmap else None,
+             "cmd": vmap[p["pid"]][0] if p["pid"] in vmap else p["cmd"]}
+            for p in snap["procs"]]
+    rows.sort(key=lambda r: (-(r["vram"] or 0), -r["cpu"]))
+    term_w = shutil.get_terminal_size((110, 24)).columns
+    lines.append("│ " + dim(f"{'PID':>7} {'USER':>7} {'%CPU':>5} {'%MEM':>5}"
+                            f" {'RSS':>7} {'VRAM':>7}  模型 / 命令行"))
+    budget = max(20, term_w - 52)
+    for r in rows[:12]:
+        vr = (c(pct_color(r["vpct"]), rpad(fmt_mb(r["vram"]), 7))
+              if r["vram"] else dim(rpad("·", 7)))
+        cpu_c = pct_color(r["cpu"]) if r["cpu"] >= 60 else COL_DIM
+        tag = c(COL_MODEL, f"[{r['model']}] ") if r["model"] else ""
+        lines.append(
+            "│ " + f"{r['pid']:>7} {r['user']:>7} "
+            + c(cpu_c, f"{r['cpu']:>5.1f}") + f" {r['pmem']:>5.1f}"
+            + f" {rpad(fmt_bytes(r['rss']), 7)} {vr}  {tag}"
+            + dim(shorten(r["cmd"], budget))
+        )
+    lines.append("│ " + dim(f"共 {len(rows)} 进程 · 排序:显存,CPU（curses 版 P 键可切 %CPU/%MEM）"))
     return lines
 
 
@@ -663,7 +813,10 @@ def render(snap=None):
     lines += render_memory() + [""]
     lines += render_disk() + [""]
     lines += render_gpus(snap) + [""]
-    lines += render_llm(snap)
+    lines += render_llm(snap) + [""]
+    lines += render_net(snap) + [""]
+    lines += render_diskio(snap) + [""]
+    lines += render_procs(snap)
     return "\n".join(lines)
 
 
@@ -673,29 +826,22 @@ def main():
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="数据刷新间隔秒数（默认 2）")
     ap.add_argument("-a", "--animate", action="store_true",
                     help="watch 模式下动画帧以 ~8fps 重绘（spinner/脉冲；需 tty）")
-    ap.add_argument("--chart", default=None, choices=CHART_STYLES,
-                    help="速率曲线风格：area/wave=方块曲线 spectrum=绿→红分级 "
-                         "heat=密度条（默认 SYSMON_CHART 或 area；curses 版可用 C 键实时切换）")
     ap.add_argument("--no-color", action="store_true", help="禁用彩色输出")
     ap.add_argument("--gateway", default=DEFAULT_GATEWAY,
                     help="模型网关地址（默认 %(default)s，也可用 SYSMON_GATEWAY）")
     ap.add_argument("--theme", default=None,
                     help="配色主题：主题名（themes/<名>.json）或 JSON 文件路径；"
-                         "也可用 SYSMON_THEME。默认内置 Tokyo Night")
+                         "也可用 SYSMON_THEME。默认 catppuccin-mocha")
     ap.add_argument("--list-themes", action="store_true", help="列出可用主题后退出")
     args = ap.parse_args()
 
-    global USE_COLOR, GATEWAY, _THEME_WARN, ANIM, _frame, CHART_STYLE
+    global USE_COLOR, GATEWAY, _THEME_WARN, ANIM, _frame
     GATEWAY = args.gateway
-    if args.chart:
-        CHART_STYLE = args.chart
-    elif "SYSMON_CHART" not in os.environ:
-        CHART_STYLE = "area"       # 文本版默认方块曲线（无实时切换键，保持经典）
     if args.no_color:
         USE_COLOR = False
 
     if args.list_themes:
-        print("内置默认：tokyo-night")
+        print(f"默认主题：{_theme.DEFAULT_THEME_NAME}（themes/ 目录，缺失时回退内置配色）")
         d = _theme.THEMES_DIR
         if os.path.isdir(d):
             for f in sorted(os.listdir(d)):

@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""nvtop-style 图形化系统资源监控 - curses TUI。
+"""nvtop-style 图形化系统资源监控 - curses TUI（当前值仪表版）。
 
-借鉴 nvtop 布局，图形与数字并存；数据采样与动画刷新分离（画面 ~8fps）：
-  - 顶部：每块 GPU 一个面板，温度/功耗/风扇/显存数值 + 算力、显存负载图
+只呈现「此刻」的压力与负载，不画时间曲线：所有百分比都是即采即画的水平仪表条，
+▰=已占用 / ▱=余量；压力类指标（算力/带宽/CPU/交换/磁盘）按值分级着色
+绿 <60% ≤ 黄 <85% ≤ 红，容量类（显存/内存）用固定青蓝，一眼区分"忙"与"占"。
+仪表动效（A 键可全关，关闭即回退到精确静态值）：
+  - 平滑过渡：采样 tick 间显示值以 ease-out 滑行（~0.5s 收敛），数字/条/颜色同步
+  - 微光扫掠：已填充段有一个亮格自左向右漂移（btop 式 shimmer，窄条自动跳过）
+  - 流向箭头：网速 ↓入/↑出 箭头在有流量时交替闪动，指示方向流动
+数据采样与动画刷新分离（画面 ~8fps）：
+  - 顶部：每块 GPU 一个面板，温度/功耗/风扇 + 算力/显存/带宽 三条当前值仪表
   - 中部：LLM 模型面板——每模型两行：阶段动画（Prompt 进度条 / 生成脉冲 / 加载转圈）、
-          p/s 与 t/s 双速率曲线 sparkline、活动/排队 x/slot、空闲时长、累计 tokens；
+          当前 t/s 与 p/s 速率数值、slot 占用表+排队、累计 tokens；
           面板头汇总全局 t/s、p/s、请求数与排队数
-  - CPU 面积图 + 每核方块图 + 每核占用数字表；右侧内存/交换/磁盘
-  - 底部：GPU 进程表（GPU/PID/USER/%CPU/%MEM/显存/模型/命令行）
-
-负载图 4 种风格（C 键循环，--chart 指定，默认 wave）：
-  area      面积图（经典 nvtop 滚动波形，▀▄█ 半块）
-  wave      波动直方图（每样本一根柱，柱顶水面波纹动画，最直观）
-  spectrum  频谱柱（柱高=负载 + 绿→红分级着色 + ▔ 峰值落帽）
-  heat      热力条（单行密度条 ░▒▓█，按值着色，最紧凑省行）
+  - CPU 总体仪表 + 每核方块图 + 每核占用数字表；右侧内存/交换/磁盘仪表
+  - 网络面板：各活动网卡实时 ↓入/↑出 速率 + 累计流量（按链路速率归一化仪表）
+  - 磁盘 I/O 面板：物理盘的 util 繁忙度仪表 + 读写吞吐/IOPS（busy_time 差分）
+  - 底部：全系统进程表（GPU/PID/USER/%CPU/%MEM/显存/RSS/显存仪表/模型/命令行），
+          可用 `P` 键在 显存/CPU/MEM 三种排序间循环，占用高的行分级着色
 
 快捷键：
     q / Esc    退出
-    Space      暂停/继续数据采样（动画不停）
+    Space      暂停/继续数据采样（数据与动效一起冻结便于读数，墙钟继续）
     A          开/关动画（脉冲、转圈、spinner）
-    C          切换负载图风格（area → wave → spectrum → heat）
+    P          进程表排序：显存 → %CPU → %MEM 循环
     T          下一主题    Shift+Tab  上一主题
 
 用法：
@@ -34,6 +38,7 @@ import curses
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -41,15 +46,12 @@ import sys
 import time
 import unicodedata
 import urllib.request
-from collections import deque
 
 import psutil
 
 # ─── 配置 ──────────────────────────────────────────────────────
-HISTORY_LEN = 60          # 波形图采样点数
 MIN_COLS = 100
 MIN_ROWS = 30
-ch = 2           # 系统波形图高度（行）
 ANIM_TICK = 0.15          # 动画帧间隔（秒）
 DEFAULT_GATEWAY = os.environ.get("SYSMON_GATEWAY", "http://localhost:8000")
 
@@ -57,7 +59,13 @@ DEFAULT_GATEWAY = os.environ.get("SYSMON_GATEWAY", "http://localhost:8000")
 PULSE = "●○"                              # 生成中呼吸点
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"                # braille 转圈（Prompt 预填充）
 LOAD_SPIN = "◐◓◑◒"                        # 加载转圈
-SPARK = "▁▂▃▄▅▆▇█"                        # sparkline 八级方块
+METER_ON = "▰"                            # 当前值仪表：已占用
+METER_OFF = "▱"                           # 当前值仪表：余量
+ARROW_IN = "↓⇣"                           # 网速箭头：入（有流量时交替=流动感）
+ARROW_OUT = "↑⇡"                          # 网速箭头：出
+GLINT_STEP = 2                            # 仪表微光每帧推进格数（扫掠速度）
+LERP = 0.4                                # 仪表值平滑系数（越大越跟手）
+_FRAME = 0                                # 当前动画帧（draw() 每帧更新）
 try:
     _KEY_BTAB = curses.KEY_BTAB          # Shift+Tab（部分终端/仿真环境可能缺失）
 except AttributeError:
@@ -124,33 +132,14 @@ def fmt_dur(secs: float | None) -> str:
         return f"{secs // 3600}h{(secs % 3600) // 60:02d}"
     return f"{secs // 86400}d{(secs % 86400) // 3600:02d}h"
 
-def progress_bar(frac: float, width: int = 10) -> str:
-    """Prompt 预填充进度条：▰ 已填充 / ▱ 剩余。"""
-    frac = max(0.0, min(1.0, frac))
-    n = int(round(frac * width))
-    return "▰" * n + "▱" * (width - n)
-
-def sparkline(hist, width: int) -> str:
-    """把速率序列画成方块 sparkline（按序列内最大值归一）。"""
-    vals = [float(v) for v in hist][-width:]
-    if not vals:
-        return " " * width
-    m = max(vals)
-    if m <= 0:
-        return SPARK[0] * len(vals) + " " * (width - len(vals))
-    out = "".join(SPARK[min(7, int(v / m * 8 + 0.5))] for v in vals)
-    return out + " " * (width - len(out))
-
 # ─── LLM token 指标 ───────────────────────────────────────────
 _llm_baseline: dict[str, tuple[float, float]] = {}
-_gen_hist: dict[str, deque] = {}        # 每模型 t/s 历史（sparkline）
-_prompt_hist: dict[str, deque] = {}     # 每模型 p/s 历史（sparkline）
 _last_active: dict[str, float] = {}     # 每模型最后一次「有活动」的时刻
 GATEWAY_CONNECTED = False
 
 
 def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list[dict]:
-    """从网关读取已加载模型，本地差分速率并维护 sparkline 历史与空闲时长。"""
+    """从网关读取已加载模型，本地差分当前速率并记录空闲时长。"""
     global GATEWAY_CONNECTED
     if not gateway:
         GATEWAY_CONNECTED = False
@@ -186,10 +175,6 @@ def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list
         rate = float(rate or 0.0)
         p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
 
-        gh = _gen_hist.setdefault(name, deque(maxlen=HISTORY_LEN))
-        gh.append(rate)
-        ph = _prompt_hist.setdefault(name, deque(maxlen=HISTORY_LEN))
-        ph.append(p_rate)
         active = b.get("in_flight", 0) or 0
         if active > 0 or rate > 0 or p_rate > 0:
             _last_active[name] = now
@@ -214,132 +199,63 @@ def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list
             "idle": idle,
             "metrics_ok": bool(tokens.get("metrics_ok")),
         })
-    # 清理已卸载模型的历史
+    # 清理已卸载模型的跟踪状态
     live = {m["name"] for m in models}
-    for gone in set(_gen_hist) - live:
-        _gen_hist.pop(gone, None)
-        _prompt_hist.pop(gone, None)
+    for gone in set(_llm_baseline) - live:
+        _llm_baseline.pop(gone, None)
         _last_active.pop(gone, None)
     models.sort(key=lambda m: (m["active"] <= 0, -(m["rate"] or 0), m["name"]))
     return models
 
 _no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# ─── 图表字符与风格 ────────────────────────────────────────────
-# nvtop 半块面积图的像素合成表：每个字符位表示 2 个垂直像素
-HALF = {(0, 0): " ", (0, 1): "▀", (1, 0): "▄", (1, 1): "█"}
-WAVE_TOP = "▁▂▃▄▅▆▇"       # 波柱顶面：水位起伏动画字形（按列相位循环）
-DENSITY = " ░▒▓█"           # 热力条密度字符（5 级）
+# ─── 当前值仪表 ────────────────────────────────────────────────
+# 所有百分比都画成一行式仪表：标签 + 数值 + ▰▱ 条 + 右侧明细，只呈现此刻的值。
+# 压力类（算力/带宽/CPU/交换/磁盘）按值分级着色：绿 <60 ≤黄 <85 ≤红；
+# 容量类（显存/内存）固定青蓝系——模型常驻显存是"占"不是"忙"，避免误读为过载。
+GAUGE_LABEL_W = 12        # 标签+数值固定列宽（"算力 100.0%"）
+GAUGE_METER_MIN = 8       # 仪表条最小保留宽度
+_gauge_shown: dict[str, float] = {}   # 平滑显示值（key -> 上次画出的 %）
 
-# 图表风格（C 键循环）：area=面积图(经典nvtop) / wave=波动直方图 /
-# spectrum=频谱柱(分级着色+落顶帽) / heat=热力条(单行密度)
-CHART_STYLES = ("area", "wave", "spectrum", "heat")
-CHART_STYLE_NAMES = {"area": "面积图", "wave": "波动直方图",
-                     "spectrum": "频谱柱", "heat": "热力条"}
-CHART_STYLE = os.environ.get("SYSMON_CHART", "wave")
-if CHART_STYLE not in CHART_STYLES:
-    CHART_STYLE = "area"
-_FRAME = 0                  # 当前动画帧（draw() 每帧更新，波顶相位用）
-_spectrum_caps: dict[str, list[float]] = {}   # 频谱顶帽（hkey -> 每列峰值）
+def put_meter(stdscr, y, x, w, frac, pair, glint=False):
+    """水平仪表条：▰=当前占用 / ▱=余量（暗色）。
 
-
-def cycle_chart_style() -> str:
-    """C 键：切到下一图表风格，返回新风格名。"""
-    global CHART_STYLE
-    CHART_STYLE = CHART_STYLES[(CHART_STYLES.index(CHART_STYLE) + 1)
-                               % len(CHART_STYLES)]
-    _spectrum_caps.clear()
-    return CHART_STYLE
-
-
-def _cols_from(history: list[float], width: int) -> list[float]:
-    """历史序列右对齐到 width 列（不足左侧补 0），clamp 到 0..1。"""
-    n = min(len(history), width)
-    cols = [0.0] * width
-    if n:
-        src = history[len(history) - n:]
-        cols[width - n:] = [min(max(float(v), 0.0), 1.0) for v in src]
-    return cols
-
-
-def _bar_grid(history: list[float], width: int, height: int,
-              frame: int) -> list[list[tuple[str, str, float]]]:
-    """波柱/频谱共用的柱网格：cell = (字符, 类型, 该行高度比例0..1)。
-    类型：body 柱身 / top 波顶 / empty 底纹 / cap 顶帽（由 _spectrum_cap_grid 写入）。
-    柱自底向上填充；顶行按列相位取波浪字形，形成水面起伏。
-    """
-    cols = _cols_from(history, width)
-    pad = max(0, width - len(history))        # 左侧无数据列：留白（区别于真实 0%）
-    grid = [[(" ", "", 0.0)] * width for _ in range(height)]
-    for i, v in enumerate(cols):
-        h = v * height                        # 连续柱高（行）
-        if i < pad:
-            continue
-        if h <= 0.05:
-            for r in range(height):
-                grid[r][i] = ("░", "empty", (height - r) / height)
-            continue
-        for r in range(height):
-            pb = height - 1 - r               # 距底行数（0=最底）
-            frac = (pb + 1) / height
-            if pb < h - 0.5:
-                grid[r][i] = ("█", "body", frac)
-            elif pb < h + 0.5:
-                grid[r][i] = (WAVE_TOP[(frame + i) % len(WAVE_TOP)], "top", frac)
-            else:
-                grid[r][i] = ("░", "empty", frac)
-    return grid
-
-
-def _apply_spectrum_caps(grid, history: list[float], width: int, height: int,
-                         hkey: str | None):
-    """频谱顶帽：每列记忆峰值并缓慢下落（▔），高于当前柱顶时可见。"""
-    if not hkey:
+    glint：开动画时在已填充段让一个亮格自左向右扫掠（微光流动感），
+    其余格略暗形成对比；窄条（<10 格）或填充 <3 格时自动跳过。"""
+    if w <= 0:
         return
-    cols = _cols_from(history, width)
-    cap = _spectrum_caps.get(hkey)
-    if cap is None or len(cap) != width:
-        cap = list(cols)
-        _spectrum_caps[hkey] = cap
-    pad = max(0, width - len(history))
-    for i, v in enumerate(cols):
-        cap[i] = max(cap[i] * 0.985, v)       # ~8fps 下约 6s 半衰
-        if i < pad or cap[i] <= 0.02:
-            continue                           # 无数据/零值列不画帽
-        cap_row = height - 1 - int(round(cap[i] * height))
-        bar_top = next((r for r in range(height)
-                        if grid[r][i][1] in ("body", "top")), height)
-        if 0 <= cap_row < bar_top:
-            grid[cap_row][i] = ("▔", "cap", cap[i])
+    frac = max(0.0, min(1.0, frac))
+    n = int(round(frac * w))
+    if glint and ANIM and n >= 3 and w >= 10:
+        put(stdscr, y, x, METER_ON * n, cpair(pair) | curses.A_DIM, w)
+        put(stdscr, y, x + (_FRAME * GLINT_STEP) % n, METER_ON, cpair(pair, True), 1)
+    else:
+        put(stdscr, y, x, METER_ON * n, cpair(pair, True), w)
+    put(stdscr, y, x + n, METER_OFF * (w - n), cpair(PAIR_BORDER), w - n)
 
-def draw_chart_area(history: list[float], width: int, height: int, frame: int = 0) -> list[str]:
-    """nvtop 经典面积图（原始风格）。"""
-    pix_h = height * 2
-    n = min(len(history), width)
-    cols = [0.0] * width
-    for i in range(n):
-        cols[width - n + i] = history[len(history) - n + i]
-    rows = [[] for _ in range(height)]
-    for v in cols:
-        filled = int(round(min(max(v, 0.0), 1.0) * pix_h))
-        for r in range(height):
-            lo = 2 * (height - 1 - r)
-            hi = lo + 1
-            bot = 1 if filled > lo else 0
-            top = 1 if filled > hi else 0
-            rows[r].append(HALF[(top, bot)])
-    return ["".join(r) for r in rows]
+def put_gauge(stdscr, y, x, w, label, pct, detail="", pair=None, key=None):
+    """一行当前值仪表：左=标签+百分比（着色），中=▰▱仪表条，右=暗色明细。
 
-
-# ─── 历史数据 ─────────────────────────────────────────────────
-_history: dict[str, list[float]] = {}
-
-def push(key: str, value: float) -> list[float]:
-    h = _history.setdefault(key, [])
-    h.append(value)
-    if len(h) > HISTORY_LEN:
-        h.pop(0)
-    return h
+    key：开动画时显示值向采样值 ease-out 滑行（~0.5s 收敛），数字/条/颜色同步；
+    动画关或暂停时直接跳到真实值，读数不失真。"""
+    if key is not None and ANIM and not PAUSED:
+        prev = _gauge_shown.get(key)
+        v = pct if prev is None else prev + (pct - prev) * LERP
+        if abs(pct - v) < 0.05:
+            v = pct
+        _gauge_shown[key] = v
+    else:
+        v = pct
+    pair = pair if pair is not None else color_for(v)
+    head = pad(label, 4) + f" {v:5.1f}%"
+    put(stdscr, y, x, clip(head, GAUGE_LABEL_W), cpair(pair, True), GAUGE_LABEL_W)
+    dw = disp_width(detail) if detail else 0
+    dw = min(dw, max(0, w - GAUGE_LABEL_W - GAUGE_METER_MIN - 2))
+    mw = max(0, w - GAUGE_LABEL_W - 2 - (dw + 1 if dw else 0))
+    put_meter(stdscr, y, x + GAUGE_LABEL_W + 1, mw, v / 100, pair, glint=True)
+    if dw:
+        put(stdscr, y, x + GAUGE_LABEL_W + 2 + mw, clip(detail, dw),
+            cpair(PAIR_DIM), dw)
 
 # ─── 模型识别 ─────────────────────────────────────────────────
 MODEL_FLAGS = (
@@ -533,23 +449,151 @@ def get_disk_info() -> dict:
 
 _disk_cache: tuple = ()
 
+
+def get_net_info() -> list[dict]:
+    """各网卡当前收发速率与累计字节（差分自上次采样）。
+
+    排除 lo/veth/br-/docker 等虚拟口；满格刻度 = 链路速率（未知时取本批最活跃口）。
+    """
+    now = time.time()
+    try:
+        per = psutil.net_io_counters(pernic=True)
+        stats = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+    except (AttributeError, OSError):
+        return []
+    nics = []
+    for name, io in per.items():
+        if name.startswith(("lo", "veth", "br-", "docker", "virbr")):
+            continue
+        st = stats.get(name)
+        if st and not st.isup:
+            continue
+        prev = _net_cache.get(name)
+        rx = tx = 0.0
+        if prev:
+            dt = now - prev[2]
+            if dt > 0:
+                rx = max(0.0, (io.bytes_recv - prev[0]) / dt)
+                tx = max(0.0, (io.bytes_sent - prev[1]) / dt)
+        _net_cache[name] = (io.bytes_recv, io.bytes_sent, now)
+        ip = ""
+        for a in addrs.get(name, []):
+            if a.family == socket.AF_INET:
+                ip = a.address
+                break
+        nics.append({"name": name, "rx": rx, "tx": tx,
+                     "rx_total": io.bytes_recv, "tx_total": io.bytes_sent,
+                     "link_mbps": (st.speed if st else 0),   # 以太网为 Mb/s
+                     "ip": ip})
+    nics.sort(key=lambda n: -(n["rx"] + n["tx"]))
+    return nics
+
+_net_cache: dict[str, tuple[int, int, float]] = {}
+
+
+_DISK_NAME_RE = re.compile(r"(nvme\d+n\d+|mmcblk\d+|sd[a-z]|vd[a-z]|hd[a-z])$")
+
+
+def get_diskio_info() -> list[dict]:
+    """物理盘当前 I/O：吞吐、IOPS、利用率%（busy_time 差分——真正的磁盘压力）。"""
+    now = time.time()
+    try:
+        per = psutil.disk_io_counters(perdisk=True)
+    except (AttributeError, OSError):
+        return []
+    out = []
+    for name, v in (per or {}).items():
+        if not _DISK_NAME_RE.fullmatch(name):
+            continue
+        prev = _diskio_cache.get(name)
+        r = w = ri = wi = util = 0.0
+        if prev:
+            dt = now - prev[0]
+            if dt > 0:
+                r = max(0.0, (v.read_bytes - prev[1]) / dt)
+                w = max(0.0, (v.write_bytes - prev[2]) / dt)
+                ri = max(0.0, (v.read_count - prev[3]) / dt)
+                wi = max(0.0, (v.write_count - prev[4]) / dt)
+                util = min(100.0, max(0.0, (v.busy_time - prev[5]) / (dt * 1000) * 100))
+        _diskio_cache[name] = (now, v.read_bytes, v.write_bytes,
+                               v.read_count, v.write_count, v.busy_time)
+        out.append({"name": name, "r_bps": r, "w_bps": w,
+                    "r_iops": ri, "w_iops": wi, "util": util})
+    out.sort(key=lambda d: -(d["util"] * 1e6 + d["r_bps"] + d["w_bps"]))
+    return out
+
+_diskio_cache: dict[str, tuple] = {}
+
+
+def get_proc_list() -> list[dict]:
+    """全系统进程当前指标（%CPU 需跨采样差分，首次出现记 0）。
+
+    缓存 Process 对象与 create_time；后者变化 = pid 被复用，重建基线。
+    跳过内核线程（无命令行）。
+    """
+    out = []
+    seen = set()
+    for pid in psutil.pids():
+        try:
+            p = _proc_all.get(pid)
+            if p is None:
+                p = psutil.Process(pid)
+                cmd = [a for a in p.cmdline() if a.strip()]
+                if not cmd:
+                    continue
+                _proc_all[pid] = p
+                _proc_ctime[pid] = p.create_time()
+                p.cpu_percent(None)          # 建立差分基线，本轮 %CPU 记 0
+                cpu = 0.0
+            else:
+                if p.create_time() != _proc_ctime.get(pid):
+                    _proc_all.pop(pid, None)     # pid 复用：下一轮重建
+                    _proc_ctime.pop(pid, None)
+                    continue
+                cmd = [a for a in p.cmdline() if a.strip()]
+                if not cmd:
+                    continue
+                cpu = p.cpu_percent(None)
+            mi = p.memory_info()
+            out.append({"pid": pid, "cpu": cpu, "rss": mi.rss,
+                        "pmem": p.memory_percent(), "user": p.username()[:8],
+                        "cmd": " ".join(cmd)})
+            seen.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            _proc_all.pop(pid, None)
+            _proc_ctime.pop(pid, None)
+    for dead in set(_proc_all) - seen:
+        _proc_all.pop(dead, None)
+        _proc_ctime.pop(dead, None)
+    return out
+
+_proc_all: dict[int, psutil.Process] = {}
+_proc_ctime: dict[int, float] = {}
+
+
+def get_uptime() -> float:
+    try:
+        return time.time() - psutil.boot_time()
+    except OSError:
+        return 0.0
+
 # ─── 颜色 ──────────────────────────────────────────────────────
 # 语义角色（全程序统一，颜色只是这些角色的具体呈现）：
 #   HEADER  面板标题条 / 顶栏          黑字 + 青色底
-#   BORDER  分隔线 / 峰值标记          暗灰（弱化结构线）
+#   BORDER  分隔线 / 仪表条余量▱       暗灰（弱化结构线）
 #   DIM     次要信息：单位、明细、注释  中灰
 #   ACCENT  表头 / 标签                柔和青蓝
-#   OK      正常 / 生成阶段 t/s        绿
-#   WARN    注意 / Prompt 处理 p/s     琥珀（忙碌但非异常）
-#   CRIT    告警：高温 / 利用率 ≥85%   红
-#   GPU     GPU 曲线（多卡按下面板循环）蓝紫青系
-#   MEM     内存曲线 / 数值            青蓝
-#   CPU     CPU 曲线 / 数值            绿
-#   DISK    磁盘曲线 / 数值            土黄
+#   OK      正常 / 生成阶段 t/s / 低负载仪表   绿
+#   WARN    注意 / Prompt 处理 p/s / 中负载仪表 琥珀（忙碌但非异常）
+#   CRIT    告警：高温 / 利用率 ≥85% 仪表      红
+#   GPU     GPU 面板标题（多卡按下面板循环）蓝紫青系
+#   MEM     显存/内存仪表（容量占用类，非压力）青蓝
+#   CPU     CPU 相关数值                          绿
+#   DISK    磁盘/交换数值                         土黄
 #   MODEL   GPU 上进程的模型名标签      紫
 (PAIR_HEADER, PAIR_DIM, PAIR_BORDER, PAIR_OK, PAIR_WARN, PAIR_CRIT,
- PAIR_GPU, PAIR_MEM, PAIR_CPU, PAIR_DISK, PAIR_MODEL, PAIR_ACCENT,
- PAIR_SPARK_G, PAIR_SPARK_P, PAIR_PEAK) = range(1, 16)
+ PAIR_GPU, PAIR_MEM, PAIR_CPU, PAIR_DISK, PAIR_MODEL, PAIR_ACCENT) = range(1, 13)
 
 _ROLE_PAIR = {
     "header": PAIR_HEADER, "border": PAIR_BORDER, "dim": PAIR_DIM,
@@ -592,14 +636,7 @@ def init_colors(theme=None):
             else:
                 fg, bg = _LOGICAL_C[base], -1
         curses.init_pair(pair, fg, bg)
-    # sparkline / 峰值：跟随 ok/warn/border 角色
-    for src, dst in ((PAIR_OK, PAIR_SPARK_G), (PAIR_WARN, PAIR_SPARK_P),
-                     (PAIR_BORDER, PAIR_PEAK)):
-        try:
-            curses.init_pair(dst, *curses.pair_content(src))
-        except (curses.error, ValueError):
-            curses.init_pair(dst, curses.COLOR_WHITE, -1)
-    # 动态配色：GPU 曲线（pair 20+i）与亮色版本（pair 40+i）
+    # 动态配色：GPU 面板色（pair 20+i）与亮色版本（pair 40+i）
     global GPU_COLORS
     if hi:
         GPU_COLORS = tuple(theme.get("gpu") or _theme.DEFAULT_THEME["gpu"])
@@ -646,71 +683,6 @@ def put(stdscr, y, x, text, attr=curses.A_NORMAL, maxw=None):
     except curses.error:
         pass
 
-def put_chart(stdscr, y, x, w, history, color_pair, height=2, bold=False,
-              peak=False, hkey=None):
-    """按当前 CHART_STYLE 绘制负载可视化（C 键切换）：
-    area=面积图(peak ▁ 标记) / wave=波动直方图(顶面水波动画) /
-    spectrum=频谱柱(绿→红分级着色+▔落顶帽) / heat=热力条(单行密度+按值着色)。
-    hkey 用于频谱顶帽的列峰值记忆。
-    """
-    style = CHART_STYLE if CHART_STYLE in CHART_STYLES else "area"
-    if style == "area":
-        lines = draw_chart_area(history, w, height)
-        attr = cpair(color_pair, bold)
-        if peak and history and max(history) > 0.02:
-            lines = _mark_peak(lines, history, w)
-        for r, line in enumerate(lines):
-            put(stdscr, y + r, x, line, attr, w)
-        return
-    if style == "heat":
-        cols = _cols_from(history, w)
-        pad = max(0, w - len(history))
-        for i, v in enumerate(cols):
-            if i < pad:
-                continue                          # 无数据留白
-            if v <= 0.02:
-                put(stdscr, y + height - 1, x + i, "░", cpair(PAIR_BORDER), 1)
-            else:
-                cell = DENSITY[min(4, int(v * 4.999) + 1)]
-                put(stdscr, y + height - 1, x + i, cell,
-                    cpair(color_for(v * 100), v >= 0.6), 1)
-        return
-    grid = _bar_grid(history, w, height, _FRAME)
-    if style == "spectrum":
-        _apply_spectrum_caps(grid, history, w, height, hkey)
-    for r in range(height):
-        for i, (glyph, kind, frac) in enumerate(grid[r]):
-            if kind == "body":
-                a = cpair(color_for(frac * 100)) if style == "spectrum" \
-                    else cpair(color_pair, bold)
-            elif kind == "top":
-                a = cpair(color_for(frac * 100), True) if style == "spectrum" \
-                    else cpair(color_pair, True)
-            elif kind == "cap":
-                a = cpair(PAIR_ACCENT, True)
-            else:
-                a = cpair(PAIR_BORDER)
-            put(stdscr, y + r, x + i, glyph, a, 1)
-
-def _mark_peak(lines, history, w):
-    """在峰值所在列顶格画 ▁ 标记线（重绘为列表便于覆写）。"""
-    idx = max(range(len(history)), key=lambda i: history[i])
-    col = w - len(history) + idx
-    if 0 <= col < w and len(lines) >= 1:
-        top = list(lines[0])
-        if col < len(top) and top[col] == " ":
-            top[col] = "▁"
-            lines = ["".join(top)] + list(lines[1:])
-    return lines
-
-def spark_cells(stdscr, y, x, w, hist, base_pair):
-    """绘制 sparkline；有非零样本时最后一格用亮色突出当前值。"""
-    vals = list(hist)[-w:]
-    text = sparkline(vals, w)
-    put(stdscr, y, x, text, cpair(base_pair), w)
-    if vals and max(vals) > 0:
-        put(stdscr, y, x + w - 1, text[-1], cpair(base_pair, True), 1)
-
 def vline(stdscr, x, y0, y1, ch="│"):
     for y in range(y0, y1):
         put(stdscr, y, x, ch, cpair(PAIR_BORDER))
@@ -720,18 +692,16 @@ def anim_char(seq: str, frame: int) -> str:
 
 # ─── GPU 面板 ─────────────────────────────────────────────────
 
-def panel_gpu(stdscr, y, x, w, gpu, ch):
-    """单卡面板：标题 + 状态行 + Util/Mem 数值与负载图（风格随 CHART_STYLE）。共 4 + 2*ch 行。"""
+def panel_gpu(stdscr, y, x, w, gpu):
+    """单卡面板：标题 + 状态行 + 算力/显存/带宽 三条当前值仪表。共 5 行。"""
     gi = gpu["index"]
     gc = 20 + (gi % len(GPU_COLORS))
-    label_w = 25 if w >= 40 else max(13, w - 12)
-    chart_w = max(8, w - label_w - 1)
 
     # 标题行
     title = f"[GPU {gi}] {gpu['name']}"
     put(stdscr, y, x, clip(title, w), cpair(gc, True), w)
 
-    # 状态行：温度(分级着色) / 功耗 / 风扇 / 剩余显存
+    # 状态行：温度(分级着色) / 功耗 / 风扇
     y += 1
     cx = x
     if gpu["temp"]:
@@ -745,33 +715,20 @@ def panel_gpu(stdscr, y, x, w, gpu, ch):
     if gpu.get("fan") is not None:
         f = f"风扇 {gpu['fan']:.0f}%"
         put(stdscr, y, cx, f, cpair(PAIR_DIM), disp_width(f))
-        cx += disp_width(f) + 2
-    free = gpu["mem_total"] - gpu["mem_used"]
-    put(stdscr, y, cx, clip(f"显存空闲 {fmt_mb(free)}", max(0, w - (cx - x))),
-        cpair(PAIR_DIM), max(0, w - (cx - x)))
+
     mem_pct = gpu["mem_used"] / gpu["mem_total"] * 100
+    free = gpu["mem_total"] - gpu["mem_used"]
 
-    # Utilization：数值 + 负载图（风格随 CHART_STYLE）
+    # 当前值仪表：算力/带宽=压力分级色，显存=容量色（青蓝）
     y += 1
-    hist_u = push(f"gu{gi}", gpu["util"] / 100)
-    put(stdscr, y, x, f"算力 {gpu['util']:6.1f}%", cpair(color_for(gpu["util"]), True), 13)
-    if gpu.get("mem_util") is not None:
-        put(stdscr, y, x + 14, f"带宽 {gpu['mem_util']:3.0f}%", cpair(PAIR_DIM),
-            max(0, label_w - 14))
-    put_chart(stdscr, y + 1, x + label_w, chart_w, hist_u, gc, ch, bold=True,
-              peak=True, hkey=f"gu{gi}")
-
-    # Memory：数值 + 图表（风格由 C 键切换）
-    y += 1 + ch
-    hist_m = push(f"gm{gi}", gpu["mem_used"] / gpu["mem_total"])
-    put(stdscr, y, x, f"显存 {mem_pct:5.1f}%", cpair(color_for(mem_pct), True), 13)
-    detail = f"{fmt_mb(gpu['mem_used'])}/{fmt_mb(gpu['mem_total'])}"
-    put(stdscr, y, x + 14, clip(detail, max(0, label_w - 14)), cpair(PAIR_DIM),
-        max(0, label_w - 14))
-    put_chart(stdscr, y + 1, x + label_w, chart_w, hist_m, PAIR_MEM, ch, bold=True,
-              peak=True, hkey=f"gm{gi}")
-
-    return y + 1 + ch
+    put_gauge(stdscr, y, x, w, "算力", gpu["util"], key=f"gu{gi}u")
+    y += 1
+    put_gauge(stdscr, y, x, w, "显存", mem_pct,
+              f"{fmt_mb(gpu['mem_used'])}/{fmt_mb(gpu['mem_total'])} "
+              f"空闲{fmt_mb(free)}", pair=PAIR_MEM, key=f"gu{gi}m")
+    y += 1
+    put_gauge(stdscr, y, x, w, "带宽", gpu.get("mem_util") or 0.0, key=f"gu{gi}b")
+    return y + 1
 
 # ─── LLM token 面板 ───────────────────────────────────────────
 
@@ -830,12 +787,14 @@ def panel_llm(stdscr, y, x, w, models, max_rows, frame):
         elapsed = m.get("prefill_elapsed")
         if prefill:
             sp = anim_char(SPINNER, frame)
-            seg = f"{sp} Prompt ▰"
+            seg = f"{sp} Prompt "
             put(stdscr, y, cx, seg, cpair(PAIR_WARN, True), disp_width(seg))
             cx += disp_width(seg)
             barw = max(6, min(14, x + w - cx - 18))
-            bar = progress_bar((m.get("prefill_progress") or 0), barw)
-            put(stdscr, y, cx, bar, cpair(PAIR_WARN), barw)
+            fn = int(round(max(0.0, min(1.0, m.get("prefill_progress") or 0)) * barw))
+            put(stdscr, y, cx, METER_ON * fn, cpair(PAIR_WARN, True), barw)
+            put(stdscr, y, cx + fn, METER_OFF * (barw - fn), cpair(PAIR_BORDER),
+                barw - fn)
             cx += barw + 1
             tail = f"{prog:3.0f}% " + (f"{fmt_tokens(m.get('prefill_tokens'))}tok "
                                        f"{float(elapsed):.0f}s" if elapsed else
@@ -857,34 +816,37 @@ def panel_llm(stdscr, y, x, w, models, max_rows, frame):
             put(stdscr, y, cx, "空闲", cpair(PAIR_DIM), 4)
         y += 1
 
-        # ── 第二行：双 sparkline + 速率 + 活动/排队 + 累计 + 显存 ──
-        spark_w = 14 if w >= 150 else 10
-        put(stdscr, y, x + 2, "t/s", cpair(PAIR_OK, True), 3)
-        spark_cells(stdscr, y, x + 5, spark_w, _gen_hist.get(m["name"], ()),
-                    PAIR_SPARK_G)
+        # ── 第二行：当前速率数值 + slot 占用仪表 + 累计 ──
+        cx = x + 2
+        put(stdscr, y, cx, "t/s", cpair(PAIR_OK, True), 3)
         t_txt = f"{t_rate:7.1f}" if t_rate > 0 else "     --"
-        put(stdscr, y, x + 5 + spark_w + 1, t_txt,
+        put(stdscr, y, cx + 4, t_txt,
             cpair(PAIR_OK, True) if t_rate > 0 else cpair(PAIR_DIM), 7)
-        cx = x + 5 + spark_w + 9
+        cx += 13
         put(stdscr, y, cx, "p/s", cpair(PAIR_WARN, True), 3)
-        spark_cells(stdscr, y, cx + 3, spark_w, _prompt_hist.get(m["name"], ()),
-                    PAIR_SPARK_P)
-        cx += 3 + spark_w + 1
         p_txt = f"{p_rate:6.0f}" if p_rate > 0 else "    --"
-        put(stdscr, y, cx, p_txt,
+        put(stdscr, y, cx + 4, p_txt,
             cpair(PAIR_WARN, True) if p_rate > 0 else cpair(PAIR_DIM), 6)
-        cx += 8
-
-        active_txt = f"{m['active']}/{slots}" if slots else str(m["active"])
-        if queueing:
-            q = anim_char(PULSE, frame // 3)
-            seg = f"{q} {active_txt} 排队"
-            put(stdscr, y, cx, seg, cpair(PAIR_WARN, True), disp_width(seg))
-        elif m["active"] > 0:
-            put(stdscr, y, cx, f"ACT {active_txt}", cpair(PAIR_OK, True), 9)
-        else:
-            put(stdscr, y, cx, f"ACT {active_txt}", cpair(PAIR_DIM), 9)
         cx += 12
+
+        put(stdscr, y, cx, "ACT", cpair(PAIR_DIM, True), 3)
+        cx += 4
+        if slots:
+            mw = 6
+            pair = PAIR_WARN if queueing else (PAIR_OK if m["active"] > 0 else PAIR_MEM)
+            put_meter(stdscr, y, cx, mw, m["active"] / slots if slots else 0.0, pair)
+            cx += mw + 1
+            put(stdscr, y, cx, f"{m['active']}/{slots}", cpair(pair, True), 5)
+            cx += 6
+            if queueing:
+                q = anim_char(PULSE, frame // 3)
+                seg = f"{q}+{m['active'] - slots}排队"
+                put(stdscr, y, cx, seg, cpair(PAIR_WARN, True), disp_width(seg))
+                cx += disp_width(seg) + 1
+        else:
+            put(stdscr, y, cx, str(m["active"]),
+                cpair(PAIR_OK, True) if m["active"] > 0 else cpair(PAIR_MEM), 3)
+            cx += 4
 
         put(stdscr, y, cx,
             f"Σprompt {fmt_tokens(m.get('prompt_total'))}", cpair(PAIR_DIM), 18)
@@ -898,52 +860,45 @@ def panel_llm(stdscr, y, x, w, models, max_rows, frame):
         put(stdscr, y, x, f"… 另有 {hidden} 个模型未显示", cpair(PAIR_DIM), w)
         y += 1
 
-    # 图例（含当前负载图风格说明）
+    # 图例
     lx = x + 2
-    _chart_legend = {
-        "area": ((cpair(PAIR_BORDER), "▁"), (cpair(PAIR_DIM), "峰值 ")),
-        "wave": ((cpair(PAIR_OK), "▃▅▂"), (cpair(PAIR_DIM), "柱顶=水位 ")),
-        "spectrum": ((cpair(PAIR_ACCENT, True), "▔"),
-                     (cpair(PAIR_DIM), "顶帽=峰值回落 ")),
-        "heat": ((cpair(PAIR_DIM), "░▒▓█"), (cpair(PAIR_DIM), "密度=负载 ")),
-    }.get(CHART_STYLE, ())
     legend = (
         (cpair(PAIR_OK), "●"), (cpair(PAIR_DIM), "生成 "),
-        (cpair(PAIR_WARN), "◐"), (cpair(PAIR_DIM), "Prompt "),
+        (cpair(PAIR_WARN), "⠋"), (cpair(PAIR_DIM), "Prompt "),
         (cpair(PAIR_OK, True), "t/s"), (cpair(PAIR_DIM), "=生成速率 "),
         (cpair(PAIR_WARN, True), "p/s"), (cpair(PAIR_DIM), "=Prompt速率 "),
-    ) + _chart_legend + (
-        (cpair(PAIR_DIM), f"C键:图→{CHART_STYLES[(CHART_STYLES.index(CHART_STYLE)+1) % len(CHART_STYLES)]}  "
-                          "ACT=活动/slot(超则排队)  Σ=累计(加载以来)  K=千 M=百万tok"),
+        (cpair(PAIR_MEM), "▰▱"), (cpair(PAIR_DIM), " ACT=slot占用(超则排队)  "),
+        (cpair(PAIR_OK), "▰"), (cpair(PAIR_DIM), " 绿<60 "),
+        (cpair(PAIR_WARN), "▰"), (cpair(PAIR_DIM), " 黄<85 "),
+        (cpair(PAIR_CRIT), "▰"), (cpair(PAIR_DIM), " 红≥85  "),
+        (cpair(PAIR_DIM), "Σ=加载以来累计  K=千 M=百万tok"),
     )
     for a, seg in legend:
+        if lx - x + disp_width(seg) > w:
+            break                                   # 窄屏：图例装不下就截断
         put(stdscr, y, lx, seg, a, disp_width(seg))
         lx += disp_width(seg)
     return y + 2
 
 # ─── CPU 面板 ─────────────────────────────────────────────────
 
-def panel_cpu(stdscr, y, x, w, cpu, ch, room=99):
-    """CPU 面积图 + 每核方块 + 每核数字表。"""
+def panel_cpu(stdscr, y, x, w, cpu, room=99):
+    """CPU 总体仪表 + 每核方块图（均为当前值）+ 每核占用数字表。"""
     label_w = 13
     chart_w = max(10, w - label_w - 1)
     top = y
 
-    hist = push("cpu", cpu["total"] / 100)
-    put(stdscr, y, x, f"CPU  {cpu['total']:5.1f}%", cpair(color_for(cpu["total"]), True), label_w)
     extra = ""
     if cpu["load"]:
         extra = f"load {cpu['load'][0]:.2f} {cpu['load'][1]:.2f} {cpu['load'][2]:.2f}"
     if cpu["freq"]:
         extra += f"  {cpu['freq'] / 1000:.2f}GHz"
-    put(stdscr, y, x + label_w, clip(extra, chart_w), cpair(PAIR_DIM), chart_w)
-    put_chart(stdscr, y + 1, x + label_w, chart_w, hist, PAIR_CPU, ch,
-              peak=True, hkey="cpu")
+    put_gauge(stdscr, y, x, w, "CPU", cpu["total"], extra, key="cpu")
 
-    # 每核方块图：一列一核，▁▂▃▄▅▆▇█ 八级
+    # 每核方块图：一列一核，当前值 8 级
     LEVELS = " ▁▂▃▄▅▆▇█"
     cores = cpu["per_core"]
-    y += 1 + ch
+    y += 1
     put(stdscr, y, x, f"每核 {len(cores)}:", cpair(PAIR_DIM), label_w)
     for i, c in enumerate(cores[:chart_w]):
         put(stdscr, y, x + label_w + i, LEVELS[min(8, int(round(c / 100 * 8)))],
@@ -973,63 +928,134 @@ def panel_cpu(stdscr, y, x, w, cpu, ch, room=99):
 
 # ─── 系统面板（内存/交换/磁盘）────────────────────────────────
 
-def panel_mem(stdscr, y, x, w, mem, disk, ch):
-    """内存 / 交换 / 磁盘 面积图。"""
-    label_w = 12
-    chart_w = max(10, w - label_w - 1)
+def panel_mem(stdscr, y, x, w, mem, disk):
+    """内存 / 交换 / 磁盘 一行式当前值仪表。"""
     vm, sm = mem["vm"], mem["sm"]
 
-    def block(row, label, pct, detail, hist_key, pair):
-        h = push(hist_key, pct / 100)
-        put(stdscr, row, x, f"{label} {pct:5.1f}%", cpair(color_for(pct), True), label_w)
-        put(stdscr, row, x + label_w, clip(detail, chart_w), cpair(PAIR_DIM), chart_w)
-        put_chart(stdscr, row + 1, x + label_w, chart_w, h, pair, ch,
-                  peak=True, hkey=hist_key)
+    def block(row, label, pct, detail, pair=None, key=None):
+        put_gauge(stdscr, row, x, w, label, pct, detail, pair=pair, key=key)
 
     block(y, "内存", vm.percent,
-          f"{fmt_bytes(vm.used)}/{fmt_bytes(vm.total)}  可用 {fmt_bytes(vm.available)}"
-          f"  活动 {fmt_bytes(getattr(vm, 'active', 0))}", "ram", PAIR_MEM)
-    y += 1 + ch
-    block(y, "交换", sm.percent, f"{fmt_bytes(sm.used)}/{fmt_bytes(sm.total)}", "swap", PAIR_DISK)
-    y += 1 + ch
+          f"{fmt_bytes(vm.used)}/{fmt_bytes(vm.total)}  可用 {fmt_bytes(vm.available)}",
+          pair=PAIR_MEM, key="ram")
+    y += 1
+    block(y, "交换", sm.percent, f"{fmt_bytes(sm.used)}/{fmt_bytes(sm.total)}",
+          key="swap")
+    y += 1
     if disk["du"]:
         block(y, "磁盘", disk["du"].percent,
               f"{fmt_bytes(disk['du'].used)}/{fmt_bytes(disk['du'].total)}"
-              f"  剩余 {fmt_bytes(disk['du'].free)}", "disk", PAIR_DISK)
-        put(stdscr, y + 1 + ch, x + label_w,
-            f"读 {fmt_bytes(disk['read_bps'])}/s  写 {fmt_bytes(disk['write_bps'])}/s",
-            cpair(PAIR_DIM), chart_w)
-        y += 1 + ch
+              f"  剩余 {fmt_bytes(disk['du'].free)}"
+              f"  读 {fmt_bytes(disk['read_bps'])}/s 写 {fmt_bytes(disk['write_bps'])}/s",
+              key="disk")
+        y += 1
     return y + 1
 
 # ─── 进程表 ────────────────────────────────────────────────────
 
-def proc_columns(w):
-    """按终端宽度决定进程表列；窄屏优先砍掉 USER / %MEM，保住命令行。"""
+# ─── 网络面板 ─────────────────────────────────────────────────
+
+def panel_net(stdscr, y, x, w, nics):
+    """进出口网速：每网卡当前 ↓入 ↑出 + mini 仪表。满格=链路速率（未知取本批最活跃）。"""
+    head = "网络  ↓入 ↑出"
+    put(stdscr, y, x, head, cpair(PAIR_ACCENT, True), disp_width(head))
+    hint = "满格=带宽"
+    put(stdscr, y, x + max(0, w - disp_width(hint)), hint, cpair(PAIR_DIM), disp_width(hint))
+    y += 1
+    if not nics:
+        put(stdscr, y, x, "（无活动网卡）", cpair(PAIR_DIM), w)
+        return y + 2
+    rel = max([max(n["rx"], n["tx"]) for n in nics] + [100_000.0])
+    for n in nics[:3]:
+        scale = (n["link_mbps"] * 1_000_000 / 8) if n.get("link_mbps") else rel
+        cx = x
+        name = clip(n["name"], 12)
+        put(stdscr, y, cx, pad(name, 13), cpair(PAIR_DIM), 13)
+        cx += 13
+        for glyph, rate, in_color in ((ARROW_IN, n["rx"], PAIR_OK),
+                                      (ARROW_OUT, n["tx"], PAIR_MEM)):
+            pct = rate / scale * 100 if scale > 0 else 0.0
+            arrow = (glyph[(_FRAME // 2) % 2] if (ANIM and rate > 0)
+                     else glyph[0])
+            put(stdscr, y, cx, arrow, cpair(in_color, True), 1)
+            put(stdscr, y, cx + 1, rpad(fmt_bytes(rate) + "/s", 8),
+                cpair(PAIR_OK if pct >= 1 else PAIR_DIM), 8)
+            put_meter(stdscr, y, cx + 10, 6, pct / 100, color_for(pct))
+            cx += 17
+        ip = n.get("ip") or ""
+        if ip and cx - x + disp_width(ip) < w:
+            put(stdscr, y, cx, ip, cpair(PAIR_DIM), x + w - cx)
+        y += 1
+    tot_d = sum(n["rx_total"] for n in nics)
+    tot_u = sum(n["tx_total"] for n in nics)
+    put(stdscr, y, x, f"Σ累计 ↓{fmt_bytes(tot_d)}  ↑{fmt_bytes(tot_u)}",
+        cpair(PAIR_DIM), w)
+    return y + 2
+
+# ─── 磁盘 I/O 面板 ────────────────────────────────────────────
+
+def panel_diskio(stdscr, y, x, w, disks):
+    """物理盘当前吞吐 / IOPS / util（busy_time 差分——磁盘真正的压力指标）。"""
+    head = "磁盘 I/O  util=繁忙度"
+    put(stdscr, y, x, head, cpair(PAIR_ACCENT, True), disp_width(head))
+    y += 1
+    if not disks:
+        put(stdscr, y, x, "（无磁盘 I/O 数据）", cpair(PAIR_DIM), w)
+        return y + 1
+    for d in disks[:3]:
+        name = clip(d["name"], 9)
+        put(stdscr, y, x, pad(name, 10), cpair(PAIR_DIM), disp_width(name))
+        put_gauge(stdscr, y, x + 10, w - 10, "", d["util"],
+                  f"读{fmt_bytes(d['r_bps'])}/s 写{fmt_bytes(d['w_bps'])}/s "
+                  f"{d['r_iops'] + d['w_iops']:,.0f}io/s", key=f"dio{d['name']}")
+        y += 1
+    return y
+
+# ─── 进程表（全系统，可排序）──────────────────────────────────
+
+PROC_SORTS = ("vram", "cpu", "mem")
+PROC_SORT_NAMES = {"vram": "显存", "cpu": "%CPU", "mem": "%MEM"}
+PROC_SORT = 0                   # 运行时索引（P 键循环）
+
+
+def cycle_proc_sort() -> str:
+    global PROC_SORT
+    PROC_SORT = (PROC_SORT + 1) % len(PROC_SORTS)
+    return PROC_SORTS[PROC_SORT]
+
+
+def panel_procs(stdscr, y, x, w, gpus, procs, max_rows, bar_w=14):
+    """全宽进程表：GPU/PID/USER/%CPU/%MEM/RSS/VRAM + 显存仪表 + 模型/命令行。
+    排序方式 P 键循环（显存→%CPU→%MEM），覆盖全系统进程。"""
+    vram_by_pid = {p["pid"]: p for g in gpus for p in g["procs"]}
+    gpu_total = {g["index"]: g["mem_total"] for g in gpus}
+    rows = []
+    for p in procs:
+        g = vram_by_pid.get(p["pid"])
+        rows.append({**p, "vram": g["mem"] if g else None,
+                     "gpu": g["gpu"] if g else None,
+                     "model": g.get("model") if g else None,
+                     "cmd": g["cmd"] if g else p["cmd"]})
+    mode = PROC_SORTS[PROC_SORT]
+    if mode == "vram":
+        rows.sort(key=lambda r: (-(r["vram"] or 0), -r["cpu"]))
+    elif mode == "cpu":
+        rows.sort(key=lambda r: -r["cpu"])
+    else:
+        rows.sort(key=lambda r: -r["pmem"])
+
     cols = [
-        ("GPU",   4, lambda p: f"{p['gpu']:>3}"),
-        ("PID",   8, lambda p: f"{p['pid']:>7}"),
-        ("USER",  8, lambda p: f"{p.get('user', '?'):>7}"),
-        ("%CPU",  6, lambda p: f"{p.get('cpu', 0.0):>5.1f}"),
-        ("%MEM",  6, lambda p: f"{p.get('pmem', 0.0):>5.1f}"),
-        ("RSS",   7, lambda p: f"{fmt_bytes(p.get('rss', 0)):>6}"),
-        ("VRAM",  8, lambda p: f"{fmt_mb(p['mem']):>7}" if p["mem"] else f"{'?':>7}"),
+        ("GPU",   3, lambda r: f"{r['gpu']:>3}" if r["gpu"] is not None else " · "),
+        ("PID",   7, lambda r: f"{r['pid']:>7}"),
+        ("USER",  7, lambda r: f"{r.get('user', '?'):>7}"),
+        ("%CPU",  5, lambda r: f"{r['cpu']:>5.1f}"),
+        ("%MEM",  5, lambda r: f"{r['pmem']:>5.1f}"),
+        ("RSS",   6, lambda r: f"{fmt_bytes(r['rss']):>6}"),
+        ("VRAM",  7, lambda r: f"{fmt_mb(r['vram']):>7}" if r["vram"] else "     · "),
     ]
-    if w < 118:
-        cols = [c for c in cols if c[0] not in ("USER", "%MEM", "RSS")]
-    elif w < 132:
-        cols = [c for c in cols if c[0] != "RSS"]
-    return cols
-
-
-def panel_procs(stdscr, y, x, w, gpus, max_rows=8, bar_w=16):
-    """全宽 GPU 进程表：GPU/PID/USER/%CPU/%MEM/RSS/VRAM + 显存条 + 模型/命令。"""
-    procs = [p for g in gpus for p in g["procs"]]
-    procs.sort(key=lambda p: p["mem"] or 0, reverse=True)
-
-    cols = proc_columns(w)
-    # 预留：显存条 + 至少 20 列给命令
-    while w < sum(c[1] + 1 for c in cols) + bar_w + 21 and len(cols) > 2:
+    if w < 116:
+        cols = [c for c in cols if c[0] not in ("USER", "RSS")]
+    while w < sum(c[1] + 1 for c in cols) + bar_w + 21 and len(cols) > 3:
         cols.pop(-2 if cols[-1][0] == "VRAM" else -1)
 
     xs, acc = [], 0
@@ -1038,48 +1064,65 @@ def panel_procs(stdscr, y, x, w, gpus, max_rows=8, bar_w=16):
         acc += cw + 1
     bar_x, cmd_x = acc, acc + bar_w + 1
 
+    sort_col = {"vram": "VRAM", "cpu": "%CPU", "mem": "%MEM"}[mode]
     for cx, (name, _, _) in zip(xs, cols):
-        put(stdscr, y, x + cx, name, cpair(PAIR_ACCENT, True), max(0, w - cx))
+        put(stdscr, y, x + cx, name, cpair(PAIR_ACCENT, name == sort_col),
+            max(0, w - cx))
     put(stdscr, y, x + bar_x, "占用", cpair(PAIR_ACCENT, True), max(0, w - bar_x))
-    put(stdscr, y, x + cmd_x, "模型 / 命令行", cpair(PAIR_ACCENT, True), max(0, w - cmd_x))
+    tag = f"模型 / 命令行（P排序:{PROC_SORT_NAMES[mode]}）"
+    put(stdscr, y, x + cmd_x, tag, cpair(PAIR_ACCENT, True), max(0, w - cmd_x))
     y += 1
 
-    for p in procs[:max(0, max_rows)]:
-        gpu = next((g for g in gpus if g["index"] == p["gpu"]), None)
-        mem_pct = ((p["mem"] or 0) / gpu["mem_total"] * 100) if gpu and gpu["mem_total"] else 0.0
-        attr = cpair(color_for(mem_pct))
-        for cx, (_, cw, fmt) in zip(xs, cols):
-            put(stdscr, y, x + cx, fmt(p), attr, cw)
-        n = int(round(mem_pct / 100 * bar_w))
-        put(stdscr, y, x + bar_x, "█" * n + "░" * (bar_w - n), attr, bar_w)
-        tag = f"[{p['model']}] " if p["model"] else ""
-        if tag:
-            put(stdscr, y, x + cmd_x, tag, cpair(PAIR_MODEL, True), max(0, w - cmd_x))
-        put(stdscr, y, x + cmd_x + len(tag),
-            clip(p["cmd"], w - cmd_x - len(tag)), cpair(PAIR_DIM),
-            max(0, w - cmd_x - len(tag)))
+    for r in rows[:max(0, max_rows)]:
+        mem_pct = ((r["vram"] or 0) / gpu_total[r["gpu"]] * 100) \
+            if r["gpu"] is not None and gpu_total.get(r["gpu"]) else 0.0
+        for cx, (name, cw, fmt) in zip(xs, cols):
+            a = cpair(PAIR_DIM)
+            if name == "%CPU" and r["cpu"] >= 60:
+                a = cpair(color_for(r["cpu"]), True)
+            elif name == "%MEM" and r["pmem"] >= 5:
+                a = cpair(color_for(min(100.0, r["pmem"] * 2)), True)
+            elif name == "VRAM" and r["vram"]:
+                a = cpair(color_for(mem_pct), True)
+            put(stdscr, y, x + cx, fmt(r), a, cw)
+        if r["vram"]:
+            put_meter(stdscr, y, x + bar_x, bar_w, mem_pct / 100,
+                      color_for(mem_pct), glint=True)
+        else:
+            put(stdscr, y, x + bar_x, " " * bar_w, cpair(PAIR_DIM), bar_w)
+        mtag = f"[{r['model']}] " if r["model"] else ""
+        if mtag:
+            put(stdscr, y, x + cmd_x, mtag, cpair(PAIR_MODEL, True), max(0, w - cmd_x))
+        put(stdscr, y, x + cmd_x + len(mtag),
+            clip(r["cmd"], w - cmd_x - len(mtag)), cpair(PAIR_DIM),
+            max(0, w - cmd_x - len(mtag)))
         y += 1
-    if not procs:
-        put(stdscr, y, x, "（GPU 无占用进程）", cpair(PAIR_DIM), w)
-        y += 1
-    elif len(procs) > max_rows:
-        put(stdscr, y, x, f"… 另有 {len(procs) - max_rows} 个进程未显示", cpair(PAIR_DIM), w)
+    n_vram = sum(1 for r in rows if r["vram"])
+    if not rows:
+        put(stdscr, y, x, "（无用户进程）", cpair(PAIR_DIM), w)
         y += 1
     else:
-        put(stdscr, y, x, f"共 {len(procs)} 个 GPU 进程", cpair(PAIR_DIM), w)
+        rest = len(rows) - max_rows
+        put(stdscr, y, x,
+            f"共 {len(rows)} 进程 · 排序:{PROC_SORT_NAMES[mode]}（P 切换）· "
+            f"{n_vram} 个占显存" + (f" · 另有 {rest} 行未显示" if rest > 0 else ""),
+            cpair(PAIR_DIM), w)
         y += 1
     return y
 
 # ─── 采样与主渲染 ──────────────────────────────────────────────
 
 def collect_samples(gateway, interval):
-    """采集一轮数据（含历史 push，每数据周期只调用一次）。"""
+    """采集一轮数据（每数据周期只调用一次；全部为当前值，不留历史）。"""
     return {
         "gpus": get_gpu_info(),
         "models": get_llm_models(gateway, timeout=min(0.8, max(0.2, interval / 2))),
         "cpu": get_cpu_info(),
         "mem": get_mem_info(),
         "disk": get_disk_info(),
+        "net": get_net_info(),
+        "diskio": get_diskio_info(),
+        "procs": get_proc_list(),
     }
 
 
@@ -1103,30 +1146,31 @@ def draw(stdscr, samples, interval, frame, theme_warn=None):
     # ── 标题栏（含全局吞吐聚合）──
     host = socket.gethostname()
     total_t = sum(float(m.get("rate") or 0) for m in llm_models)
-    bar = pad(f" SYSMON  {host}  {time.strftime('%Y-%m-%d %H:%M:%S')} ", cols)
+    total_p = sum(float(m.get("prompt_rate") or 0) for m in llm_models)
+    up = fmt_dur(get_uptime())
+    bar = pad(f" SYSMON  {host}" + (f"  运行{up}" if up != "-" else "")
+              + f"  {time.strftime('%Y-%m-%d %H:%M:%S')} ", cols)
     put(stdscr, 0, 0, bar, cpair(PAIR_HEADER, True), cols)
     if llm_models:
-        tag = f"Σ {total_t:5.1f} t/s "
-        right = x0 = cols - disp_width(tag) - 1
+        tag = f"Σ {total_t:5.1f} t/s" + (f" · {total_p:4.0f} p/s " if total_p > 0 else " ")
+        x0 = cols - disp_width(tag) - 1
         put(stdscr, 0, x0, tag, cpair(PAIR_HEADER, True), disp_width(tag))
-        dot = anim_char(PULSE, frame // 2) if total_t > 0 else "○"
+        dot = anim_char(PULSE, frame // 2) if (total_t > 0 or total_p > 0) else "○"
         put(stdscr, 0, max(0, x0 - 2), dot,
-            cpair(PAIR_OK if total_t > 0 else PAIR_DIM, True), 1)
+            cpair(PAIR_OK if (total_t > 0 or total_p > 0) else PAIR_DIM, True), 1)
 
-    # 依据终端高度自适应图表行数（每模型 2 行 + 面板头 + 图例）
-    llm_rows = min(len(llm_models), max(1, (rows - 20) // 2)) if llm_models else 1
-    llm_h = 2 * llm_rows + (3 if llm_models else 2)
-    ch = max(1, (rows - 16 - llm_h) // 5)
+    # 终端高度自适应：每模型 2 行 + 面板头 + 图例
+    llm_rows = min(len(llm_models), max(1, (rows - 22) // 2)) if llm_models else 1
     y = 1
 
     # ── GPU 区域：多卡并排 ──
     if gpus:
         pw = cols // len(gpus)
-        gpu_h = 2 + 2 * (1 + ch)
+        gpu_h = 5
         for gi, g in enumerate(gpus):
             gx = gi * pw
             gw = (cols - gx) if gi == len(gpus) - 1 else pw - 1
-            panel_gpu(stdscr, y, gx, gw, g, ch)
+            panel_gpu(stdscr, y, gx, gw, g)
         for gi in range(1, len(gpus)):
             vline(stdscr, gi * pw - 1, y, y + gpu_h)
         y += gpu_h
@@ -1139,33 +1183,38 @@ def draw(stdscr, samples, interval, frame, theme_warn=None):
         put(stdscr, y, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
         y = panel_llm(stdscr, y + 1, 0, cols - 1, llm_models, llm_rows, frame)
 
-    # ── CPU / 系统 双列 ──
+    # ── CPU | 系统·网络·磁盘IO 双列 ──
     half = cols // 2
     put(stdscr, y, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
     sep_y = y + 1
-    # CPU 面板可用行数：底部要留给进程表（分隔线 + 表头 + 至少 2 行 + 状态栏）
-    room = max(4, rows - 5 - sep_y)
+    n_nic = min(len(samples["net"]), 3)
+    n_disk = min(len(samples["diskio"]), 3)
+    # 右列总高：mem(3+空1) + net(头+nics+Σ+空) + diskio(头+disks)；左列 CPU 数字表补到同高
+    right_h = 4 + (n_nic + 4) + (1 + n_disk)
+    room = max(3, min(right_h, rows - 6 - sep_y))
 
-    y_cpu = panel_cpu(stdscr, sep_y, 0, half - 1, cpu, ch, room)
-    y_mem = panel_mem(stdscr, sep_y, half + 1, cols - half - 2, mem, disk, ch)
-    vline(stdscr, half, sep_y, min(max(y_cpu, y_mem), rows - 2))
+    y_cpu = panel_cpu(stdscr, sep_y, 0, half - 1, cpu, room)
+    rw = cols - half - 2
+    ry = panel_mem(stdscr, sep_y, half + 1, rw, mem, disk)
+    ry = panel_net(stdscr, ry, half + 1, rw, samples["net"])
+    ry = panel_diskio(stdscr, ry, half + 1, rw, samples["diskio"])
+    vline(stdscr, half, sep_y, min(max(y_cpu, ry), rows - 2))
 
-    # ── 进程表（剩余空间不足则省略）──
-    y_tbl = max(y_cpu, y_mem)
+    # ── 进程表（剩余空间不足则省略；预留表头+排序脚注 2 行）──
+    y_tbl = max(y_cpu, ry)
     avail = rows - 1 - y_tbl - 2          # 减去分隔线、表头、状态栏
-    if avail >= 1:
+    if avail >= 4:
         put(stdscr, y_tbl, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
-        panel_procs(stdscr, y_tbl + 1, 0, cols - 1, gpus, avail)
+        panel_procs(stdscr, y_tbl + 1, 0, cols - 1, gpus, samples["procs"], avail - 2)
 
     # ── 状态栏 ──
-    theme_name = (THEME or {}).get("name", "tokyo-night")
+    theme_name = (THEME or {}).get("name", "catppuccin-mocha")
     pause_tag = " ⏸已暂停 " if PAUSED else ""
     anim_tag = "动效开" if ANIM else "动效关"
-    status = (f" q 退出  Space 暂停  A 动画  C 图表  T/⇧T 主题"
+    status = (f" q 退出  Space 暂停  A 动画  P 进程排序  T/⇧T 主题"
               f" | {pause_tag}{anim_tag}"
-              f" 图表 {CHART_STYLE_NAMES[CHART_STYLE]}"
-              f" 刷新 {interval:.1f}s 采样 {len(_history.get('cpu', []))} 点"
-              f" 主题 {theme_name}")
+              f" 刷新 {interval:.1f}s 主题 {theme_name}"
+              f" · ▰▱=当前值仪表 绿黄红=压力分级 蓝=容量占用")
     put(stdscr, rows - 1, 0, pad(status, cols - 1), cpair(PAIR_HEADER, True), cols - 1)
     if theme_warn:
         put(stdscr, rows - 1, max(0, cols - 1 - disp_width(theme_warn)),
@@ -1176,7 +1225,10 @@ def draw(stdscr, samples, interval, frame, theme_warn=None):
 
 def _theme_names():
     import theme as _theme
-    return [_theme.DEFAULT_THEME_NAME] + _theme._list_available_themes()
+    names = _theme._list_available_themes()
+    if _theme.DEFAULT_THEME_NAME not in names:
+        names.insert(0, _theme.DEFAULT_THEME_NAME)   # 内置兜底时也参与循环
+    return names
 
 
 def render(stdscr, interval, gateway=DEFAULT_GATEWAY, theme_warn=None):
@@ -1218,10 +1270,10 @@ def render(stdscr, interval, gateway=DEFAULT_GATEWAY, theme_warn=None):
             theme_warn_c = THEME_WARN_C[0]
         elif key == 32:                          # Space 暂停/继续
             PAUSED = not PAUSED
-        elif key in (ord("A"),):                 # 动画开关
+        elif key in (ord("A"), ord("a")):           # 动画开关
             ANIM = not ANIM
-        elif key in (ord("C"), ord("c")):        # 图表风格循环
-            cycle_chart_style()
+        elif key in (ord("P"),):                 # 进程表排序循环：显存→CPU→MEM
+            cycle_proc_sort()
         elif key in (curses.KEY_RESIZE,):
             curses.update_lines_cols()
             samples = None                       # 立即重绘适配新尺寸
@@ -1255,17 +1307,13 @@ def main():
                     help="模型网关地址（默认 %(default)s，也可用 SYSMON_GATEWAY）")
     ap.add_argument("--theme", default=None,
                     help="配色主题：主题名（themes/<名>.json）或 JSON 文件路径；"
-                         "也可用 SYSMON_THEME。默认内置 Tokyo Night")
+                         "也可用 SYSMON_THEME。默认 catppuccin-mocha")
     ap.add_argument("--no-anim", action="store_true", help="关闭动画（脉冲/转圈/spinner 静止）")
-    ap.add_argument("--chart", default=None, choices=CHART_STYLES,
-                    help="负载图表风格：area=面积图(经典) wave=波动直方图 "
-                         "spectrum=频谱柱(分级色+顶帽) heat=热力条；"
-                         "运行中按 C 循环切换（默认 SYSMON_CHART 或 wave）")
     ap.add_argument("--list-themes", action="store_true", help="列出可用主题后退出")
     args = ap.parse_args()
 
     if args.list_themes:
-        print("内置默认：tokyo-night")
+        print(f"默认主题：{_theme.DEFAULT_THEME_NAME}（themes/ 目录，缺失时回退内置配色）")
         d = _theme.THEMES_DIR
         if os.path.isdir(d):
             for f in sorted(os.listdir(d)):
@@ -1274,10 +1322,8 @@ def main():
         print("\n用法：--theme <名> 或 --theme /path/to/theme.json（也可设 SYSMON_THEME）")
         return
 
-    global THEME, ANIM, CHART_STYLE
+    global THEME, ANIM
     ANIM = not args.no_anim
-    if args.chart:
-        CHART_STYLE = args.chart        # 默认 wave（模块级），--chart area 回经典
     THEME, warn = _theme.load_theme(args.theme)
     try:
         curses.wrapper(render, args.interval, args.gateway, warn)

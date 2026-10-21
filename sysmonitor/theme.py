@@ -4,7 +4,8 @@
 主题文件为 JSON，按 --theme 参数或 SYSMON_THEME 环境变量选择：
   - 给的是文件路径（绝对或相对）则直接加载；
   - 否则按主题名在本目录 themes/<name>.json 查找；
-  - 都没有 / 解析失败时回退内置 Tokyo Night，并把原因写入 load_warning。
+  - 都未指定时默认加载 themes/catppuccin-mocha.json；
+  - 查找失败 / 解析失败时回退内置配色（Tokyo Night 系），并把原因写入 load_warning。
 
 JSON 格式（值为 256 色索引 0..255；header 可给 fg/bg）：
 {
@@ -25,13 +26,14 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 THEMES_DIR = os.path.join(HERE, "themes")
-DEFAULT_THEME_NAME = "tokyo-night"
+# 默认主题 = themes/catppuccin-mocha.json；文件缺失时回退下方内置配色
+DEFAULT_THEME_NAME = "catppuccin-mocha"
 
 # 语义角色；curses/text 两端都用这些名字取色
 ROLES = ("header", "border", "dim", "accent", "ok", "warn", "crit",
          "mem", "cpu", "disk", "model")
 
-# ── 内置默认：Tokyo Night（256 色索引）──
+# ── 内置兜底配色（themes/ 文件缺失/损坏时用；Tokyo Night 系，256 色索引）──
 # header 为 [fg, bg]；其余为前景索引
 DEFAULT_THEME = {
     "name": "tokyo-night (built-in)",
@@ -84,17 +86,17 @@ def _theme_path(spec):
 
 
 def load_theme(spec=None):
-    """返回 (theme, warning)。theme 结构同 DEFAULT_THEME；warning 为 None 或说明串。"""
+    """返回 (theme, warning)。theme 结构同 DEFAULT_THEME；warning 为 None 或说明串。
+
+    无 spec/环境变量时按 DEFAULT_THEME_NAME 加载 themes/ 文件。"""
     import copy
     theme = copy.deepcopy(DEFAULT_THEME)
     if not spec:
-        spec = os.environ.get("SYSMON_THEME")
-    if not spec:
-        return theme, None
+        spec = os.environ.get("SYSMON_THEME") or DEFAULT_THEME_NAME
 
     path = _theme_path(spec)
     if path is None:
-        return theme, f"主题 {spec!r} 未找到（查找 {THEMES_DIR}），使用内置 Tokyo Night"
+        return theme, f"主题 {spec!r} 未找到（查找 {THEMES_DIR}），使用内置配色"
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -121,7 +123,7 @@ def load_theme(spec=None):
             warn = f"主题 {path} 含未知角色（已忽略）: {', '.join(unknown)}"
         return theme, warn
     except Exception as e:
-        return DEFAULT_THEME, f"主题 {path} 加载失败（{e}），使用内置 Tokyo Night"
+        return DEFAULT_THEME, f"主题 {path} 加载失败（{e}），使用内置配色"
 
 
 def _list_available_themes():
