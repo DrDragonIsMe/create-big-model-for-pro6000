@@ -29,6 +29,8 @@ fc.use_default_colors = lambda: None
 fc.curs_set = lambda v: None
 fc.init_pair = lambda *a: None
 fc.color_pair = lambda n: n
+fc.pair_content = lambda n: (n, -1)
+fc.update_lines_cols = lambda: None
 class Error(Exception):
     pass
 fc.error = Error
@@ -97,18 +99,34 @@ import sysmon
 sysmon.curses = fc          # 让 sysmon 模块内的所有 curses 调用都走假实现
 
 def fake_llm_models(gateway="", timeout=0.6):
-    return [
+    import math, random
+    sysmon.GATEWAY_CONNECTED = True
+    models = [
         {"name": "qwen3.6-35b-a3b", "engine": "vllm", "gpus": "1", "active": 2,
          "status": "ready", "prompt_total": 12345, "generation_total": 67890,
-         "rate": 148.2, "prompt_rate": 2200.0, "slots": None, "metrics_ok": True},
+         "rate": 148.2, "prompt_rate": 2200.0, "slots": None, "metrics_ok": True,
+         "idle": None, "prefill_elapsed": None},
         {"name": "qwen3.8-flash-next-iq3s", "engine": "llamacpp", "gpus": "0", "active": 3,
          "status": "ready", "prompt_total": 4321, "generation_total": 1000,
          "rate": 0.0, "prefill_active": True, "prefill_tokens": 320000,
-         "prefill_progress": 0.82, "prompt_rate": 1712.0, "slots": 2, "metrics_ok": True},
+         "prefill_progress": 0.82, "prefill_elapsed": 12.4, "prompt_rate": 1712.0,
+         "slots": 2, "metrics_ok": True, "idle": None},
         {"name": "qwen3-32b-idle", "engine": "vllm", "gpus": "2", "active": 0,
          "status": "ready", "prompt_total": 999, "generation_total": 5366,
-         "rate": 0.0, "prompt_rate": 0.0, "slots": None, "metrics_ok": True},
+         "rate": 0.0, "prompt_rate": 0.0, "slots": None, "metrics_ok": True,
+         "idle": 1830.0, "prefill_elapsed": None},
     ]
+    # 预置 sparkline 历史，便于观察曲线渲染
+    for m in models:
+        g = sysmon._gen_hist.setdefault(m["name"], __import__("collections").deque(maxlen=60))
+        p = sysmon._prompt_hist.setdefault(m["name"], __import__("collections").deque(maxlen=60))
+        if not g:
+            n = 46
+            for i in range(n):
+                w = math.sin(i / 5) * 0.5 + 0.5
+                g.append(max(0.0, m["rate"] * (0.5 + w) + random.random() * 6))
+                p.append(max(0.0, m["prompt_rate"] * (0.4 + w)))
+    return models
 
 sysmon.get_llm_models = fake_llm_models
 sysmon.main()

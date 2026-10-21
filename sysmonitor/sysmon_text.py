@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""系统资源监控：CPU / 内存 / 磁盘 / GPU（利用率、显存、温度、功耗）。
+"""系统资源监控：CPU / 内存 / 磁盘 / GPU + LLM 模型吞吐（文本版，适合 ssh/日志）。
+
+LLM 面板含：阶段动画（Prompt 进度条 / 生成脉冲 / 加载转圈）、p/s 与 t/s 双速率
+sparkline 曲线、活动/排队、空闲时长、累计 tokens；表头汇总全局吞吐。
 
 用法：
-    python3 sysmon.py            # 输出一次快照
-    python3 sysmon.py -w         # 持续刷新（默认每 2 秒）
-    python3 sysmon.py -w -i 1    # 每 1 秒刷新一次
+    python3 sysmon_text.py            # 输出一次快照
+    python3 sysmon_text.py -w         # 持续刷新（默认每 2 秒）
+    python3 sysmon_text.py -w -i 1    # 每 1 秒刷新一次
+    python3 sysmon_text.py -w -a      # 动画模式：帧内 ~8fps 重绘 spinner/脉冲
 """
 
 import argparse
@@ -17,6 +21,7 @@ import sys
 import time
 import unicodedata
 import urllib.request
+from collections import deque
 from datetime import datetime
 
 import psutil
@@ -24,7 +29,18 @@ import psutil
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 DEFAULT_GATEWAY = os.environ.get("SYSMON_GATEWAY", "http://localhost:8000")
 GATEWAY = DEFAULT_GATEWAY
+ANIM = True                                  # --animate 时 spinner/脉冲动起来
 _llm_baseline = {}
+_gen_hist: dict[str, deque] = {}             # 每模型 t/s 历史（sparkline）
+_prompt_hist: dict[str, deque] = {}          # 每模型 p/s 历史（sparkline）
+_last_active: dict[str, float] = {}          # 每模型最后活动时刻
+GATEWAY_CONNECTED = False
+HISTORY_LEN = 60
+SPARK = "▁▂▃▄▅▆▇█"
+PULSE = "●○"
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+LOAD_SPIN = "◐◓◑◒"
+_frame = 0
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # ── 语义配色（主题可换；默认 Tokyo Night）──
@@ -120,15 +136,55 @@ def fmt_tokens(n):
     return f"{int(n):,}"
 
 
+def fmt_dur(secs):
+    """空闲/运行时长紧凑格式：12s / 3m12s / 2h05 / 5d03h。"""
+    if secs is None or secs < 0:
+        return "-"
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    if secs < 86400:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}"
+    return f"{secs // 86400}d{(secs % 86400) // 3600:02d}h"
+
+
+def sparkline(hist, width):
+    """速率序列 -> 方块 sparkline（按序列内最大值归一）。"""
+    vals = [float(v) for v in hist][-width:]
+    if not vals:
+        return " " * width
+    m = max(vals)
+    if m <= 0:
+        return SPARK[0] * len(vals) + " " * (width - len(vals))
+    out = "".join(SPARK[min(7, int(v / m * 8 + 0.5))] for v in vals)
+    return out + " " * (width - len(out))
+
+
+def progress_bar(frac, width=12):
+    frac = max(0.0, min(1.0, frac or 0.0))
+    n = int(round(frac * width))
+    return "▰" * n + "▱" * (width - n)
+
+
+def anim_char(seq, frame):
+    return seq[frame % len(seq)] if ANIM else seq[0]
+
+
 def get_llm_models(timeout=0.8):
-    """读取网关状态，并按刷新间隔计算本窗口生成速率。"""
+    """读取网关状态，本地差分速率并维护 sparkline 历史与空闲时长。"""
+    global GATEWAY_CONNECTED
     if not GATEWAY:
+        GATEWAY_CONNECTED = False
         return []
     try:
         with _opener.open(GATEWAY.rstrip("/") + "/v1/gateway/status",
                           timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace"))
+        GATEWAY_CONNECTED = True
     except Exception:
+        GATEWAY_CONNECTED = False
         return []
 
     now = time.time()
@@ -150,23 +206,39 @@ def get_llm_models(timeout=0.8):
         gw_rate = tokens.get("generation_rate")
         if (rate is None or rate <= 0) and isinstance(gw_rate, (int, float)):
             rate = gw_rate
+        rate = float(rate or 0.0)
+        p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
+
+        _gen_hist.setdefault(name, deque(maxlen=HISTORY_LEN)).append(rate)
+        _prompt_hist.setdefault(name, deque(maxlen=HISTORY_LEN)).append(p_rate)
+        active = b.get("in_flight", 0) or 0
+        if active > 0 or rate > 0 or p_rate > 0:
+            _last_active[name] = now
+        idle = now - _last_active[name] if name in _last_active else None
+
         gpus = b.get("gpus") or []
         models.append({
             "name": name,
             "engine": "vLLM" if b.get("engine") == "vllm" else "llama",
             "gpus": ",".join(str(g) for g in gpus) if gpus else "-",
-            "active": b.get("in_flight", 0) or 0,
+            "active": active,
             "slots": b.get("slots"),
             "status": b.get("status", "?"),
             "prompt_total": tokens.get("prompt_total"),
             "generation_total": total,
             "rate": rate,
+            "prompt_rate": p_rate,
             "prefill_active": bool(tokens.get("prefill_active")),
             "prefill_tokens": tokens.get("prefill_tokens"),
             "prefill_progress": tokens.get("prefill_progress"),
-            "prompt_rate": tokens.get("prompt_rate", tokens.get("prefill_rate")),
+            "idle": idle,
             "metrics_ok": bool(tokens.get("metrics_ok")),
         })
+    live = {m["name"] for m in models}
+    for gone in set(_gen_hist) - live:
+        _gen_hist.pop(gone, None)
+        _prompt_hist.pop(gone, None)
+        _last_active.pop(gone, None)
     models.sort(key=lambda m: (m["active"] <= 0, -(m["rate"] or 0), m["name"]))
     return models
 
@@ -334,9 +406,19 @@ def get_gpu_procs():
     return procs
 
 
-def render_cpu():
+def snapshot():
+    """一轮数据采样（只在数据 tick 调用；动画帧复用快照，不碰 nvidia-smi/网关）。"""
+    return {
+        "cpu": get_cpu(),
+        "gpus": get_gpus(),
+        "gpu_procs": get_gpu_procs(),
+        "models": get_llm_models(),
+    }
+
+
+def render_cpu(snap):
     lines = [section("CPU")]
-    pct_total, pct_cores, freq, load = get_cpu()
+    pct_total, pct_cores, freq, load = snap["cpu"]
 
     info = f"{psutil.cpu_count()} 逻辑核"
     if freq:
@@ -404,14 +486,14 @@ def shorten(s, width):
     return out.rstrip() + " …"
 
 
-def render_gpus():
+def render_gpus(snap):
     lines = [section("GPU")]
-    gpus = get_gpus()
+    gpus = snap["gpus"]
     if not gpus:
         lines.append("│ " + dim("未检测到 NVIDIA GPU 或 nvidia-smi 不可用"))
         return lines
 
-    gpu_procs = get_gpu_procs()
+    gpu_procs = snap["gpu_procs"]
 
     for i, g in enumerate(gpus):
         if i:
@@ -462,9 +544,23 @@ def render_gpus():
     return lines
 
 
-def render_llm():
-    lines = [section("LLM 模型")]
-    models = get_llm_models()
+def render_llm(snap):
+    models = snap["models"]
+    total_t = sum(float(m.get("rate") or 0) for m in models)
+    total_p = sum(float(m.get("prompt_rate") or 0) for m in models)
+    total_req = sum(int(m["active"]) for m in models) if models else 0
+    queued = sum(1 for m in models if m.get("slots") and m["active"] > m["slots"])
+    head = section("LLM 模型")
+    if models:
+        pulse = anim_char(PULSE, _frame // 2) if (total_t or total_p) else "○"
+        agg = (c(COL_OK, f"Σ {total_t:.1f} t/s") + "  "
+               + (c(COL_WARN, f"Σ {total_p:.0f} p/s") + "  " if total_p else "")
+               + c(COL_ACCENT, f"请求 {total_req}")
+               + (c(COL_WARN, f" ▲{queued}排队") if queued else "")
+               + "  " + pulse + dim(" 网关"))
+        lines = [head, "│ " + agg]
+    else:
+        lines = [head]
     if not models:
         lines.append("│ " + dim("网关不可达，或当前没有已加载模型；token 指标暂不可用"))
         return lines
@@ -472,63 +568,78 @@ def render_llm():
     for m in models:
         slots = m.get("slots")
         active_txt = f"{m['active']}/{slots}" if slots else str(m["active"])
-        if m["active"] > 0:
-            active = c(COL_WARN if (slots and m["active"] > slots) else COL_OK,
-                       f"ACT {active_txt}")
+        queueing = bool(slots and m["active"] > slots)
+        if queueing:
+            active = c(COL_WARN, f"⚠{active_txt}排队")
+        elif m["active"] > 0:
+            active = c(COL_OK, f"ACT {active_txt}")
         else:
             active = dim(f"ACT {active_txt}")
         model = c(COL_MODEL, shorten(m["name"], 30))
         p_rate = float(m.get("prompt_rate") or 0)
         t_rate = float(m.get("rate") or 0)
         prefill = bool(m.get("prefill_active"))
+        loading = m["status"] == "loading"
         decoding = t_rate > 0 or (m["active"] > 0 and not prefill)
+        gspark = c(COL_OK, sparkline(_gen_hist.get(m["name"], ()), 12))
+        pspark = c(COL_WARN, sparkline(_prompt_hist.get(m["name"], ()), 12))
         ps = c(COL_WARN, f"{p_rate:7.0f} p/s") if p_rate > 0 else dim("    -- p/s")
         ts = c(COL_OK, f"{t_rate:7.1f} t/s") if t_rate > 0 else dim("    -- t/s")
-        cum = dim(f"累计prompt {fmt_tokens(m.get('prompt_total'))} · "
-                  f"累计生成 {fmt_tokens(m.get('generation_total'))}")
+        cum = dim(f"Σprompt {fmt_tokens(m.get('prompt_total'))} · "
+                  f"Σgen {fmt_tokens(m.get('generation_total'))}")
         if prefill:
             progress = (m.get("prefill_progress") or 0) * 100
-            phase = c(COL_WARN, "Prompt处理")
-            detail = c(COL_WARN, f"{fmt_tokens(m.get('prefill_tokens'))} tok {progress:.0f}%")
+            phase = c(COL_WARN, anim_char(SPINNER, _frame) + " Prompt")
+            detail = (c(COL_WARN, progress_bar(progress / 100, 10))
+                      + c(COL_WARN, f" {progress:3.0f}% ")
+                      + dim(fmt_tokens(m.get("prefill_tokens")) + "tok"))
+        elif loading:
+            phase = c(COL_ACCENT, anim_char(LOAD_SPIN, _frame) + " 加载")
+            detail = ""
         elif decoding:
-            phase = c(COL_OK, "生成中")
+            phase = c(COL_OK, anim_char(PULSE, _frame) + " 生成")
             detail = ""
         else:
+            idle_s = fmt_dur(m.get("idle")) if m.get("idle") is not None else "-"
             phase = dim("空闲")
-            detail = ""
-        line = (
+            detail = dim(f"{idle_s}")
+        lines.append(
             f"│ {model} {dim(pad(m['engine'], 5))} GPU{pad(m['gpus'], 4)} {active}"
-            f"  {pad(phase, 9)} {pad(detail, 16)} {ps}  {ts}   {cum}"
+            f"  {pad(phase, 9)} {pad(detail, 22)} {pspark} {ps}  {gspark} {ts}  {cum}"
         )
-        lines.append(line)
     lines.append(
         "│ " + c(COL_WARN, "p/s") + dim("=Prompt处理速率  ")
-        + c(COL_OK, "t/s") + dim("=生成速率（两列独立，并发时可同时有值）  "
-                                 "ACT=进行中/slot上限  K=千tokens M=百万tokens  "
-                                 "累计=模型加载以来(换模型/重启清零)")
+        + c(COL_OK, "t/s") + dim("=生成速率（两列独立，并发时可同时有值）  ")
+        + c(COL_OK, "▁▂▄█") + dim("=近%d次采样曲线  " % HISTORY_LEN)
+        + dim("ACT=进行中/slot上限(超则⚠排队)  K=千tokens M=百万tokens  "
+              "Σ=模型加载以来累计(换模型/重启清零)  空闲=距上次活动时长")
     )
     return lines
 
 
-def render():
+def render(snap=None):
+    if snap is None:
+        snap = snapshot()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     host = socket.gethostname()
     lines = [
         bold(c(COL_MODEL, f"  系统资源监控")) + dim(f"  {host} · {now}"),
         "",
     ]
-    lines += render_cpu() + [""]
+    lines += render_cpu(snap) + [""]
     lines += render_memory() + [""]
     lines += render_disk() + [""]
-    lines += render_gpus() + [""]
-    lines += render_llm()
+    lines += render_gpus(snap) + [""]
+    lines += render_llm(snap)
     return "\n".join(lines)
 
 
 def main():
     ap = argparse.ArgumentParser(description="CPU/内存/GPU 资源监控")
     ap.add_argument("-w", "--watch", action="store_true", help="持续刷新模式")
-    ap.add_argument("-i", "--interval", type=float, default=2.0, help="刷新间隔秒数（默认 2）")
+    ap.add_argument("-i", "--interval", type=float, default=2.0, help="数据刷新间隔秒数（默认 2）")
+    ap.add_argument("-a", "--animate", action="store_true",
+                    help="watch 模式下动画帧以 ~8fps 重绘（spinner/脉冲；需 tty）")
     ap.add_argument("--no-color", action="store_true", help="禁用彩色输出")
     ap.add_argument("--gateway", default=DEFAULT_GATEWAY,
                     help="模型网关地址（默认 %(default)s，也可用 SYSMON_GATEWAY）")
@@ -538,7 +649,7 @@ def main():
     ap.add_argument("--list-themes", action="store_true", help="列出可用主题后退出")
     args = ap.parse_args()
 
-    global USE_COLOR, GATEWAY, _THEME_WARN
+    global USE_COLOR, GATEWAY, _THEME_WARN, ANIM, _frame
     GATEWAY = args.gateway
     if args.no_color:
         USE_COLOR = False
@@ -553,6 +664,8 @@ def main():
         print("\n用法：--theme <名> 或 --theme /path/to/theme.json（也可设 SYSMON_THEME）")
         return
 
+    ANIM = args.animate and sys.stdout.isatty()
+
     _THEME_WARN = _apply_theme(args.theme)
     if _THEME_WARN:
         print(dim("# " + _THEME_WARN), file=sys.stderr)
@@ -566,9 +679,21 @@ def main():
 
     try:
         while True:
-            time.sleep(args.interval)
+            snap = snapshot()          # 数据 tick：一次性采样
             print("\033[2J\033[H", end="")  # 清屏并移动光标到左上角
-            print(render())
+            print(render(snap))
+            t0 = time.monotonic()
+            if not ANIM:
+                time.sleep(max(0.0, args.interval - (time.monotonic() - t0)))
+                continue
+            # 动画帧：复用快照，~8fps 只重绘 spinner/脉冲
+            while time.monotonic() - t0 < args.interval:
+                time.sleep(0.12)
+                if time.monotonic() - t0 >= args.interval:
+                    break
+                _frame += 1
+                print("\033[2J\033[H", end="")
+                print(render(snap))
     except KeyboardInterrupt:
         pass
 

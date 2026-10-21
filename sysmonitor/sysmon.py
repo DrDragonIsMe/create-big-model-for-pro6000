@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """nvtop-style 图形化系统资源监控 - curses TUI。
 
-借鉴 nvtop 布局，图形与数字并存：
-  - 顶部：每块 GPU 一个面板，温度/功耗/风扇/显存数值 + 算力、显存面积波形图
-  - 中部：CPU 面积波形图 + 每核方块图 + 每核占用数字表；右侧内存/交换/磁盘
+借鉴 nvtop 布局，图形与数字并存；数据采样与动画刷新分离（画面 ~8fps）：
+  - 顶部：每块 GPU 一个面板，温度/功耗/风扇/显存数值 + 算力、显存面积波形图（带峰值标记）
+  - 中部：LLM 模型面板——每模型两行：阶段动画（Prompt 进度条 / 生成脉冲 / 加载转圈）、
+          p/s 与 t/s 双速率曲线 sparkline、活动/排队 x/slot、空闲时长、累计 tokens；
+          面板头汇总全局 t/s、p/s、请求数与排队数
+  - CPU 面积波形图 + 每核方块图 + 每核占用数字表；右侧内存/交换/磁盘
   - 底部：GPU 进程表（GPU/PID/USER/%CPU/%MEM/显存/模型/命令行）
 
+快捷键：
+    q / Esc    退出
+    Space      暂停/继续数据采样（动画不停）
+    A          开/关动画（脉冲、转圈、spinner）
+    T          下一主题    Shift+Tab  上一主题
+
 用法：
-    python3 sysmon.py          # TUI 图形界面（q / Ctrl+C 退出）
-    python3 sysmon.py -i 0.5   # 自定义刷新间隔（秒）
+    python3 sysmon.py          # TUI 图形界面
+    python3 sysmon.py -i 0.5   # 自定义数据刷新间隔（秒）
 """
 
 from __future__ import annotations
@@ -25,6 +34,7 @@ import sys
 import time
 import unicodedata
 import urllib.request
+from collections import deque
 
 import psutil
 
@@ -33,7 +43,18 @@ HISTORY_LEN = 60          # 波形图采样点数
 MIN_COLS = 100
 MIN_ROWS = 30
 ch = 2           # 系统波形图高度（行）
+ANIM_TICK = 0.15          # 动画帧间隔（秒）
 DEFAULT_GATEWAY = os.environ.get("SYSMON_GATEWAY", "http://localhost:8000")
+
+# ─── 动画字形 ──────────────────────────────────────────────────
+PULSE = "●○"                              # 生成中呼吸点
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"                # braille 转圈（Prompt 预填充）
+LOAD_SPIN = "◐◓◑◒"                        # 加载转圈
+SPARK = "▁▂▃▄▅▆▇█"                        # sparkline 八级方块
+try:
+    _KEY_BTAB = curses.KEY_BTAB          # Shift+Tab（部分终端/仿真环境可能缺失）
+except AttributeError:
+    _KEY_BTAB = None
 
 # ─── 文本工具 ──────────────────────────────────────────────────
 
@@ -67,7 +88,6 @@ def fmt_bytes(n: float) -> str:
 def fmt_mb(mb: float) -> str:
     return fmt_bytes(mb * 1024 * 1024)
 
-
 def fmt_int(n: float | None) -> str:
     if n is None:
         return "n/a"
@@ -84,20 +104,57 @@ def fmt_tokens(n: float | None) -> str:
         return f"{n / 1_000:.1f}K"
     return f"{int(n):,}"
 
+def fmt_dur(secs: float | None) -> str:
+    """空闲/运行时长紧凑格式：12s / 3m12s / 2h05 / 5d03h。"""
+    if secs is None or secs < 0:
+        return "-"
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    if secs < 86400:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}"
+    return f"{secs // 86400}d{(secs % 86400) // 3600:02d}h"
+
+def progress_bar(frac: float, width: int = 10) -> str:
+    """Prompt 预填充进度条：▰ 已填充 / ▱ 剩余。"""
+    frac = max(0.0, min(1.0, frac))
+    n = int(round(frac * width))
+    return "▰" * n + "▱" * (width - n)
+
+def sparkline(hist, width: int) -> str:
+    """把速率序列画成方块 sparkline（按序列内最大值归一）。"""
+    vals = [float(v) for v in hist][-width:]
+    if not vals:
+        return " " * width
+    m = max(vals)
+    if m <= 0:
+        return SPARK[0] * len(vals) + " " * (width - len(vals))
+    out = "".join(SPARK[min(7, int(v / m * 8 + 0.5))] for v in vals)
+    return out + " " * (width - len(out))
+
 # ─── LLM token 指标 ───────────────────────────────────────────
 _llm_baseline: dict[str, tuple[float, float]] = {}
-_no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_gen_hist: dict[str, deque] = {}        # 每模型 t/s 历史（sparkline）
+_prompt_hist: dict[str, deque] = {}     # 每模型 p/s 历史（sparkline）
+_last_active: dict[str, float] = {}     # 每模型最后一次「有活动」的时刻
+GATEWAY_CONNECTED = False
 
 
 def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list[dict]:
-    """从网关读取已加载模型，并用本地差分计算当前刷新窗口的 toks/s。"""
+    """从网关读取已加载模型，本地差分速率并维护 sparkline 历史与空闲时长。"""
+    global GATEWAY_CONNECTED
     if not gateway:
+        GATEWAY_CONNECTED = False
         return []
     try:
         with _no_proxy_opener.open(gateway.rstrip("/") + "/v1/gateway/status",
                                    timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace"))
+        GATEWAY_CONNECTED = True
     except Exception:
+        GATEWAY_CONNECTED = False
         return []
 
     now = time.time()
@@ -119,25 +176,47 @@ def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list
         gw_rate = tokens.get("generation_rate")
         if (rate is None or rate <= 0) and isinstance(gw_rate, (int, float)):
             rate = gw_rate
+        rate = float(rate or 0.0)
+        p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
+
+        gh = _gen_hist.setdefault(name, deque(maxlen=HISTORY_LEN))
+        gh.append(rate)
+        ph = _prompt_hist.setdefault(name, deque(maxlen=HISTORY_LEN))
+        ph.append(p_rate)
+        active = b.get("in_flight", 0) or 0
+        if active > 0 or rate > 0 or p_rate > 0:
+            _last_active[name] = now
+        idle = now - _last_active[name] if name in _last_active else None
+
         gpus = b.get("gpus") or []
         models.append({
             "name": name,
             "engine": b.get("engine", "?"),
             "gpus": ",".join(str(g) for g in gpus) if gpus else "-",
-            "active": b.get("in_flight", 0) or 0,
+            "active": active,
             "slots": b.get("slots"),
             "status": b.get("status", "?"),
             "prompt_total": tokens.get("prompt_total"),
             "generation_total": total,
             "rate": rate,
+            "prompt_rate": p_rate,
             "prefill_active": bool(tokens.get("prefill_active")),
             "prefill_tokens": tokens.get("prefill_tokens"),
             "prefill_progress": tokens.get("prefill_progress"),
-            "prompt_rate": tokens.get("prompt_rate", tokens.get("prefill_rate")),
+            "prefill_elapsed": tokens.get("prefill_elapsed"),
+            "idle": idle,
             "metrics_ok": bool(tokens.get("metrics_ok")),
         })
+    # 清理已卸载模型的历史
+    live = {m["name"] for m in models}
+    for gone in set(_gen_hist) - live:
+        _gen_hist.pop(gone, None)
+        _prompt_hist.pop(gone, None)
+        _last_active.pop(gone, None)
     models.sort(key=lambda m: (m["active"] <= 0, -(m["rate"] or 0), m["name"]))
     return models
+
+_no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # ─── 波形图字符 ────────────────────────────────────────────────
 # nvtop 用半块字符做上下堆叠的面积图：每个字符位表示 2 个垂直像素
@@ -369,7 +448,7 @@ _disk_cache: tuple = ()
 # ─── 颜色 ──────────────────────────────────────────────────────
 # 语义角色（全程序统一，颜色只是这些角色的具体呈现）：
 #   HEADER  面板标题条 / 顶栏          黑字 + 青色底
-#   BORDER  分隔线                     暗灰（弱化结构线）
+#   BORDER  分隔线 / 峰值标记          暗灰（弱化结构线）
 #   DIM     次要信息：单位、明细、注释  中灰
 #   ACCENT  表头 / 标签                柔和青蓝
 #   OK      正常 / 生成阶段 t/s        绿
@@ -381,7 +460,8 @@ _disk_cache: tuple = ()
 #   DISK    磁盘曲线 / 数值            土黄
 #   MODEL   GPU 上进程的模型名标签      紫
 (PAIR_HEADER, PAIR_DIM, PAIR_BORDER, PAIR_OK, PAIR_WARN, PAIR_CRIT,
- PAIR_GPU, PAIR_MEM, PAIR_CPU, PAIR_DISK, PAIR_MODEL, PAIR_ACCENT) = range(1, 13)
+ PAIR_GPU, PAIR_MEM, PAIR_CPU, PAIR_DISK, PAIR_MODEL, PAIR_ACCENT,
+ PAIR_SPARK_G, PAIR_SPARK_P, PAIR_PEAK) = range(1, 16)
 
 _ROLE_PAIR = {
     "header": PAIR_HEADER, "border": PAIR_BORDER, "dim": PAIR_DIM,
@@ -395,8 +475,10 @@ _LOGICAL_C = {
     "cyan": curses.COLOR_CYAN, "white": curses.COLOR_WHITE,
 }
 
-# 运行时主题（main 里由 theme.load_theme 填充）；None 时 init_colors 用内置默认
+# 运行时状态（main/render 里填充）
 THEME = None
+ANIM = True              # 动画开关（A 键）
+PAUSED = False           # 暂停数据采样（Space 键）
 GPU_COLORS = (_LOGICAL_C["blue"], _LOGICAL_C["magenta"],
              _LOGICAL_C["cyan"], _LOGICAL_C["green"])
 
@@ -422,6 +504,13 @@ def init_colors(theme=None):
             else:
                 fg, bg = _LOGICAL_C[base], -1
         curses.init_pair(pair, fg, bg)
+    # sparkline / 峰值：跟随 ok/warn/border 角色
+    for src, dst in ((PAIR_OK, PAIR_SPARK_G), (PAIR_WARN, PAIR_SPARK_P),
+                     (PAIR_BORDER, PAIR_PEAK)):
+        try:
+            curses.init_pair(dst, *curses.pair_content(src))
+        except (curses.error, ValueError):
+            curses.init_pair(dst, curses.COLOR_WHITE, -1)
     # 动态配色：GPU 曲线（pair 20+i）与亮色版本（pair 40+i）
     global GPU_COLORS
     if hi:
@@ -469,16 +558,41 @@ def put(stdscr, y, x, text, attr=curses.A_NORMAL, maxw=None):
     except curses.error:
         pass
 
-def put_chart(stdscr, y, x, w, history, color_pair, height=2, bold=False):
-    """在 (y,x,w,height) 区域内绘制面积图。"""
+def put_chart(stdscr, y, x, w, history, color_pair, height=2, bold=False,
+              peak=False):
+    """在 (y,x,w,height) 区域内绘制面积图；peak=True 时叠加窗口峰值标记 ▁。"""
     lines = area_chart(history, w, height)
     attr = cpair(color_pair, bold)
+    if peak and history and max(history) > 0.02:
+        lines = _mark_peak(lines, history, w)
     for r, line in enumerate(lines):
         put(stdscr, y + r, x, line, attr, w)
+
+def _mark_peak(lines, history, w):
+    """在峰值所在列顶格画 ▁ 标记线（重绘为列表便于覆写）。"""
+    idx = max(range(len(history)), key=lambda i: history[i])
+    col = w - len(history) + idx
+    if 0 <= col < w and len(lines) >= 1:
+        top = list(lines[0])
+        if col < len(top) and top[col] == " ":
+            top[col] = "▁"
+            lines = ["".join(top)] + list(lines[1:])
+    return lines
+
+def spark_cells(stdscr, y, x, w, hist, base_pair):
+    """绘制 sparkline；有非零样本时最后一格用亮色突出当前值。"""
+    vals = list(hist)[-w:]
+    text = sparkline(vals, w)
+    put(stdscr, y, x, text, cpair(base_pair), w)
+    if vals and max(vals) > 0:
+        put(stdscr, y, x + w - 1, text[-1], cpair(base_pair, True), 1)
 
 def vline(stdscr, x, y0, y1, ch="│"):
     for y in range(y0, y1):
         put(stdscr, y, x, ch, cpair(PAIR_BORDER))
+
+def anim_char(seq: str, frame: int) -> str:
+    return seq[frame % len(seq)] if ANIM else seq[0]
 
 # ─── GPU 面板 ─────────────────────────────────────────────────
 
@@ -513,118 +627,167 @@ def panel_gpu(stdscr, y, x, w, gpu, ch):
         cpair(PAIR_DIM), max(0, w - (cx - x)))
     mem_pct = gpu["mem_used"] / gpu["mem_total"] * 100
 
-    # Utilization：数值 + 面积图
+    # Utilization：数值 + 面积图（峰值标记）
     y += 1
     hist_u = push(f"gu{gi}", gpu["util"] / 100)
     put(stdscr, y, x, f"算力 {gpu['util']:6.1f}%", cpair(color_for(gpu["util"]), True), 13)
     if gpu.get("mem_util") is not None:
         put(stdscr, y, x + 14, f"带宽 {gpu['mem_util']:3.0f}%", cpair(PAIR_DIM),
             max(0, label_w - 14))
-    put_chart(stdscr, y + 1, x + label_w, chart_w, hist_u, gc, ch, bold=True)
+    put_chart(stdscr, y + 1, x + label_w, chart_w, hist_u, gc, ch, bold=True,
+              peak=True)
 
-    # Memory：数值 + 面积图
+    # Memory：数值 + 面积图（峰值标记）
     y += 1 + ch
     hist_m = push(f"gm{gi}", gpu["mem_used"] / gpu["mem_total"])
     put(stdscr, y, x, f"显存 {mem_pct:5.1f}%", cpair(color_for(mem_pct), True), 13)
     detail = f"{fmt_mb(gpu['mem_used'])}/{fmt_mb(gpu['mem_total'])}"
     put(stdscr, y, x + 14, clip(detail, max(0, label_w - 14)), cpair(PAIR_DIM),
         max(0, label_w - 14))
-    put_chart(stdscr, y + 1, x + label_w, chart_w, hist_m, PAIR_MEM, ch, bold=True)
+    put_chart(stdscr, y + 1, x + label_w, chart_w, hist_m, PAIR_MEM, ch, bold=True,
+              peak=True)
 
     return y + 1 + ch
 
 # ─── LLM token 面板 ───────────────────────────────────────────
 
-def panel_llm(stdscr, y, x, w, models, max_rows=4):
-    """显示已加载模型的累计生成 tokens 与当前窗口速率。"""
-    if not models:
-        put(stdscr, y, x, clip("LLM Tokens  网关未返回已加载模型或指标暂不可用", w),
-            cpair(PAIR_DIM), w)
-        return y + 2
+def panel_llm(stdscr, y, x, w, models, max_rows, frame):
+    """每模型两行：第一行 阶段动画+Prompt 进度；第二行 双速率曲线+速率数值+累计。
+    面板头汇总全局吞吐；返回下一可用行。
+    """
+    total_t = sum(float(m.get("rate") or 0) for m in models)
+    total_p = sum(float(m.get("prompt_rate") or 0) for m in models)
+    total_req = sum(int(m["active"]) for m in models) if models else 0
+    queued = sum(1 for m in models if m.get("slots") and m["active"] > m["slots"])
 
-    put(stdscr, y, x, "LLM Tokens", cpair(PAIR_HEADER, True), 12)
-    # 列：前 4 列标识，阶段三列只在 prefill 有值；p/s 与 t/s 互相独立可同时非零（并发请求）
-    cols = (("模型", 24, "l"), ("引擎", 6, "l"), ("GPU", 4, "l"), ("活动", 5, "r"),
-            ("阶段", 6, "r"), ("阶段tok", 9, "r"), ("进度", 5, "r"),
-            ("p/s", 8, "r"), ("t/s", 8, "r"),
-            ("累计prompt", 11, "r"), ("累计生成", 9, "r"))
-    hx = 14
-    for name, cw, al in cols:
-        text = rpad(name, cw) if al == "r" else pad(name, cw)
-        hattr = (cpair(PAIR_WARN, True) if name == "p/s"
-                 else cpair(PAIR_OK, True) if name == "t/s"
-                 else cpair(PAIR_ACCENT, True))
-        put(stdscr, y, x + hx, text, hattr, cw)
-        hx += cw + 1
+    # ── 面板头（聚合信息）──
+    put(stdscr, y, x, " LLM ", cpair(PAIR_HEADER, True), 5)
+    if models:
+        cx = x + 6
+        head = f"Σ {total_t:6.1f} t/s"
+        put(stdscr, y, cx, head, cpair(PAIR_OK, True), disp_width(head))
+        cx += disp_width(head) + 2
+        if total_p > 0:
+            s = f"{total_p:6.0f} p/s"
+            put(stdscr, y, cx, s, cpair(PAIR_WARN, True), disp_width(s))
+            cx += disp_width(s) + 2
+        s = f"请求 {total_req}" + (f" ▲{queued}排队" if queued else "")
+        put(stdscr, y, cx, s, cpair(PAIR_ACCENT, True), disp_width(s))
+        pulse = anim_char(PULSE, frame // 2) if (total_t > 0 or total_p > 0) else "○"
+        put(stdscr, y, x + max(0, w - 8), f"{pulse} 网关",
+            cpair(PAIR_OK if GATEWAY_CONNECTED else PAIR_CRIT, True), 6)
+    else:
+        msg = (" 网关离线/不可达" if not GATEWAY_CONNECTED
+               else " 已连接，暂无已加载模型")
+        put(stdscr, y, x + 6, clip(msg, w - 6), cpair(PAIR_DIM), w - 6)
     y += 1
+
+    if not models:
+        return y + 1
 
     for m in models[:max(0, max_rows)]:
         prefill = bool(m.get("prefill_active"))
         p_rate = float(m.get("prompt_rate") or 0)
         t_rate = float(m.get("rate") or 0)
         decoding = t_rate > 0 or (m["active"] > 0 and not prefill)
-        prog = (m.get("prefill_progress") or 0) * 100
-        if prefill:
-            phase_text = "Prompt"
-            token_text = fmt_tokens(m.get("prefill_tokens"))
-            prog_text = f"{prog:3.0f}%"
-        elif decoding:
-            phase_text = "生成"
-            token_text = "--"
-            prog_text = " --"
-        else:
-            phase_text = "空闲"
-            token_text = "--"
-            prog_text = " --"
-        base_attr = cpair(PAIR_DIM)
+        loading = m["status"] == "loading"
         slots = m.get("slots")
-        active_txt = f"{m['active']}/{slots}" if slots else str(m["active"])
-        if m["active"] > 0:
-            active_attr = cpair(PAIR_WARN, True) if (slots and m["active"] > slots) \
-                else cpair(PAIR_OK, True)
+        queueing = bool(slots and m["active"] > slots)
+        prog = (m.get("prefill_progress") or 0) * 100
+
+        # ── 第一行：模型名 + 引擎/GPU + 阶段动画 + Prompt 进度 ──
+        name = clip(m["name"], 30)
+        put(stdscr, y, x + 2, name, cpair(PAIR_MODEL, True), disp_width(name))
+        cx = x + 2 + disp_width(name) + 1
+        meta = f"{('vLLM' if m['engine'] == 'vllm' else 'llama')} ·GPU{m['gpus']}"
+        put(stdscr, y, cx, meta, cpair(PAIR_DIM), disp_width(meta))
+        cx += disp_width(meta) + 2
+
+        elapsed = m.get("prefill_elapsed")
+        if prefill:
+            sp = anim_char(SPINNER, frame)
+            seg = f"{sp} Prompt ▰"
+            put(stdscr, y, cx, seg, cpair(PAIR_WARN, True), disp_width(seg))
+            cx += disp_width(seg)
+            barw = max(6, min(14, x + w - cx - 18))
+            bar = progress_bar((m.get("prefill_progress") or 0), barw)
+            put(stdscr, y, cx, bar, cpair(PAIR_WARN), barw)
+            cx += barw + 1
+            tail = f"{prog:3.0f}% " + (f"{fmt_tokens(m.get('prefill_tokens'))}tok "
+                                       f"{float(elapsed):.0f}s" if elapsed else
+                                       fmt_tokens(m.get("prefill_tokens")))
+            tw = disp_width(tail)
+            put(stdscr, y, min(cx, x + w - tw - 1), tail, cpair(PAIR_WARN, True), tw)
+        elif loading:
+            sp = anim_char(LOAD_SPIN, frame)
+            put(stdscr, y, cx, f"{sp} 模型加载中…", cpair(PAIR_ACCENT, True),
+                disp_width("⠿ 模型加载中…"))
+        elif decoding:
+            dot = anim_char(PULSE, frame)
+            put(stdscr, y, cx, f"{dot} 生成中", cpair(PAIR_OK, True),
+                disp_width("● 生成中"))
+        elif m["idle"] is not None:
+            put(stdscr, y, cx, f"空闲 {fmt_dur(m['idle'])}", cpair(PAIR_DIM),
+                disp_width("空闲 0m00s"))
         else:
-            active_attr = base_attr
-        cells = (
-            (pad(clip(m["name"], 24), 24), base_attr),
-            (pad(clip("vLLM" if m["engine"] == "vllm" else "llama", 6), 6), base_attr),
-            (pad(clip(m["gpus"], 4), 4), base_attr),
-            (f"{active_txt:>5}", active_attr),
-            (rpad(phase_text, 6), cpair(PAIR_WARN, True) if prefill
-             else cpair(PAIR_OK, True) if decoding else base_attr),
-            (f"{token_text:>9}", cpair(PAIR_WARN, True) if prefill else base_attr),
-            (f"{prog_text:>5}", cpair(PAIR_WARN, True) if prefill else base_attr),
-            (f"{p_rate:7.0f} " if p_rate > 0 else f"{'--':>8}",
-             cpair(PAIR_WARN, True) if p_rate > 0 else base_attr),
-            (f"{t_rate:7.1f} " if t_rate > 0 else f"{'--':>8}",
-             cpair(PAIR_OK, True) if t_rate > 0 else base_attr),
-            (f"{fmt_tokens(m.get('prompt_total')):>11}", base_attr),
-            (f"{fmt_tokens(m.get('generation_total')):>9}", base_attr),
-        )
-        cx = 14
-        for (_, cw, _), (text, attr) in zip(cols, cells):
-            put(stdscr, y, x + cx, text, attr, cw)
-            cx += cw + 1
+            put(stdscr, y, cx, "空闲", cpair(PAIR_DIM), 4)
         y += 1
 
-    # 图例：两种速率单位的含义与颜色；累计列的口径
-    legend = (
-        (cpair(PAIR_DIM), "活动=进行中/slot上限(超slot在排队,显黄)  "),
-        (cpair(PAIR_WARN, True), "p/s"),
-        (cpair(PAIR_DIM), "=Prompt速率  "),
-        (cpair(PAIR_OK, True), "t/s"),
-        (cpair(PAIR_DIM), "=生成速率  K=千 M=百万tokens  累计=模型加载以来(重启清零)"),
-    )
-    lx = x + 14
-    for a, seg in legend:
-        put(stdscr, y, lx, seg, a, disp_width(seg))
-        lx += disp_width(seg) + 1
-    y += 1
+        # ── 第二行：双 sparkline + 速率 + 活动/排队 + 累计 + 显存 ──
+        spark_w = 14 if w >= 150 else 10
+        put(stdscr, y, x + 2, "t/s", cpair(PAIR_OK, True), 3)
+        spark_cells(stdscr, y, x + 5, spark_w, _gen_hist.get(m["name"], ()),
+                    PAIR_SPARK_G)
+        t_txt = f"{t_rate:7.1f}" if t_rate > 0 else "     --"
+        put(stdscr, y, x + 5 + spark_w + 1, t_txt,
+            cpair(PAIR_OK, True) if t_rate > 0 else cpair(PAIR_DIM), 7)
+        cx = x + 5 + spark_w + 9
+        put(stdscr, y, cx, "p/s", cpair(PAIR_WARN, True), 3)
+        spark_cells(stdscr, y, cx + 3, spark_w, _prompt_hist.get(m["name"], ()),
+                    PAIR_SPARK_P)
+        cx += 3 + spark_w + 1
+        p_txt = f"{p_rate:6.0f}" if p_rate > 0 else "    --"
+        put(stdscr, y, cx, p_txt,
+            cpair(PAIR_WARN, True) if p_rate > 0 else cpair(PAIR_DIM), 6)
+        cx += 8
+
+        active_txt = f"{m['active']}/{slots}" if slots else str(m["active"])
+        if queueing:
+            q = anim_char(PULSE, frame // 3)
+            seg = f"{q} {active_txt} 排队"
+            put(stdscr, y, cx, seg, cpair(PAIR_WARN, True), disp_width(seg))
+        elif m["active"] > 0:
+            put(stdscr, y, cx, f"ACT {active_txt}", cpair(PAIR_OK, True), 9)
+        else:
+            put(stdscr, y, cx, f"ACT {active_txt}", cpair(PAIR_DIM), 9)
+        cx += 12
+
+        put(stdscr, y, cx,
+            f"Σprompt {fmt_tokens(m.get('prompt_total'))}", cpair(PAIR_DIM), 18)
+        cx += 18
+        put(stdscr, y, cx,
+            f"Σgen {fmt_tokens(m.get('generation_total'))}", cpair(PAIR_DIM), 15)
+        y += 1
 
     hidden = len(models) - max_rows
     if hidden > 0:
         put(stdscr, y, x, f"… 另有 {hidden} 个模型未显示", cpair(PAIR_DIM), w)
         y += 1
-    return y + 1
+
+    # 图例
+    lx = x + 2
+    legend = (
+        (cpair(PAIR_OK), "●"), (cpair(PAIR_DIM), "生成 "),
+        (cpair(PAIR_WARN), "◐"), (cpair(PAIR_DIM), "Prompt "),
+        (cpair(PAIR_OK, True), "t/s"), (cpair(PAIR_DIM), "=生成速率 "),
+        (cpair(PAIR_WARN, True), "p/s"), (cpair(PAIR_DIM), "=Prompt速率 "),
+        (cpair(PAIR_BORDER), "▁"), (cpair(PAIR_DIM), "峰值  "),
+        (cpair(PAIR_DIM), "ACT=活动/slot(超则排队)  Σ=累计(加载以来)  K=千 M=百万tok"),
+    )
+    for a, seg in legend:
+        put(stdscr, y, lx, seg, a, disp_width(seg))
+        lx += disp_width(seg)
+    return y + 2
 
 # ─── CPU 面板 ─────────────────────────────────────────────────
 
@@ -642,7 +805,7 @@ def panel_cpu(stdscr, y, x, w, cpu, ch, room=99):
     if cpu["freq"]:
         extra += f"  {cpu['freq'] / 1000:.2f}GHz"
     put(stdscr, y, x + label_w, clip(extra, chart_w), cpair(PAIR_DIM), chart_w)
-    put_chart(stdscr, y + 1, x + label_w, chart_w, hist, PAIR_CPU, ch)
+    put_chart(stdscr, y + 1, x + label_w, chart_w, hist, PAIR_CPU, ch, peak=True)
 
     # 每核方块图：一列一核，▁▂▃▄▅▆▇█ 八级
     LEVELS = " ▁▂▃▄▅▆▇█"
@@ -773,118 +936,187 @@ def panel_procs(stdscr, y, x, w, gpus, max_rows=8, bar_w=16):
         y += 1
     return y
 
-# ─── 主渲染 ────────────────────────────────────────────────────
+# ─── 采样与主渲染 ──────────────────────────────────────────────
+
+def collect_samples(gateway, interval):
+    """采集一轮数据（含历史 push，每数据周期只调用一次）。"""
+    return {
+        "gpus": get_gpu_info(),
+        "models": get_llm_models(gateway, timeout=min(0.8, max(0.2, interval / 2))),
+        "cpu": get_cpu_info(),
+        "mem": get_mem_info(),
+        "disk": get_disk_info(),
+    }
+
+
+def draw(stdscr, samples, interval, frame, theme_warn=None):
+    rows, cols = stdscr.getmaxyx()
+    gpus = samples["gpus"]
+    llm_models = samples["models"]
+    cpu = samples["cpu"]
+    mem = samples["mem"]
+    disk = samples["disk"]
+
+    stdscr.erase()
+    if rows < MIN_ROWS or cols < MIN_COLS:
+        put(stdscr, 0, 0, f"终端太小: {cols}x{rows}（需要 ≥ {MIN_COLS}x{MIN_ROWS}）",
+            cpair(PAIR_CRIT))
+        stdscr.refresh()
+        return
+
+    # ── 标题栏（含全局吞吐聚合）──
+    host = socket.gethostname()
+    total_t = sum(float(m.get("rate") or 0) for m in llm_models)
+    bar = pad(f" SYSMON  {host}  {time.strftime('%Y-%m-%d %H:%M:%S')} ", cols)
+    put(stdscr, 0, 0, bar, cpair(PAIR_HEADER, True), cols)
+    if llm_models:
+        tag = f"Σ {total_t:5.1f} t/s "
+        right = x0 = cols - disp_width(tag) - 1
+        put(stdscr, 0, x0, tag, cpair(PAIR_HEADER, True), disp_width(tag))
+        dot = anim_char(PULSE, frame // 2) if total_t > 0 else "○"
+        put(stdscr, 0, max(0, x0 - 2), dot,
+            cpair(PAIR_OK if total_t > 0 else PAIR_DIM, True), 1)
+
+    # 依据终端高度自适应图表行数（每模型 2 行 + 面板头 + 图例）
+    llm_rows = min(len(llm_models), max(1, (rows - 20) // 2)) if llm_models else 1
+    llm_h = 2 * llm_rows + (3 if llm_models else 2)
+    ch = max(1, (rows - 16 - llm_h) // 5)
+    y = 1
+
+    # ── GPU 区域：多卡并排 ──
+    if gpus:
+        pw = cols // len(gpus)
+        gpu_h = 2 + 2 * (1 + ch)
+        for gi, g in enumerate(gpus):
+            gx = gi * pw
+            gw = (cols - gx) if gi == len(gpus) - 1 else pw - 1
+            panel_gpu(stdscr, y, gx, gw, g, ch)
+        for gi in range(1, len(gpus)):
+            vline(stdscr, gi * pw - 1, y, y + gpu_h)
+        y += gpu_h
+    else:
+        put(stdscr, y, 0, " 未检测到 NVIDIA GPU", cpair(PAIR_WARN, True) | curses.A_REVERSE, cols)
+        y += 2
+
+    # ── LLM token 吞吐 ──
+    if y < rows - 8:
+        put(stdscr, y, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
+        y = panel_llm(stdscr, y + 1, 0, cols - 1, llm_models, llm_rows, frame)
+
+    # ── CPU / 系统 双列 ──
+    half = cols // 2
+    put(stdscr, y, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
+    sep_y = y + 1
+    # CPU 面板可用行数：底部要留给进程表（分隔线 + 表头 + 至少 2 行 + 状态栏）
+    room = max(4, rows - 5 - sep_y)
+
+    y_cpu = panel_cpu(stdscr, sep_y, 0, half - 1, cpu, ch, room)
+    y_mem = panel_mem(stdscr, sep_y, half + 1, cols - half - 2, mem, disk, ch)
+    vline(stdscr, half, sep_y, min(max(y_cpu, y_mem), rows - 2))
+
+    # ── 进程表（剩余空间不足则省略）──
+    y_tbl = max(y_cpu, y_mem)
+    avail = rows - 1 - y_tbl - 2          # 减去分隔线、表头、状态栏
+    if avail >= 1:
+        put(stdscr, y_tbl, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
+        panel_procs(stdscr, y_tbl + 1, 0, cols - 1, gpus, avail)
+
+    # ── 状态栏 ──
+    theme_name = (THEME or {}).get("name", "tokyo-night")
+    pause_tag = " ⏸已暂停 " if PAUSED else ""
+    anim_tag = "动效开" if ANIM else "动效关"
+    status = (f" q 退出  Space 暂停  A 动画  T/⇧T 主题 | {pause_tag}{anim_tag}"
+              f" 刷新 {interval:.1f}s 采样 {len(_history.get('cpu', []))} 点"
+              f" 主题 {theme_name}")
+    put(stdscr, rows - 1, 0, pad(status, cols - 1), cpair(PAIR_HEADER, True), cols - 1)
+    if theme_warn:
+        put(stdscr, rows - 1, max(0, cols - 1 - disp_width(theme_warn)),
+            clip(theme_warn, cols - 1), cpair(PAIR_WARN, True), cols - 1)
+
+    stdscr.refresh()
+
+
+def _theme_names():
+    import theme as _theme
+    return [_theme.DEFAULT_THEME_NAME] + _theme._list_available_themes()
+
 
 def render(stdscr, interval, gateway=DEFAULT_GATEWAY, theme_warn=None):
-    global THEME
+    global THEME, ANIM, PAUSED, samples, theme_warn_c
     init_colors(THEME)
     try:
         curses.curs_set(0)
     except curses.error:
         pass
     stdscr.nodelay(True)
-    stdscr.timeout(int(interval * 1000))
-    psutil.cpu_percent(interval=None)  # 预热
+    stdscr.timeout(120)                     # 动画 tick 粒度
+    psutil.cpu_percent(interval=None)       # 预热
+
+    frame = 0
+    theme_warn_c = theme_warn
+    next_anim = time.monotonic() + ANIM_TICK
+    next_sample = 0.0                       # 立即采一次
+    samples = None
 
     while True:
-        rows, cols = stdscr.getmaxyx()
-        gpus = get_gpu_info()
-        llm_models = get_llm_models(gateway, timeout=min(0.8, max(0.2, interval / 2)))
-        cpu = get_cpu_info()
-        mem = get_mem_info()
-        disk = get_disk_info()
-
-        stdscr.erase()
-        if rows < MIN_ROWS or cols < MIN_COLS:
-            put(stdscr, 0, 0, f"终端太小: {cols}x{rows}（需要 ≥ {MIN_COLS}x{MIN_ROWS}）",
-                cpair(PAIR_CRIT))
-            stdscr.refresh()
-        else:
-            # ── 标题栏 ──
-            host = socket.gethostname()
-            bar = pad(f" SYSMON  {host}  {time.strftime('%Y-%m-%d %H:%M:%S')} ", cols)
-            put(stdscr, 0, 0, bar, cpair(PAIR_HEADER, True), cols)
-
-            # 依据终端高度自适应图表行数（预留 LLM/系统/进程表所需）
-            llm_rows = min(len(llm_models), max(1, (rows - 19) // 2)) if llm_models else 1
-            llm_h = llm_rows + (3 if llm_models else 2)
-            ch = max(1, (rows - 16 - llm_h) // 5)
-            y = 1
-
-            # ── GPU 区域：多卡并排 ──
-            if gpus:
-                pw = cols // len(gpus)
-                gpu_h = 2 + 2 * (1 + ch)
-                for gi, g in enumerate(gpus):
-                    gx = gi * pw
-                    gw = (cols - gx) if gi == len(gpus) - 1 else pw - 1
-                    panel_gpu(stdscr, y, gx, gw, g, ch)
-                for gi in range(1, len(gpus)):
-                    vline(stdscr, gi * pw - 1, y, y + gpu_h - 1)
-                y += gpu_h
-            else:
-                put(stdscr, y, 0, " 未检测到 NVIDIA GPU", cpair(PAIR_WARN, True) | curses.A_REVERSE, cols)
-                y += 2
-
-            # ── LLM token 吞吐 ──
-            if y < rows - 8:
-                put(stdscr, y, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
-                y = panel_llm(stdscr, y + 1, 0, cols - 1, llm_models, llm_rows)
-
-            # ── CPU / 系统 双列 ──
-            half = cols // 2
-            put(stdscr, y, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
-            sep_y = y + 1
-            # CPU 面板可用行数：底部要留给进程表（分隔线 + 表头 + 至少 2 行 + 状态栏）
-            room = max(4, rows - 5 - sep_y)
-
-            y_cpu = panel_cpu(stdscr, sep_y, 0, half - 1, cpu, ch, room)
-            y_mem = panel_mem(stdscr, sep_y, half + 1, cols - half - 2, mem, disk, ch)
-            vline(stdscr, half, sep_y, min(max(y_cpu, y_mem), rows - 2))
-
-            # ── 进程表（剩余空间不足则省略）──
-            y_tbl = max(y_cpu, y_mem)
-            avail = rows - 1 - y_tbl - 2          # 减去分隔线、表头、状态栏
-            if avail >= 1:
-                put(stdscr, y_tbl, 0, "─" * (cols - 1), cpair(PAIR_BORDER))
-                panel_procs(stdscr, y_tbl + 1, 0, cols - 1, gpus, avail)
-
-            # ── 状态栏 ──
-            theme_name = (THEME or {}).get("name", "tokyo-night")
-            put(stdscr, rows - 1, 0, pad(" q 退出   刷新 %.1fs   采样 %d 点   主题 %s" %
-                (interval, len(_history.get("cpu", [])), theme_name), cols - 1),
-                cpair(PAIR_HEADER, True), cols - 1)
-            if theme_warn:
-                put(stdscr, rows - 1, max(0, cols - 1 - disp_width(theme_warn)),
-                    clip(theme_warn, cols - 1), cpair(PAIR_WARN, True), cols - 1)
-
-            stdscr.refresh()
+        now = time.monotonic()
+        if samples is None or (not PAUSED and now >= next_sample):
+            samples = collect_samples(gateway, interval)
+            next_sample = time.monotonic() + interval
+        if samples is not None and (now >= next_anim or PAUSED):
+            if ANIM and not PAUSED:
+                frame += 1
+            next_anim = time.monotonic() + ANIM_TICK
+            draw(stdscr, samples, interval, frame, theme_warn_c)
 
         key = stdscr.getch()
         if key in (ord("q"), ord("Q"), 3, 27):  # q / Ctrl+C / Esc
             return
-        elif key == ord("T"):  # 切换主题
-            import theme as _theme
-            all_themes = [_theme.DEFAULT_THEME_NAME] + _theme._list_available_themes()
-            current_name = (THEME or {}).get("name")
-            idx = (all_themes.index(current_name) + 1) % len(all_themes) if current_name in all_themes else 0
-            new_theme = all_themes[idx]
-            THEME, warn = _theme.load_theme(new_theme)
-            init_colors(THEME)
+        elif key == ord("T"):                    # 下一主题
+            _cycle_theme(+1, theme_warn_c)
+            theme_warn_c = THEME_WARN_C[0]
+        elif _KEY_BTAB is not None and key == _KEY_BTAB:   # Shift+Tab 上一主题
+            _cycle_theme(-1, theme_warn_c)
+            theme_warn_c = THEME_WARN_C[0]
+        elif key == 32:                          # Space 暂停/继续
+            PAUSED = not PAUSED
+        elif key in (ord("A"),):                 # 动画开关
+            ANIM = not ANIM
         elif key in (curses.KEY_RESIZE,):
-            time.sleep(0.1)
+            curses.update_lines_cols()
+            samples = None                       # 立即重绘适配新尺寸
+
+
+THEME_WARN_C = [None]
+
+
+def _cycle_theme(step, _unused=None):
+    import theme as _theme
+    global THEME
+    names = _theme_names()
+    current = (THEME or {}).get("name")
+    base = current.split(" ")[0] if current else names[0]
+    try:
+        idx = names.index(base)
+    except ValueError:
+        idx = 0
+    new_name = names[(idx + step) % len(names)]
+    THEME, warn = _theme.load_theme(new_name)
+    init_colors(THEME)
+    THEME_WARN_C[0] = warn
 
 # ─── 入口 ──────────────────────────────────────────────────────
 
 def main():
     import theme as _theme
     ap = argparse.ArgumentParser(description="nvtop-style GPU/CPU/LLM token 资源监控")
-    ap.add_argument("-i", "--interval", type=float, default=1.0, help="刷新间隔秒（默认 1.0）")
+    ap.add_argument("-i", "--interval", type=float, default=1.0, help="数据刷新间隔秒（默认 1.0）")
     ap.add_argument("--gateway", default=DEFAULT_GATEWAY,
                     help="模型网关地址（默认 %(default)s，也可用 SYSMON_GATEWAY）")
     ap.add_argument("--theme", default=None,
                     help="配色主题：主题名（themes/<名>.json）或 JSON 文件路径；"
                          "也可用 SYSMON_THEME。默认内置 Tokyo Night")
+    ap.add_argument("--no-anim", action="store_true", help="关闭动画（脉冲/转圈/spinner 静止）")
     ap.add_argument("--list-themes", action="store_true", help="列出可用主题后退出")
     args = ap.parse_args()
 
@@ -898,7 +1130,8 @@ def main():
         print("\n用法：--theme <名> 或 --theme /path/to/theme.json（也可设 SYSMON_THEME）")
         return
 
-    global THEME
+    global THEME, ANIM
+    ANIM = not args.no_anim
     THEME, warn = _theme.load_theme(args.theme)
     try:
         curses.wrapper(render, args.interval, args.gateway, warn)
