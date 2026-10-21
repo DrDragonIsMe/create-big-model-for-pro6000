@@ -162,6 +162,39 @@ def sparkline(hist, width):
     return out + " " * (width - len(out))
 
 
+DENSITY = " ░▒▓█"
+CHART_STYLES = ("area", "wave", "spectrum", "heat")
+CHART_STYLE = os.environ.get("SYSMON_CHART", "area")   # 文本版默认方块曲线（经典）
+if CHART_STYLE not in CHART_STYLES:
+    CHART_STYLE = "area"
+
+
+def spark_render(hist, width, base_col):
+    """按 CHART_STYLE 渲染速率曲线：spectrum=按水平绿→红着色；
+    heat=密度字符着色；area/wave=方块曲线 + 尾格亮色（当前值）。"""
+    vals = list(hist)[-width:]
+    if not vals:
+        return " " * max(0, width)
+    mx = max(float(v) for v in vals)
+    if CHART_STYLE == "spectrum" and USE_COLOR:
+        cells = []
+        for v in vals:
+            norm = float(v) / mx if mx > 0 else 0.0
+            cells.append(c(pct_color(norm * 100), SPARK[min(7, int(norm * 8 + 0.5))]))
+        return "".join(cells)
+    if CHART_STYLE == "heat" and USE_COLOR:
+        cells = []
+        for v in vals:
+            norm = float(v) / mx if mx > 0 else 0.0
+            glyph = DENSITY[min(4, int(norm * 4.999) + (1 if v > 0 else 0))]
+            cells.append(c(pct_color(norm * 100), glyph))
+        return "".join(cells)
+    text = sparkline(vals, width)
+    if USE_COLOR and mx > 0:
+        return text[:-1] + c(f"1;{base_col}", text[-1])
+    return text
+
+
 def progress_bar(frac, width=12):
     frac = max(0.0, min(1.0, frac or 0.0))
     n = int(round(frac * width))
@@ -581,8 +614,8 @@ def render_llm(snap):
         prefill = bool(m.get("prefill_active"))
         loading = m["status"] == "loading"
         decoding = t_rate > 0 or (m["active"] > 0 and not prefill)
-        gspark = c(COL_OK, sparkline(_gen_hist.get(m["name"], ()), 12))
-        pspark = c(COL_WARN, sparkline(_prompt_hist.get(m["name"], ()), 12))
+        gspark = spark_render(_gen_hist.get(m["name"], ()), 12, COL_OK)
+        pspark = spark_render(_prompt_hist.get(m["name"], ()), 12, COL_WARN)
         ps = c(COL_WARN, f"{p_rate:7.0f} p/s") if p_rate > 0 else dim("    -- p/s")
         ts = c(COL_OK, f"{t_rate:7.1f} t/s") if t_rate > 0 else dim("    -- t/s")
         cum = dim(f"Σprompt {fmt_tokens(m.get('prompt_total'))} · "
@@ -640,6 +673,9 @@ def main():
     ap.add_argument("-i", "--interval", type=float, default=2.0, help="数据刷新间隔秒数（默认 2）")
     ap.add_argument("-a", "--animate", action="store_true",
                     help="watch 模式下动画帧以 ~8fps 重绘（spinner/脉冲；需 tty）")
+    ap.add_argument("--chart", default=None, choices=CHART_STYLES,
+                    help="速率曲线风格：area/wave=方块曲线 spectrum=绿→红分级 "
+                         "heat=密度条（默认 SYSMON_CHART 或 area；curses 版可用 C 键实时切换）")
     ap.add_argument("--no-color", action="store_true", help="禁用彩色输出")
     ap.add_argument("--gateway", default=DEFAULT_GATEWAY,
                     help="模型网关地址（默认 %(default)s，也可用 SYSMON_GATEWAY）")
@@ -649,8 +685,12 @@ def main():
     ap.add_argument("--list-themes", action="store_true", help="列出可用主题后退出")
     args = ap.parse_args()
 
-    global USE_COLOR, GATEWAY, _THEME_WARN, ANIM, _frame
+    global USE_COLOR, GATEWAY, _THEME_WARN, ANIM, _frame, CHART_STYLE
     GATEWAY = args.gateway
+    if args.chart:
+        CHART_STYLE = args.chart
+    elif "SYSMON_CHART" not in os.environ:
+        CHART_STYLE = "area"       # 文本版默认方块曲线（无实时切换键，保持经典）
     if args.no_color:
         USE_COLOR = False
 

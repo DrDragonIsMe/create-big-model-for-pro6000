@@ -2,17 +2,24 @@
 """nvtop-style 图形化系统资源监控 - curses TUI。
 
 借鉴 nvtop 布局，图形与数字并存；数据采样与动画刷新分离（画面 ~8fps）：
-  - 顶部：每块 GPU 一个面板，温度/功耗/风扇/显存数值 + 算力、显存面积波形图（带峰值标记）
+  - 顶部：每块 GPU 一个面板，温度/功耗/风扇/显存数值 + 算力、显存负载图
   - 中部：LLM 模型面板——每模型两行：阶段动画（Prompt 进度条 / 生成脉冲 / 加载转圈）、
           p/s 与 t/s 双速率曲线 sparkline、活动/排队 x/slot、空闲时长、累计 tokens；
           面板头汇总全局 t/s、p/s、请求数与排队数
-  - CPU 面积波形图 + 每核方块图 + 每核占用数字表；右侧内存/交换/磁盘
+  - CPU 面积图 + 每核方块图 + 每核占用数字表；右侧内存/交换/磁盘
   - 底部：GPU 进程表（GPU/PID/USER/%CPU/%MEM/显存/模型/命令行）
+
+负载图 4 种风格（C 键循环，--chart 指定，默认 wave）：
+  area      面积图（经典 nvtop 滚动波形，▀▄█ 半块）
+  wave      波动直方图（每样本一根柱，柱顶水面波纹动画，最直观）
+  spectrum  频谱柱（柱高=负载 + 绿→红分级着色 + ▔ 峰值落帽）
+  heat      热力条（单行密度条 ░▒▓█，按值着色，最紧凑省行）
 
 快捷键：
     q / Esc    退出
     Space      暂停/继续数据采样（动画不停）
     A          开/关动画（脉冲、转圈、spinner）
+    C          切换负载图风格（area → wave → spectrum → heat）
     T          下一主题    Shift+Tab  上一主题
 
 用法：
@@ -218,30 +225,111 @@ def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list
 
 _no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# ─── 波形图字符 ────────────────────────────────────────────────
-# nvtop 用半块字符做上下堆叠的面积图：每个字符位表示 2 个垂直像素
+# ─── 图表字符与风格 ────────────────────────────────────────────
+# nvtop 半块面积图的像素合成表：每个字符位表示 2 个垂直像素
 HALF = {(0, 0): " ", (0, 1): "▀", (1, 0): "▄", (1, 1): "█"}
+WAVE_TOP = "▁▂▃▄▅▆▇"       # 波柱顶面：水位起伏动画字形（按列相位循环）
+DENSITY = " ░▒▓█"           # 热力条密度字符（5 级）
 
-def area_chart(history: list[float], width: int, height: int) -> list[str]:
-    """把 0..1 的历史序列画成 height 行的面积图，返回自上而下的行字符串。
-    最左列为最早样本，最右列为最新；不足 width 点时左侧留空。
+# 图表风格（C 键循环）：area=面积图(经典nvtop) / wave=波动直方图 /
+# spectrum=频谱柱(分级着色+落顶帽) / heat=热力条(单行密度)
+CHART_STYLES = ("area", "wave", "spectrum", "heat")
+CHART_STYLE_NAMES = {"area": "面积图", "wave": "波动直方图",
+                     "spectrum": "频谱柱", "heat": "热力条"}
+CHART_STYLE = os.environ.get("SYSMON_CHART", "wave")
+if CHART_STYLE not in CHART_STYLES:
+    CHART_STYLE = "area"
+_FRAME = 0                  # 当前动画帧（draw() 每帧更新，波顶相位用）
+_spectrum_caps: dict[str, list[float]] = {}   # 频谱顶帽（hkey -> 每列峰值）
+
+
+def cycle_chart_style() -> str:
+    """C 键：切到下一图表风格，返回新风格名。"""
+    global CHART_STYLE
+    CHART_STYLE = CHART_STYLES[(CHART_STYLES.index(CHART_STYLE) + 1)
+                               % len(CHART_STYLES)]
+    _spectrum_caps.clear()
+    return CHART_STYLE
+
+
+def _cols_from(history: list[float], width: int) -> list[float]:
+    """历史序列右对齐到 width 列（不足左侧补 0），clamp 到 0..1。"""
+    n = min(len(history), width)
+    cols = [0.0] * width
+    if n:
+        src = history[len(history) - n:]
+        cols[width - n:] = [min(max(float(v), 0.0), 1.0) for v in src]
+    return cols
+
+
+def _bar_grid(history: list[float], width: int, height: int,
+              frame: int) -> list[list[tuple[str, str, float]]]:
+    """波柱/频谱共用的柱网格：cell = (字符, 类型, 该行高度比例0..1)。
+    类型：body 柱身 / top 波顶 / empty 底纹 / cap 顶帽（由 _spectrum_cap_grid 写入）。
+    柱自底向上填充；顶行按列相位取波浪字形，形成水面起伏。
     """
+    cols = _cols_from(history, width)
+    pad = max(0, width - len(history))        # 左侧无数据列：留白（区别于真实 0%）
+    grid = [[(" ", "", 0.0)] * width for _ in range(height)]
+    for i, v in enumerate(cols):
+        h = v * height                        # 连续柱高（行）
+        if i < pad:
+            continue
+        if h <= 0.05:
+            for r in range(height):
+                grid[r][i] = ("░", "empty", (height - r) / height)
+            continue
+        for r in range(height):
+            pb = height - 1 - r               # 距底行数（0=最底）
+            frac = (pb + 1) / height
+            if pb < h - 0.5:
+                grid[r][i] = ("█", "body", frac)
+            elif pb < h + 0.5:
+                grid[r][i] = (WAVE_TOP[(frame + i) % len(WAVE_TOP)], "top", frac)
+            else:
+                grid[r][i] = ("░", "empty", frac)
+    return grid
+
+
+def _apply_spectrum_caps(grid, history: list[float], width: int, height: int,
+                         hkey: str | None):
+    """频谱顶帽：每列记忆峰值并缓慢下落（▔），高于当前柱顶时可见。"""
+    if not hkey:
+        return
+    cols = _cols_from(history, width)
+    cap = _spectrum_caps.get(hkey)
+    if cap is None or len(cap) != width:
+        cap = list(cols)
+        _spectrum_caps[hkey] = cap
+    pad = max(0, width - len(history))
+    for i, v in enumerate(cols):
+        cap[i] = max(cap[i] * 0.985, v)       # ~8fps 下约 6s 半衰
+        if i < pad or cap[i] <= 0.02:
+            continue                           # 无数据/零值列不画帽
+        cap_row = height - 1 - int(round(cap[i] * height))
+        bar_top = next((r for r in range(height)
+                        if grid[r][i][1] in ("body", "top")), height)
+        if 0 <= cap_row < bar_top:
+            grid[cap_row][i] = ("▔", "cap", cap[i])
+
+def draw_chart_area(history: list[float], width: int, height: int, frame: int = 0) -> list[str]:
+    """nvtop 经典面积图（原始风格）。"""
     pix_h = height * 2
     n = min(len(history), width)
     cols = [0.0] * width
     for i in range(n):
         cols[width - n + i] = history[len(history) - n + i]
-
     rows = [[] for _ in range(height)]
     for v in cols:
         filled = int(round(min(max(v, 0.0), 1.0) * pix_h))
         for r in range(height):
-            lo = 2 * (height - 1 - r)        # 该字符格下半像素（自底向上计数）
+            lo = 2 * (height - 1 - r)
             hi = lo + 1
             bot = 1 if filled > lo else 0
             top = 1 if filled > hi else 0
             rows[r].append(HALF[(top, bot)])
     return ["".join(r) for r in rows]
+
 
 # ─── 历史数据 ─────────────────────────────────────────────────
 _history: dict[str, list[float]] = {}
@@ -559,14 +647,50 @@ def put(stdscr, y, x, text, attr=curses.A_NORMAL, maxw=None):
         pass
 
 def put_chart(stdscr, y, x, w, history, color_pair, height=2, bold=False,
-              peak=False):
-    """在 (y,x,w,height) 区域内绘制面积图；peak=True 时叠加窗口峰值标记 ▁。"""
-    lines = area_chart(history, w, height)
-    attr = cpair(color_pair, bold)
-    if peak and history and max(history) > 0.02:
-        lines = _mark_peak(lines, history, w)
-    for r, line in enumerate(lines):
-        put(stdscr, y + r, x, line, attr, w)
+              peak=False, hkey=None):
+    """按当前 CHART_STYLE 绘制负载可视化（C 键切换）：
+    area=面积图(peak ▁ 标记) / wave=波动直方图(顶面水波动画) /
+    spectrum=频谱柱(绿→红分级着色+▔落顶帽) / heat=热力条(单行密度+按值着色)。
+    hkey 用于频谱顶帽的列峰值记忆。
+    """
+    style = CHART_STYLE if CHART_STYLE in CHART_STYLES else "area"
+    if style == "area":
+        lines = draw_chart_area(history, w, height)
+        attr = cpair(color_pair, bold)
+        if peak and history and max(history) > 0.02:
+            lines = _mark_peak(lines, history, w)
+        for r, line in enumerate(lines):
+            put(stdscr, y + r, x, line, attr, w)
+        return
+    if style == "heat":
+        cols = _cols_from(history, w)
+        pad = max(0, w - len(history))
+        for i, v in enumerate(cols):
+            if i < pad:
+                continue                          # 无数据留白
+            if v <= 0.02:
+                put(stdscr, y + height - 1, x + i, "░", cpair(PAIR_BORDER), 1)
+            else:
+                cell = DENSITY[min(4, int(v * 4.999) + 1)]
+                put(stdscr, y + height - 1, x + i, cell,
+                    cpair(color_for(v * 100), v >= 0.6), 1)
+        return
+    grid = _bar_grid(history, w, height, _FRAME)
+    if style == "spectrum":
+        _apply_spectrum_caps(grid, history, w, height, hkey)
+    for r in range(height):
+        for i, (glyph, kind, frac) in enumerate(grid[r]):
+            if kind == "body":
+                a = cpair(color_for(frac * 100)) if style == "spectrum" \
+                    else cpair(color_pair, bold)
+            elif kind == "top":
+                a = cpair(color_for(frac * 100), True) if style == "spectrum" \
+                    else cpair(color_pair, True)
+            elif kind == "cap":
+                a = cpair(PAIR_ACCENT, True)
+            else:
+                a = cpair(PAIR_BORDER)
+            put(stdscr, y + r, x + i, glyph, a, 1)
 
 def _mark_peak(lines, history, w):
     """在峰值所在列顶格画 ▁ 标记线（重绘为列表便于覆写）。"""
@@ -597,7 +721,7 @@ def anim_char(seq: str, frame: int) -> str:
 # ─── GPU 面板 ─────────────────────────────────────────────────
 
 def panel_gpu(stdscr, y, x, w, gpu, ch):
-    """单卡面板：标题 + 状态行 + Util/Mem 数值与面积图。共 4 + 2*ch 行。"""
+    """单卡面板：标题 + 状态行 + Util/Mem 数值与负载图（风格随 CHART_STYLE）。共 4 + 2*ch 行。"""
     gi = gpu["index"]
     gc = 20 + (gi % len(GPU_COLORS))
     label_w = 25 if w >= 40 else max(13, w - 12)
@@ -627,7 +751,7 @@ def panel_gpu(stdscr, y, x, w, gpu, ch):
         cpair(PAIR_DIM), max(0, w - (cx - x)))
     mem_pct = gpu["mem_used"] / gpu["mem_total"] * 100
 
-    # Utilization：数值 + 面积图（峰值标记）
+    # Utilization：数值 + 负载图（风格随 CHART_STYLE）
     y += 1
     hist_u = push(f"gu{gi}", gpu["util"] / 100)
     put(stdscr, y, x, f"算力 {gpu['util']:6.1f}%", cpair(color_for(gpu["util"]), True), 13)
@@ -635,9 +759,9 @@ def panel_gpu(stdscr, y, x, w, gpu, ch):
         put(stdscr, y, x + 14, f"带宽 {gpu['mem_util']:3.0f}%", cpair(PAIR_DIM),
             max(0, label_w - 14))
     put_chart(stdscr, y + 1, x + label_w, chart_w, hist_u, gc, ch, bold=True,
-              peak=True)
+              peak=True, hkey=f"gu{gi}")
 
-    # Memory：数值 + 面积图（峰值标记）
+    # Memory：数值 + 图表（风格由 C 键切换）
     y += 1 + ch
     hist_m = push(f"gm{gi}", gpu["mem_used"] / gpu["mem_total"])
     put(stdscr, y, x, f"显存 {mem_pct:5.1f}%", cpair(color_for(mem_pct), True), 13)
@@ -645,7 +769,7 @@ def panel_gpu(stdscr, y, x, w, gpu, ch):
     put(stdscr, y, x + 14, clip(detail, max(0, label_w - 14)), cpair(PAIR_DIM),
         max(0, label_w - 14))
     put_chart(stdscr, y + 1, x + label_w, chart_w, hist_m, PAIR_MEM, ch, bold=True,
-              peak=True)
+              peak=True, hkey=f"gm{gi}")
 
     return y + 1 + ch
 
@@ -774,15 +898,23 @@ def panel_llm(stdscr, y, x, w, models, max_rows, frame):
         put(stdscr, y, x, f"… 另有 {hidden} 个模型未显示", cpair(PAIR_DIM), w)
         y += 1
 
-    # 图例
+    # 图例（含当前负载图风格说明）
     lx = x + 2
+    _chart_legend = {
+        "area": ((cpair(PAIR_BORDER), "▁"), (cpair(PAIR_DIM), "峰值 ")),
+        "wave": ((cpair(PAIR_OK), "▃▅▂"), (cpair(PAIR_DIM), "柱顶=水位 ")),
+        "spectrum": ((cpair(PAIR_ACCENT, True), "▔"),
+                     (cpair(PAIR_DIM), "顶帽=峰值回落 ")),
+        "heat": ((cpair(PAIR_DIM), "░▒▓█"), (cpair(PAIR_DIM), "密度=负载 ")),
+    }.get(CHART_STYLE, ())
     legend = (
         (cpair(PAIR_OK), "●"), (cpair(PAIR_DIM), "生成 "),
         (cpair(PAIR_WARN), "◐"), (cpair(PAIR_DIM), "Prompt "),
         (cpair(PAIR_OK, True), "t/s"), (cpair(PAIR_DIM), "=生成速率 "),
         (cpair(PAIR_WARN, True), "p/s"), (cpair(PAIR_DIM), "=Prompt速率 "),
-        (cpair(PAIR_BORDER), "▁"), (cpair(PAIR_DIM), "峰值  "),
-        (cpair(PAIR_DIM), "ACT=活动/slot(超则排队)  Σ=累计(加载以来)  K=千 M=百万tok"),
+    ) + _chart_legend + (
+        (cpair(PAIR_DIM), f"C键:图→{CHART_STYLES[(CHART_STYLES.index(CHART_STYLE)+1) % len(CHART_STYLES)]}  "
+                          "ACT=活动/slot(超则排队)  Σ=累计(加载以来)  K=千 M=百万tok"),
     )
     for a, seg in legend:
         put(stdscr, y, lx, seg, a, disp_width(seg))
@@ -805,7 +937,8 @@ def panel_cpu(stdscr, y, x, w, cpu, ch, room=99):
     if cpu["freq"]:
         extra += f"  {cpu['freq'] / 1000:.2f}GHz"
     put(stdscr, y, x + label_w, clip(extra, chart_w), cpair(PAIR_DIM), chart_w)
-    put_chart(stdscr, y + 1, x + label_w, chart_w, hist, PAIR_CPU, ch, peak=True)
+    put_chart(stdscr, y + 1, x + label_w, chart_w, hist, PAIR_CPU, ch,
+              peak=True, hkey="cpu")
 
     # 每核方块图：一列一核，▁▂▃▄▅▆▇█ 八级
     LEVELS = " ▁▂▃▄▅▆▇█"
@@ -850,7 +983,8 @@ def panel_mem(stdscr, y, x, w, mem, disk, ch):
         h = push(hist_key, pct / 100)
         put(stdscr, row, x, f"{label} {pct:5.1f}%", cpair(color_for(pct), True), label_w)
         put(stdscr, row, x + label_w, clip(detail, chart_w), cpair(PAIR_DIM), chart_w)
-        put_chart(stdscr, row + 1, x + label_w, chart_w, h, pair, ch)
+        put_chart(stdscr, row + 1, x + label_w, chart_w, h, pair, ch,
+                  peak=True, hkey=hist_key)
 
     block(y, "内存", vm.percent,
           f"{fmt_bytes(vm.used)}/{fmt_bytes(vm.total)}  可用 {fmt_bytes(vm.available)}"
@@ -950,6 +1084,8 @@ def collect_samples(gateway, interval):
 
 
 def draw(stdscr, samples, interval, frame, theme_warn=None):
+    global _FRAME
+    _FRAME = frame
     rows, cols = stdscr.getmaxyx()
     gpus = samples["gpus"]
     llm_models = samples["models"]
@@ -1025,7 +1161,9 @@ def draw(stdscr, samples, interval, frame, theme_warn=None):
     theme_name = (THEME or {}).get("name", "tokyo-night")
     pause_tag = " ⏸已暂停 " if PAUSED else ""
     anim_tag = "动效开" if ANIM else "动效关"
-    status = (f" q 退出  Space 暂停  A 动画  T/⇧T 主题 | {pause_tag}{anim_tag}"
+    status = (f" q 退出  Space 暂停  A 动画  C 图表  T/⇧T 主题"
+              f" | {pause_tag}{anim_tag}"
+              f" 图表 {CHART_STYLE_NAMES[CHART_STYLE]}"
               f" 刷新 {interval:.1f}s 采样 {len(_history.get('cpu', []))} 点"
               f" 主题 {theme_name}")
     put(stdscr, rows - 1, 0, pad(status, cols - 1), cpair(PAIR_HEADER, True), cols - 1)
@@ -1082,6 +1220,8 @@ def render(stdscr, interval, gateway=DEFAULT_GATEWAY, theme_warn=None):
             PAUSED = not PAUSED
         elif key in (ord("A"),):                 # 动画开关
             ANIM = not ANIM
+        elif key in (ord("C"), ord("c")):        # 图表风格循环
+            cycle_chart_style()
         elif key in (curses.KEY_RESIZE,):
             curses.update_lines_cols()
             samples = None                       # 立即重绘适配新尺寸
@@ -1117,6 +1257,10 @@ def main():
                     help="配色主题：主题名（themes/<名>.json）或 JSON 文件路径；"
                          "也可用 SYSMON_THEME。默认内置 Tokyo Night")
     ap.add_argument("--no-anim", action="store_true", help="关闭动画（脉冲/转圈/spinner 静止）")
+    ap.add_argument("--chart", default=None, choices=CHART_STYLES,
+                    help="负载图表风格：area=面积图(经典) wave=波动直方图 "
+                         "spectrum=频谱柱(分级色+顶帽) heat=热力条；"
+                         "运行中按 C 循环切换（默认 SYSMON_CHART 或 wave）")
     ap.add_argument("--list-themes", action="store_true", help="列出可用主题后退出")
     args = ap.parse_args()
 
@@ -1130,8 +1274,10 @@ def main():
         print("\n用法：--theme <名> 或 --theme /path/to/theme.json（也可设 SYSMON_THEME）")
         return
 
-    global THEME, ANIM
+    global THEME, ANIM, CHART_STYLE
     ANIM = not args.no_anim
+    if args.chart:
+        CHART_STYLE = args.chart        # 默认 wave（模块级），--chart area 回经典
     THEME, warn = _theme.load_theme(args.theme)
     try:
         curses.wrapper(render, args.interval, args.gateway, warn)
