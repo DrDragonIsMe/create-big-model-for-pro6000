@@ -32,29 +32,61 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()   { echo -e "${RED}[ERR ]${NC} $*" >&2; }
 
 # 读取 sudo 密码（优先级：环境变量 > .env > 交互式）
+# 无参数调用＝只探测有无现成凭据，不提示；ask＝允许在无凭据时交互询问
 read_sudo_pass() {
+  local ask="${1:-}"
   if [[ -n "${SUDO_PASS:-}" ]]; then
-    echo "$SUDO_PASS"
+    printf '%s\n' "$SUDO_PASS"
     return 0
-  elif [[ -f .env ]]; then
-    grep -oP '^SUDO_PASS=\K.*' .env 2>/dev/null && return 0
   fi
-  # 交互式提示（仅在需要时）
-  if [[ "$1" == "ask" ]]; then
-    stty -echo
+  if [[ -f .env ]]; then
+    local _p
+    _p="$(grep -oP '^SUDO_PASS=\K.*' .env 2>/dev/null || true)"
+    if [[ -n "$_p" ]]; then
+      printf '%s\n' "$_p"
+      return 0
+    fi
+  fi
+  # 交互式提示（仅在需要、且确实有终端时）
+  if [[ "$ask" == "ask" && -t 0 ]]; then
+    local _pass
+    stty -echo 2>/dev/null || true
     read -rp "请输入 sudo 密码: " _pass
+    stty echo 2>/dev/null || true
     echo
-    stty echo
-    echo "$_pass"
+    [[ -n "$_pass" ]] || return 1
+    printf '%s\n' "$_pass"
     return 0
   fi
   return 1
 }
 
+# 能否拿到 root（已是 root / NOPASSWD / 有密码 / 可交互询问）
+can_sudo() {
+  [[ "$(id -u)" -eq 0 ]] && return 0
+  sudo -n true 2>/dev/null && return 0
+  read_sudo_pass >/dev/null 2>&1 && return 0
+  [[ -t 0 ]] && return 0
+  return 1
+}
+
+# 提权执行：root 直接跑，否则 sudo（NOPASSWD 或密码）。
+# 拿不到权限时返回 126，由调用方决定中止还是告警——可选步骤不该带崩整个初始化。
 sudo_cmd() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+  if sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+    return $?
+  fi
   local pass
-  pass="$(read_sudo_pass)" || { err "无法获取 sudo 密码，请设置环境变量 SUDO_PASS"; exit 1; }
-  echo "$pass" | sudo -S "$@" 2>/dev/null
+  if pass="$(read_sudo_pass ask)"; then
+    printf '%s\n' "$pass" | sudo -S -p '' "$@"
+    return $?
+  fi
+  return 126
 }
 
 # ──────────────────────────────────────────────
@@ -103,7 +135,9 @@ fi
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | while read -r line; do
   echo "  GPU: $line"
 done
-gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | tr -d '[:space:]')
+# count 每张卡输出一次，取首行；直接 tr 去空白会把 "2\n2" 粘成 "22"
+gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+[[ "$gpu_count" =~ ^[0-9]+$ ]] || gpu_count=0
 echo "  GPU 数: $gpu_count"
 if [[ "$gpu_count" -lt 1 ]]; then
   err "未检测到 NVIDIA GPU，初始化中止。"
@@ -118,27 +152,54 @@ info "========================================"
 info "  第一步：系统级依赖"
 info "========================================"
 
-bash scripts/install-prereqs.sh
+# Docker + NVIDIA Container Toolkit 只有新机器才需要装。
+# install-prereqs.sh 会整体覆盖 /etc/docker/daemon.json 并重启 docker，
+# 在已就绪的机器上重复执行既慢（apt + 拉测试镜像）又会中断在跑的服务，所以先探测再决定。
+prereqs_ready() {
+  command -v docker >/dev/null 2>&1 || return 1
+  command -v nvidia-ctk >/dev/null 2>&1 || return 1
+  if docker info >/dev/null 2>&1; then
+    docker info 2>/dev/null | grep -q nvidia || return 1
+  else
+    grep -q nvidia /etc/docker/daemon.json 2>/dev/null || return 1
+  fi
+  return 0
+}
 
-# 加入 docker 组（如果不在）
-if ! id -nG "$USER" 2>/dev/null | grep -qw docker; then
-  info "将用户 $USER 加入 docker 组…"
-  sudo_cmd usermod -aG docker "$USER" || true
-  warn "docker 组变更需要注销重登生效。本次会话通过 sudo 绕过。"
+if prereqs_ready; then
+  ok "Docker 与 NVIDIA Container Toolkit 已就绪，跳过系统依赖安装"
+elif can_sudo; then
+  info "安装系统依赖（Docker + NVIDIA Container Toolkit，需要 root）…"
+  sudo_cmd bash scripts/install-prereqs.sh
+else
+  err "缺少 Docker/NVIDIA Container Toolkit，且当前拿不到 sudo 权限。"
+  err "请设置 SUDO_PASS 后重跑，或先手动执行: sudo bash scripts/install-prereqs.sh"
+  exit 1
+fi
+
+# 加入 docker 组（如果不在）；ssh 非登录 shell 下 $USER 可能为空，用 id -un
+me="$(id -un)"
+if id -nG "$me" 2>/dev/null | grep -qw docker; then
+  ok "用户 $me 已在 docker 组"
+else
+  info "将用户 $me 加入 docker 组…"
+  if sudo_cmd usermod -aG docker "$me"; then
+    warn "docker 组变更需要注销重登生效。本次会话通过 sudo 绕过。"
+  else
+    warn "无 sudo 权限，请手动执行: sudo usermod -aG docker $me 后重新登录"
+  fi
 fi
 
 # Locale 修复
 info "配置 locale…"
-if ! locale -a 2>/dev/null | grep -q "en_US.utf8"; then
-  if [[ -f /etc/locale.gen ]]; then
-    sudo_cmd bash -c "sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen"
-    sudo_cmd locale-gen en_US.UTF-8
-    ok "en_US.UTF-8 locale 已生成"
-  else
-    warn "/etc/locale.gen 不存在，跳过 locale 配置"
-  fi
-else
+if locale -a 2>/dev/null | grep -qiE '^en_US\.utf-?8$'; then
   ok "en_US.UTF-8 locale 已存在"
+elif ! command -v locale-gen >/dev/null 2>&1; then
+  warn "locale-gen 不可用（未安装 locales？），跳过"
+elif sudo_cmd locale-gen en_US.UTF-8 && sudo_cmd update-locale LANG=en_US.UTF-8; then
+  ok "en_US.UTF-8 locale 已生成"
+else
+  warn "生成 locale 需要 root，跳过（可手动: sudo locale-gen en_US.UTF-8）"
 fi
 
 # ──────────────────────────────────────────────
@@ -155,6 +216,10 @@ if [[ ! -f models.json ]]; then
   exit 1
 fi
 ok "项目代码已就位: $(pwd)"
+
+# 运行时目录：manage.sh 把 ./models bind-mount 进容器并以当前用户身份写入，
+# 目录不存在时 docker 会以 root 建出来，后续下载直接 Permission denied
+mkdir -p models/llm models/comfy data/input data/output data/abtest data/vllm-cache .jobs
 
 # ──────────────────────────────────────────────
 # 第三步：模型下载
@@ -237,38 +302,48 @@ PYEOF
     ;;
 esac
 
-# 校验模型名
-invalid=()
+# 校验模型名：清单里没有的直接剔除。
+# 原来只是打个 warn 却把名字留在列表里，后面按名字取显存拿到 "?"，$(( )) 当场炸掉整个初始化
 all_llm=$(python3 -c "import json; print(' '.join(json.load(open('models.json'))['llm'].keys()))")
 all_video=$(python3 -c "import json; print(' '.join(json.load(open('models.json'))['video'].keys()))")
 
-for name in "${download_llm[@]}"; do
-  if ! echo "$all_llm" | grep -qw "$name"; then
-    invalid+=("$name (LLM)"); warn "  未知 LLM 模型: $name，已跳过"
-  fi
-done
-for name in "${download_video[@]}"; do
-  if ! echo "$all_video" | grep -qw "$name"; then
-    invalid+=("$name (视频)"); warn "  未知视频模型: $name，已跳过"
-  fi
-done
+# $1=空格分隔的已知名单，其余参数为候选名；输出去重后的合法名
+keep_known() {
+  local known="$1"; shift
+  local n
+  for n in "$@"; do
+    if grep -qw -- "$n" <<<"$known"; then echo "$n"
+    else warn "  未知模型: $n，已跳过"
+    fi
+  done | sort -u
+}
 
-# 去重
-download_llm=($(printf '%s\n' "${download_llm[@]}" | sort -u))
-download_video=($(printf '%s\n' "${download_video[@]}" | sort -u))
+download_llm=($(keep_known "$all_llm" "${download_llm[@]}"))
+download_video=($(keep_known "$all_video" "${download_video[@]}"))
 
-# 预估磁盘
+# 预估磁盘（清单里的显存值可能是小数，统一向上取整再累加，避免 $(( )) 拿到小数或 "?"）
+est_gb() {  # $1=取值的 python 表达式
+  python3 -c "import json,math;man=json.load(open('models.json'));print(math.ceil(float($1)))" 2>/dev/null || echo 0
+}
 est_llm_gb=0
 for name in "${download_llm[@]}"; do
-  gb=$(python3 -c "import json; man=json.load(open('models.json')); print(man['llm']['$name']['variants']['bf16'])" 2>/dev/null || echo "?")
+  gb=$(est_gb "man['llm']['$name']['variants'].get('bf16',0)")
   est_llm_gb=$((est_llm_gb + gb))
 done
 est_video_gb=0
 for name in "${download_video[@]}"; do
-  gb=$(python3 -c "import json; man=json.load(open('models.json')); print(man['video']['$name']['vram_720p_bf16'])" 2>/dev/null || echo "?")
+  gb=$(est_gb "man['video']['$name'].get('vram_720p_bf16',0)")
   est_video_gb=$((est_video_gb + gb))
 done
 est_total=$((est_llm_gb + est_video_gb + 30))
+
+# 空间不够就提前收工，比下到一半 ENOSPC 好收拾
+free_gb=$(df -BG --output=avail . 2>/dev/null | tail -1 | tr -dc '0-9')
+if [[ -n "$free_gb" && "$free_gb" -lt "$est_total" ]]; then
+  err "磁盘可用 ${free_gb}GB，放不下预计 ${est_total}GB 的模型。"
+  err "先清理空间，或减少要下载的模型后重跑。"
+  exit 1
+fi
 
 echo ""
 info "准备下载的模型:"
@@ -280,29 +355,33 @@ fi
 echo ""
 echo -e "  ${YELLOW}预计磁盘占用: ~${est_total}GB${NC}"
 
+SKIP_DOWNLOAD=0
 if [[ "$MODE" != "minimal" && "$MODE" != "full" ]]; then
   read -rp "  确认下载？[Y/n]: " confirm
   confirm="${confirm,,}"
   if [[ "$confirm" == "n" || "$confirm" == "no" ]]; then
+    SKIP_DOWNLOAD=1
     info "跳过模型下载"
   fi
 fi
 
 # 实际下载
 echo ""
-for name in "${download_llm[@]}"; do
-  info "下载 LLM: $name"
-  bash scripts/manage.sh download "$name" || warn "下载失败: $name"
-done
+if [[ $SKIP_DOWNLOAD -eq 0 ]]; then
+  for name in "${download_llm[@]}"; do
+    info "下载 LLM: $name"
+    bash scripts/manage.sh download "$name" || warn "下载失败: $name"
+  done
 
-for name in "${download_video[@]}"; do
-  info "下载视频模型: $name"
-  bash scripts/manage.sh download "$name" || warn "下载失败: $name"
-done
+  for name in "${download_video[@]}"; do
+    info "下载视频模型: $name"
+    bash scripts/manage.sh download "$name" || warn "下载失败: $name"
+  done
 
-if [[ $download_common -eq 1 ]]; then
-  info "下载共享组件"
-  bash scripts/manage.sh download common || warn "下载失败: common"
+  if [[ $download_common -eq 1 ]]; then
+    info "下载共享组件"
+    bash scripts/manage.sh download common || warn "下载失败: common"
+  fi
 fi
 
 # 自动校准
