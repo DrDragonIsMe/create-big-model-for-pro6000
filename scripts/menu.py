@@ -5,6 +5,12 @@ import argparse, json, os, re, shutil, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
+# YaRN 扩展上限复用 check_llm_config 的同一份实现：rope 缩放规则要在两处各写一遍的话，
+# 迟早算出两个不同的天花板（那边校验放行 900000、这边却按原生 262144 把配置砍下来）。
+# 该模块级只有 import 和一个纯路径常量，导入无副作用。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from check_llm_config import yarn_override_limit
+
 def load_manifest():
     with open("models.json", encoding="utf-8") as f:
         return json.load(f)
@@ -238,7 +244,9 @@ def compute(args, man, gpu_count, gpu_mem):
             free_video = 0
 
     # ---------- 上下文长度：按显卡剩余显存尽量开大 ----------
-    ctx_cap = d.get("max_ctx", d["ctx_default"])
+    # 天花板取"原生上限"与"YaRN 扩展上限"的较大者：配了 YaRN 的模型本就是为跑超长而配，
+    # 只按 max_ctx 封顶会把刻意扩出来的上下文当越界砍掉（27B：262144 → 1048576）。
+    ctx_cap = max(int(d.get("max_ctx") or d["ctx_default"]), yarn_override_limit(d))
     # KV 预算要按"网关实际加载的那份权重"算。model_dir 在没有显式指定精度时优先用
     # <name>-fp8 目录，而 variants 里的 vram 是 menu 选中的变体——两者不一致时
     # （如 96GB 机上 menu 自动选 bf16:54GB、网关却加载 fp8:28GB）会低估可用 KV，
@@ -337,10 +345,11 @@ def compute(args, man, gpu_count, gpu_mem):
         # 副本数只在 >1 时落盘，单副本删键：既不改变现有机器（参考机）的 models.json，
         # 也让"没配 replicas"永远等价于今天的单容器行为
         gw_new["replicas"] = replicas if replicas > 1 else None
-        # max_len 只往下钳：配置值超过本机装得下的才改写，本来就保守的不许抬高，
-        # 免得把别人手工调好的长上下文（如 96GB 机的 900000）按估计值砍掉。
-        cfg_len = int(gw_old.get("max_len") or 0)
-        gw_new["max_len"] = int(min(max_len, cfg_len)) if cfg_len else int(max_len)
+        # max_len 每次按本机实算，绝不与旧值取 min：旧值可能是别台机器（96GB→900000）
+        # 或本机别种布局（fp8 单卡→186048）留下的快照，取 min 等于把快照一路继承下来——
+        # 真机验证过：切到 bf16 双卡 TP=2 时本可给到 ~46 万，却被上一个布局的 186048 钉死。
+        # 该防的是"算错"，靠的是按实际加载的权重估 KV + YaRN 天花板两头，不是靠不敢抬高。
+        gw_new["max_len"] = int(max_len)
     changed = {k: (gw_old.get(k), v) for k, v in gw_new.items() if gw_old.get(k) != v}
     if changed:
         for k, (_prev, v) in changed.items():
