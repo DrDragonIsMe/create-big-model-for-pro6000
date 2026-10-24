@@ -388,6 +388,12 @@ fi
 info "自动校准 models.json（think/max_ctx/工具格式）"
 bash scripts/manage.sh check --fix || warn "校准跳过"
 
+# 实测校准：清单里的 vram_* 与 KV 密度都是"别处量的/估的"，本机真实值要跑一次才知道。
+# 这一步放在第四步之后（见文件末尾），因为 text 密度要后端已拉起、视频峰值要 ComfyUI 在跑。
+# 这里只试一次：网关是懒加载，此时后端多半没起，拿不到属正常，不打断流程。
+python3 scripts/calib_vram.py text "${download_llm[0]:-qwen3.8-27b}" 2>/dev/null \
+  || info "  KV 密度待标定：拉起后端后由第四步末尾自动补测"
+
 # ──────────────────────────────────────────────
 # 第四步：启动服务
 # ──────────────────────────────────────────────
@@ -401,17 +407,32 @@ if [[ $NO_START -eq 1 ]]; then
   info "启动命令: ./scripts/start.sh"
 else
   # 非交互启动（使用默认配置）
-  # --minimal/--full 写死的视频模型不一定放得得下本机单卡（minimax-h3 480p 要 55GB，
-  # 2×48GB 的机器每张卡只有 ~40GB 预算，menu.py 会直接拒绝）。这里退一步只起文本，
-  # 而不是让整个初始化在最后一公里报错退出——模型已经下好了，服务起不来更可惜。
+  # --minimal/--full 写死的视频模型未必放得下本机单卡。准入用的是"实测单卡峰值优先、
+  # 没有实测才退回清单声明的阶段之和"，所以全新机器上第一次很容易把其实跑得动的模型
+  # 判成放不下（minimax-h3 声明 55GB，2×4090 实测单卡峰值 45.7GB 且出片成功）。
+  # 这里退一步只起文本，让初始化至少有个可用服务；真实数字由下面的实测校准补上，
+  # 补完再重跑 start.sh 就能按实测放行。
   llm_arg="${download_llm[0]:-qwen3.8-27b}"
   video_arg="${download_video[0]:-minimax-h3}"
   info "开始启动服务…（LLM=$llm_arg 视频=$video_arg）"
-  if ! bash scripts/start.sh --llm "$llm_arg" --video "$video_arg" -y; then
-    warn "按视频模型 $video_arg 启动失败（多半是本机单卡显存放不下它）。"
-    warn "退回只起文本模型；要跑视频请选放得下的：./scripts/start.sh --llm $llm_arg --video <wan2.2-s2v|infinitetalk|ltx-2|none> -y"
+  if bash scripts/start.sh --llm "$llm_arg" --video "$video_arg" -y; then
+    VIDEO_OK=1
+  else
+    VIDEO_OK=0
+    warn "按视频模型 $video_arg 启动失败：本机单卡预算放不下它声明的显存。"
+    warn "退回只起文本。若怀疑是被清单声明的「阶段之和」高估误杀，实测一次再重跑即可放行："
+    warn "  ./scripts/start.sh --llm $llm_arg --video none -y && python3 scripts/calib_vram.py video $video_arg"
+    warn "  （或直接换一个放得下的：wan2.2-s2v | infinitetalk | ltx-2 | none）"
     bash scripts/start.sh --llm "$llm_arg" --video none -y
   fi
+
+  # 实测校准：服务已起，此时后端/ComfyUI 才可能真的在卡上，量得到的才是本机真值
+  info "实测校准（KV 密度 / 视频单卡峰值），失败不打断初始化"
+  python3 scripts/calib_vram.py text "$llm_arg" || warn "  文本密度未取到（后端还没被请求拉起）"
+  if [[ $VIDEO_OK -eq 1 ]]; then
+    python3 scripts/calib_vram.py video "$video_arg" || warn "  视频峰值未取到（ComfyUI 未就绪）"
+  fi
+
   echo ""
   ok "初始化完成！"
   echo ""

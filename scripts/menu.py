@@ -10,20 +10,11 @@ os.chdir(ROOT)
 # 该模块级只有 import 和一个纯路径常量，导入无副作用。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from check_llm_config import yarn_override_limit
+import hwprofile  # 探测 + 派生预算：meta 里那批绝对 GB 的唯一替代口径
 
 def load_manifest():
     with open("models.json", encoding="utf-8") as f:
         return json.load(f)
-
-def detect_gpus():
-    out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
-    if out.returncode != 0:
-        sys.exit("错误：检测不到 NVIDIA GPU（nvidia-smi 失败）")
-    names = [l for l in out.stdout.strip().splitlines() if l.strip()]
-    mem = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True).stdout.split()
-    return len(names), [int(m) for m in mem]  # MiB
 
 def llm_downloaded(name):
     d = os.path.join("models/llm", name)
@@ -76,26 +67,57 @@ def pick_variant(llm, budget_gb):
     return best
 
 def video_tier(vdef, free_gb, slack):
-    """返回 (标记, 说明, max_res)：'720' / '480' / 'risky480' / 'no'"""
-    if free_gb >= vdef["vram_720p_bf16"]:
+    """返回 (标记, 说明, max_res)：'720' / '480' / 'risky480' / 'no'
+
+    优先用 calib_vram.py video 实测的单卡峰值（vram_*_peak_gb），没有实测值才退回清单
+    声明值。声明值是流水线各阶段显存之和，而 ComfyUI 在阶段之间会打
+    "Unloaded partially: N MB freed, M MB remains loaded"——阶段并不要求同时在卡上，
+    所以之和系统性偏大：minimax-h3 声明 55GB，2×4090 上实测单卡峰值只有 44.8GB 且出片成功。
+    继续拿 55 做准入，就是把每台 48GB 机器都判成"跑不了"。
+
+    slack（offload 余量）只打折声明值：它那 12GB 本就是为了吃掉"阶段之和"的高估；
+    实测峰值里没有这部分水分，再打一次折等于把同一个宽容计两遍，会把真装不下的
+    机器判成"能跑"（48GB 机 free=40 vs 实测 45.7 必须还是 no）。
+    """
+    meas_720 = vdef.get("vram_720p_bf16_peak_gb")
+    meas_480 = vdef.get("vram_480p_fp8_peak_gb")
+    need_720 = meas_720 or vdef["vram_720p_bf16"]
+    need_480 = meas_480 or vdef["vram_480p_fp8"]
+    if free_gb >= need_720:
         return "720", "", 720
-    if free_gb >= vdef["vram_480p_fp8"]:
+    if free_gb >= need_480:
         return "480", "仅 480p", 480
-    if free_gb >= vdef["vram_480p_fp8"] - slack:
+    if not meas_480 and free_gb >= need_480 - slack:
         return "risky480", "480p+offload(慢)", 480
     return "no", "", None
 
 def compute(args, man, gpu_count, gpu_mem):
     meta = man["meta"]
     gmem = round(gpu_mem[0] / 1024)  # GB，同型号卡取首卡
+    # 各角色预算从探测结果派生，meta 只在人类显式写过且量纲对得上时当覆盖项
+    # （48GB 机上 meta 的 video_reserve_gb=8 是 96GB 参考机遗留值，会被退回 margin）
+    bud = hwprofile.budgets(meta, gmem)
     llms = man["llm"]
+    # 派生出来的预算一定要打出来：meta 的绝对数被忽略掉是"安全垫按本机重算"，
+    # 悄悄重算就等同于清单在骗人
+    print(f"本机预算（从 {gpu_count}×{gmem}GB 派生，margin {bud['margin']}GB）："
+          f"LLM 单卡 {bud['llm_card']}GB / 视频单卡 {bud['video_card']}GB / "
+          f"单卡共存给 LLM {bud['single_llm']}GB")
+    if bud["overridden"]:
+        print(f"  · 取自 models.json meta 的覆盖项：{'、'.join(bud['overridden'])}")
+    if bud["ignored"]:
+        print(f"  · meta 里这些键是别台大显存机器的绝对值，本机按 margin 重算："
+              f"{'、'.join(bud['ignored'])}"
+              f"（video_reserve_gb={meta.get('video_reserve_gb')}GB 相当于单卡 "
+              f"{round(100.0 * meta.get('video_reserve_gb', 0) / gmem)}%，"
+              f"派生值 {bud['margin']}GB）")
 
     # ---------- 第 1 级：LLM ----------
     llm_name = args.llm
     if llm_name is not None and llm_name not in llms:
         sys.exit(f"错误：清单里没有 LLM '{llm_name}'（可用 manage.sh list 查看，或 manage.sh add 新增）")
     if gpu_count == 1:
-        budget = meta["single_llm_budget_gb"]
+        budget = bud["single_llm"]
     else:
         budget = round(gmem * meta["dual_llm_util"])
     if llm_name is None:
@@ -144,7 +166,7 @@ def compute(args, man, gpu_count, gpu_mem):
             sys.exit(f"错误：{llm_name} 没有变体 '{variant}'，可选: {list(d['variants'])}")
     else:
         if gpu_count == 1:
-            vbudget = meta["single_llm_budget_gb"]
+            vbudget = bud["single_llm"]
         elif d["min_gpus"] == 2:
             vbudget = 10 ** 6  # 旗舰模型：直接取最大变体
         else:
@@ -175,7 +197,7 @@ def compute(args, man, gpu_count, gpu_mem):
     comfy_devices, llm_devices, tp = "0", "0", 1
     mem_util, tensor_split = None, None
     if gpu_count == 1:
-        if vram <= meta["single_llm_budget_gb"]:
+        if vram <= bud["single_llm"]:
             mode = "single"
             llm_devices = "0"
             mem_util = round((vram + meta["safety_gap_gb"]) / gmem, 2)
@@ -194,7 +216,7 @@ def compute(args, man, gpu_count, gpu_mem):
         mode = "dual"
         llm_devices = "1"
         mem_util = 0.92  # 独占一卡，尽量多留 KV 上下文
-        free_video = gmem - meta["video_reserve_gb"]
+        free_video = bud["video_card"]
     else:
         mode = "flagship"
         llm_devices = ",".join(str(i) for i in range(gpu_count))
@@ -209,9 +231,12 @@ def compute(args, man, gpu_count, gpu_mem):
             free_video = per_card_free  # 两卡对称，视频在哪张卡都一样
         else:  # llamacpp
             if d.get("coexist"):
-                reserve = meta["coexist_video_reserve_gb"]
+                # coexist_video_reserve_gb=46 也是参考机（96GB 卡）的数，量纲是"半张卡"。
+                # 卡 0 上留给视频的显存最多半卡，超过就说明这数是从大卡机继承来的：
+                # 照搬到 48GB 机会只剩 2GB 给 LLM，tensor_split 直接算成废值。
+                reserve = min(meta["coexist_video_reserve_gb"], gmem / 2)
                 g0 = gmem - reserve
-                g1 = gmem - meta["video_reserve_gb"]
+                g1 = bud["video_card"]
                 tensor_split = f"{g0 / gmem:.3f},{g1 / gmem:.3f}"
                 free_video = reserve
             else:
@@ -238,7 +263,7 @@ def compute(args, man, gpu_count, gpu_mem):
         tp = 1                          # 每副本一卡，KV 预算按单卡算
         if replicas < gpu_count:
             comfy_devices = str(gpu_count - 1)   # 剩下最高位那张卡留给视频
-            free_video = gmem - meta["video_reserve_gb"]
+            free_video = bud["video_card"]
         else:
             comfy_enabled = 0
             free_video = 0
@@ -258,8 +283,23 @@ def compute(args, man, gpu_count, gpu_mem):
     if engine == "vllm":
         total_budget = gmem * mem_util * (tp if tp > 1 else 1)
         kv_gb = max(0.0, total_budget - vram_eff - 4)  # 权重之外可用于 KV 的显存
-        est_tokens = int(kv_gb * 15300)  # 本机实测 ~15.2K tokens/GB（27B@96GB 混合架构）
+        # 密度两个来源：kv_tokens_per_gb 是 calib_vram.py text 从 vLLM 自己日志里量的
+        # （qwen3.8-27b@48GB：KV 11.99GiB / 190,622 tokens = 15898 tokens/GB）；
+        # 15300 是更早那台 96GB 机器上估出来的旧值，留着当"没量过"的兜底。
+        # 这数是 per-model 的属性、不是机器的：27B 是 Qwen3_5ForConditionalGeneration
+        # 混合 Mamba cache，KV 才这么密；换成纯 attention 模型会低一个量级。
+        density = int(d.get("kv_tokens_per_gb") or 15300)
+        est_tokens = int(kv_gb * density)
         max_len = max(32768, min(ctx_cap, est_tokens))
+        if d.get("kv_tokens_per_gb"):
+            # 有实测值就再拿它反查一遍并发度：max_len 超过 kv_gb×密度就意味着一个完整请求
+            # 都装不满（并发 <1.0），vLLM 起来也只是摆设。防的是陈旧实测值——
+            # 密度是上一个布局/上一次量化留下的，而这里的 kv_gb 已经按当前布局重算过了。
+            kv_cap = int(kv_gb * density)
+            if max_len > kv_cap:
+                print(f"  ⚠ 实测密度 {density} tokens/GB × KV {kv_gb:.1f}GB 只装得下 "
+                      f"{kv_cap} tokens（并发<1.0），max_len {int(max_len)} → {kv_cap}")
+                max_len = max(4096, kv_cap)  # 4096 兜底：再短就不是能用的上下文了
     else:
         # llamacpp：上下文即 --ctx-size，直接按 models.json 的 gw.max_len（已按 KV 余量配好）
         max_len = int(d.get("gw", {}).get("max_len") or d["ctx_default"])
@@ -357,14 +397,10 @@ def compute(args, man, gpu_count, gpu_mem):
                 gw_old.pop(k, None)
             else:
                 gw_old[k] = v
-        # 必须就地截断写，不能 tmp+rename：compose.yaml 是以"单文件"bind-mount
-        # ./models.json → /opt/models.json，rename 会换 inode，容器会一直挂在旧 inode 上，
-        # 宿主改完网关却永远读不到（实测宿主 186048 / 容器 900000）。
-        # 仓库存 models.json 的两处写者（check_llm_config.py:151、manage.sh add）都是
-        # open(out,"w") 就地截断，正是为了保住这个 inode；顺带也不补结尾换行，
-        # 免得 git 把整份文件记成改动。
-        json.dump(man_disk, open("models.json", "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=2)
+        # 就地截断写，不能 tmp+rename：compose.yaml 以"单文件"bind-mount ./models.json，
+        # rename 换 inode 会让运行中的容器一直挂在旧 inode 上（宿主 186048 / 容器 900000）。
+        # 规则与 check_llm_config.py:151、manage.sh add 同源，收在 hwprofile 里一份。
+        hwprofile.write_manifest_inplace("models.json", man_disk)
         print(f"==> 已按本机显存改写 models.json 的 gw[{llm_name!r}]（网关下个请求即生效）：")
         for k, (old, new) in changed.items():
             print(f"      {k}: {old} → {'（清除，回到默认口径）' if new is None else new}")
@@ -439,6 +475,56 @@ def write_compose(env, llm_def):
     with open("compose.selected.yaml", "w") as f:
         f.write("\n".join(lines) + "\n")
 
+def report_occupancy(entries, strict):
+    """摆放前把"本机上不归本系统管的显存持有者/容器"打出来。
+
+    为什么要专门打：下面所有预算都是"整张卡 - margin"算出来的，卡上却要有别的进程先咬走
+    一截，算出来的 max_len/util 就是空中楼阁——参考那次误判就是别人的进程占着显存，
+    菜单却判成"这个模型放不下"。默认只警告继续跑（显存空着也是空着，占的人多半是自己人）；
+    --strict 或 AI_STRICT=1 直接退出，供部署脚本卡住不放行。
+    """
+    bad = [e for e in entries if not e.get("owned", True)]
+    for e in entries:
+        if e.get("kind") == "notice":
+            print(f"（审计降级）{e['msg']}")
+    if not bad:
+        return
+    print("\n" + "!" * 62)
+    print("⚠ 显存被本系统之外的东西占着（ai-/bench- 容器之外）：")
+    for e in bad:
+        if e["kind"] == "gpu_process":
+            print(f"    PID {e['pid']:<8} 用户={e['user']:<10} 已跑={e['etime']:<12} "
+                  f"{e['mem_mib'] / 1024:.1f}GiB  {e['args'][:90]}")
+        else:
+            print(f"    容器 {e['container']:<28} 镜像={e['image']:<28} {e['status']}")
+    print("  后果：实际可用显存比下面算出来的小，模型可能加载失败或被误判成"
+          "「显存放不下」（这台机器上真发生过一次）。")
+    print("  处理：确认这些进程可以让位后停掉它们，或重跑 "
+          "`python3 scripts/menu.py --video none -y` 只起文本。")
+    print("!" * 62)
+    if strict:
+        sys.exit("错误：--strict/AI_STRICT=1 下不做带外显存的摆放。"
+                 "清掉上面列出的占用者后重跑，或去掉 --strict 接受告警继续。")
+
+
+def sync_meta(man, prof):
+    """把探测到的显存写回 models.json 的 meta：那上面的 "96" 是参考机的数，
+    在 48GB 机器上一眼看上去就是错的（gpu_mem_gb 全仓库没有消费者，纯粹给人看的，
+    所以才更要把本机真值写上去）。只在值真的变了时才动盘，幂等。"""
+    meta = man.setdefault("meta", {})
+    gib = int(round(prof["gmem_mib"] / 1024))
+    new = {"gpu_mem_gb": gib, "gpu_count": prof["gpu_count"]}
+    changed = {k: (meta.get(k), v) for k, v in new.items() if meta.get(k) != v}
+    if not changed:
+        return
+    meta.update({k: v for k, (_o, v) in changed.items()})
+    hwprofile.write_manifest_inplace("models.json", man)
+    print(f"==> models.json 的 meta 已按本机改写（原值是别台机器的显存）：")
+    for k, (old, val) in changed.items():
+        print(f"      meta.{k}: {old} → {val}")
+    if prof["mixed"]:
+        print(f"      注意：本机卡型号不一致 {prof['names']}，按最小的那张算")
+
 def main():
     ap = argparse.ArgumentParser(description="AI 服务启动配置")
     ap.add_argument("--llm", help="LLM 名称（非交互）")
@@ -447,11 +533,20 @@ def main():
     ap.add_argument("--replicas", type=int, default=1,
                     help="同一 LLM 起几个后端副本（每副本一卡，网关按在途请求数分流）。"
                          "如 2×48GB 双卡各跑一份 fp8 把吞吐翻倍")
+    ap.add_argument("--strict", action="store_true",
+                    help="发现本系统之外的显存占用者时直接退出（等价 AI_STRICT=1）")
     ap.add_argument("-y", "--yes", action="store_true", help="跳过确认")
     args = ap.parse_args()
     man = load_manifest()
-    gpu_count, gpu_mem = detect_gpus()
-    compute(args, man, gpu_count, gpu_mem)
+    try:
+        prof = hwprofile.detect()
+    except RuntimeError as e:
+        sys.exit(f"错误：{e}")
+    # 先审计再摆放：占用者在别人手里，算出来的预算全是乐观值
+    report_occupancy(hwprofile.foreign_occupancy(),
+                     args.strict or os.environ.get("AI_STRICT") == "1")
+    sync_meta(man, prof)
+    compute(args, man, prof["gpu_count"], [prof["gmem_mib"]])
 
 if __name__ == "__main__":
     main()
