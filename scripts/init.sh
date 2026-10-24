@@ -401,8 +401,17 @@ if [[ $NO_START -eq 1 ]]; then
   info "启动命令: ./scripts/start.sh"
 else
   # 非交互启动（使用默认配置）
-  info "开始启动服务…"
-  bash scripts/start.sh --llm "${download_llm[0]:-qwen3.8-27b}" --video "${download_video[0]:-minimax-h3}" -y
+  # --minimal/--full 写死的视频模型不一定放得得下本机单卡（minimax-h3 480p 要 55GB，
+  # 2×48GB 的机器每张卡只有 ~40GB 预算，menu.py 会直接拒绝）。这里退一步只起文本，
+  # 而不是让整个初始化在最后一公里报错退出——模型已经下好了，服务起不来更可惜。
+  llm_arg="${download_llm[0]:-qwen3.8-27b}"
+  video_arg="${download_video[0]:-minimax-h3}"
+  info "开始启动服务…（LLM=$llm_arg 视频=$video_arg）"
+  if ! bash scripts/start.sh --llm "$llm_arg" --video "$video_arg" -y; then
+    warn "按视频模型 $video_arg 启动失败（多半是本机单卡显存放不下它）。"
+    warn "退回只起文本模型；要跑视频请选放得下的：./scripts/start.sh --llm $llm_arg --video <wan2.2-s2v|infinitetalk|ltx-2|none> -y"
+    bash scripts/start.sh --llm "$llm_arg" --video none -y
+  fi
   echo ""
   ok "初始化完成！"
   echo ""

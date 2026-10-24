@@ -382,5 +382,5 @@ if [[ -n "$LAN_IP" ]]; then
   echo "  LLM API : http://${LAN_IP}:8000/v1/chat/completions"
   [[ $comfy_wanted == 1 && $comfy_ok == 0 ]] && echo "  ComfyUI : http://${LAN_IP}:8188"
   echo "  Open WebUI: http://${LAN_IP}:3000"
-  [[ -n "${LLM_API_KEY:-}" ]] && echo "  API Key : ${LLM_API_KEY}"
+  if [[ -n "${LLM_API_KEY:-}" ]]; then echo "  API Key : ${LLM_API_KEY}"; fi
 fi
