@@ -26,9 +26,12 @@
    503 等任务结束。卸载只释放模型权重，容器保留，下次视频任务自动重载。
 6. 上下文长度一律按模型原生上限（models.json 的 gw.max_len）配满，不降档
 7. 卸载只发生在"需要腾显存"时，不设空闲定时器
+8. 同一模型可在每张卡上各起一个副本（models.json 的 gw.replicas），请求按副本在途数
+   分流：单卡装得下的模型用多卡堆并发，而不是用 TP 把一层计算切薄
 
 运行环境：ai-gateway 容器，挂载 docker.sock 管理后端容器，--gpus all 提供 nvidia-smi。
-后端容器命名 ai-vllm-<model> / ai-llamacpp-<model>，仅加入 ai_default 内网，不暴露宿主机端口。
+后端容器命名 ai-vllm-<model> / ai-llamacpp-<model>（多副本时带 -r0/-r1… 后缀），
+仅加入 ai_default 内网，不暴露宿主机端口。
 所有 docker/nvidia-smi 同步调用均经 asyncio.to_thread 包裹，不阻塞事件循环。
 """
 import asyncio, fnmatch, json, os, re, subprocess, time, urllib.request
@@ -54,7 +57,8 @@ dcli = docker.DockerClient(base_url="unix:///var/run/docker.sock")
 http = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0))
 
 ops_lock = asyncio.Lock()      # 加载/卸载串行化
-backends = {}                  # name -> {container, gpus, util, in_flight, last_used, status}
+backends = {}                  # name -> {container, gpus, util, in_flight, last_used, status,
+                               #          replicas, peers:[{container, gpus, in_flight}]}
 token_metrics_cache = {}       # name -> {time, prompt_total, generation_total, rate, metrics_ok, live}
 _no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -126,9 +130,25 @@ def load_manifest():
         return json.load(f)["llm"]
 
 
-def model_dir(name):
-    """官方 FP8 目录优先，否则用主目录"""
-    for cand in (f"{name}-fp8", name):
+def model_dir(name, d=None):
+    """按模型条目的 gw.variant 选权重目录（目录名相对 $HOST_ROOT/models/llm）。
+
+    不配 variant 时保持历史行为：官方 FP8 目录优先，回落主目录。
+    variant 显式指定时严格取该精度——精度是配置意图，不能静默换成另一种，
+    目录缺失就报未下载，由宿主机 menu.py / manage.sh 去补。"""
+    variant = ((d or {}).get("gw") or {}).get("variant")
+    if d is None:
+        # 4 处校验型调用点（/v1/models、capabilities、load、proxy）没带条目：
+        # 自己按同一份清单取，避免它们用默认口径判"已下载"、而 ensure_loaded 按
+        # variant 口径判"未下载"，模型在列表里却调不通。
+        variant = (load_manifest().get(name) or {}).get("gw", {}).get("variant")
+    if variant == "bf16":
+        cands = (name,)
+    elif variant:
+        cands = (f"{name}-{variant}",)
+    else:
+        cands = (f"{name}-fp8", name)
+    for cand in cands:
         p = os.path.join(HOST_ROOT, "models/llm", cand)
         if os.path.isdir(p) and os.listdir(p):
             return cand
@@ -613,12 +633,40 @@ def plan_llamacpp(gpus, weights_gb, max_len, gw=None):
         "tight": kv_budget_gb < slot_kv_gb,
     }
 
+def _replica_groups(gpus, replicas):
+    """把选中的卡切成 replicas 组，每组一个后端容器（组内卡数即 tensor-parallel-size）。
+    replicas<=1 时整组交给一个容器（保持现有 TP 语义）；卡不够就自动降到每卡一组。"""
+    n = max(1, int(replicas or 1))
+    if n == 1 or len(gpus) <= 1:
+        return [list(gpus)]
+    n = min(n, len(gpus))          # 副本数不超过可用卡数
+    return [[g] for g in gpus[:n]]
+
+
+def _pick_peer(b):
+    """多副本路由：取在途请求最少的副本。没有 peers（单副本/老数据）时退回自身。"""
+    peers = b.get("peers") or []
+    if not peers:
+        return b
+    return min(peers, key=lambda p: p.get("in_flight", 0))
+
+
+def _remove_backend_containers(b):
+    """删除该后端的全部副本容器；单副本时等价于 _remove_container(b["container"])"""
+    peers = b.get("peers") or [b]
+    for p in peers:
+        c = p.get("container")
+        if c:
+            _remove_container(c)
+
+
 def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env=None,
-                 engine="vllm", gguf_include=None, plan=None):
+                 engine="vllm", gguf_include=None, plan=None, cname=None):
     kwargs = {}
     if len(gpus) > 1:
         kwargs["ipc_mode"] = "host"
     if engine == "llamacpp":
+        # llama.cpp 不做多副本：单容器吃整组卡，cname 忽略
         _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args, kwargs,
                       plan=plan)
         return
@@ -637,7 +685,7 @@ def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env
         cmd += extra_args
     log(f"加载 {name}: dir={dirname} gpus={gpus} tp={tp} util={util} max_len={max_len} think={think}"
         + (f" extra_args={extra_args}" if extra_args else ""))
-    _remove_container(f"ai-vllm-{name}")
+    _remove_container(cname or f"ai-vllm-{name}")
     # 编译/JIT 缓存持久化到宿主机：容器每次重建，不挂载则 torch.compile 每次重跑（~30s）
     cache_host = f"{HOST_ROOT}/data/vllm-cache"
     os.makedirs(cache_host, exist_ok=True)
@@ -646,7 +694,7 @@ def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env
         # 如 YaRN 超长所需的 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1（models.json 里按模型配置）
         environment.update(env)
     dcli.containers.run(
-        VLLM_IMAGE, command=cmd, name=f"ai-vllm-{name}", detach=True,
+        VLLM_IMAGE, command=cmd, name=cname or f"ai-vllm-{name}", detach=True,
         device_requests=[docker.types.DeviceRequest(
             device_ids=[str(g) for g in gpus], capabilities=[["gpu"]])],
         network=NETWORK, shm_size="16g",
@@ -746,7 +794,7 @@ def evict_idle(need):
         if cands:
             vname, victim = cands[0]
             log(f"卸载空闲模型 {victim['container']}（释放 GPU {victim['gpus']}）")
-            _remove_container(victim["container"])
+            _remove_backend_containers(victim)
             backends.pop(vname, None)
             evicted = True
             continue
@@ -859,7 +907,7 @@ async def ensure_loaded(name, man, want_gpus=None, op=None):
                 log(f"{name} 健康确认通过")
                 return b
             except Exception:
-                await asyncio.to_thread(_remove_container, b["container"])
+                await asyncio.to_thread(_remove_backend_containers, b)
                 backends.pop(name, None)
         d = man[name]
         engine = d.get("engine", "vllm")
@@ -869,7 +917,7 @@ async def ensure_loaded(name, man, want_gpus=None, op=None):
         max_len = int(gw.get("max_len", d.get("max_ctx", d.get("ctx_default", 32768))))
         think = bool(d.get("think"))
         cname = f"ai-{engine}-{name}"
-        dirname = model_dir(name)
+        dirname = model_dir(name, d)
         if not dirname:
             raise RuntimeError(f"模型 {name} 未下载")
 
@@ -982,9 +1030,19 @@ async def ensure_loaded(name, man, want_gpus=None, op=None):
         if chosen[0] != gpus:
             log(f"{name}: 配置的 GPU{gpus} 放不下，改放 GPU{chosen[0]}（与已加载模型并存）")
         gpus = chosen[0]
+
+        # 多副本：放置定了才切副本组——每组一个容器，请求按在途数分流。
+        # replicas 缺省/为 1 时 groups 就是 [gpus]，容器名无后缀，与旧行为完全一致。
+        # llama.cpp 不支持多副本（单容器吃整组卡，起两个会同名互删），整组交给一个容器。
+        replicas = int(gw.get("replicas", 1))
+        groups = _replica_groups(gpus, replicas) if engine != "llamacpp" else [list(gpus)]
+        cnodes = ([cname] if len(groups) == 1
+                  else [f"{cname}-r{i}" for i in range(len(groups))])
         if op:
             _op_update(op, status="running", stage="loading",
-                       detail=f"放置 GPU {sorted(gpus)}，启动后端容器…",
+                       detail=f"放置 GPU {sorted(gpus)}，启动后端容器"
+                              + (f" ×{len(groups)}（每副本 GPU {groups}）" if len(groups) > 1 else "")
+                              + "…",
                        target_gpus=gpus)
 
         # llama.cpp：按当前硬件（GPU 数/显存、权重体积）自动规划 --parallel 等
@@ -994,24 +1052,59 @@ async def ensure_loaded(name, man, want_gpus=None, op=None):
                                                  d.get("gguf_include"))
             plan = await asyncio.to_thread(plan_llamacpp, gpus, weights_gb, max_len, gw)
 
-        await asyncio.to_thread(_run_backend, name, dirname, gpus, util, max_len,
-                                think, gw.get("extra_args"), gw.get("env"),
-                                engine, d.get("gguf_include"), plan)
-        backends[name] = {"container": cname, "gpus": gpus, "util": util,
+        launched = []
+        try:
+            for grp, node in zip(groups, cnodes):
+                await asyncio.to_thread(_run_backend, name, dirname, grp, util, max_len,
+                                        think, gw.get("extra_args"), gw.get("env"),
+                                        engine, d.get("gguf_include"), plan, node)
+                launched.append(node)
+        except Exception:
+            # 某副本连容器都没拉起来：删掉已拉起的副本，别留登记之外占着显存的孤儿容器
+            for node in launched:
+                await asyncio.to_thread(_remove_container, node)
+            raise
+        backends[name] = {"container": cnodes[0], "gpus": gpus, "util": util,
                           "in_flight": 0, "last_used": time.time(), "status": "loading",
                           "engine": engine,
-                          "slots": plan["parallel"] if plan else None}
-        try:
-            await wait_ready(name, cname)
-        except Exception:
+                          "slots": plan["parallel"] if plan else None,
+                          "replicas": len(groups),
+                          "peers": [{"container": c, "gpus": g, "in_flight": 0}
+                                    for c, g in zip(cnodes, groups)]}
+        # 所有副本都拉起后再并发等就绪：ops_lock 全程持有，串行等会把冷启动墙钟翻倍
+        res = await asyncio.gather(*(wait_ready(name, node, timeout=900) for node in cnodes),
+                                   return_exceptions=True)
+        ready, ready_groups, dead = [], [], []
+        for node, grp, r in zip(cnodes, groups, res):
+            if isinstance(r, BaseException):
+                dead.append((node, r))
+            else:
+                ready.append(node)
+                ready_groups.append(grp)
+        if not ready:
+            # 全起不来：与单副本旧行为一致——摘掉登记并抛出，容器留着让人 docker logs 排查
             backends.pop(name, None)
-            raise
+            raise dead[0][1]
+        for node, r in dead:
+            # 部分副本失败不拖垮其它副本：删掉它释放显存，剩下的照常服务
+            await asyncio.to_thread(_remove_container, node)
+            log(f"{name} 副本 {node} 就绪失败，已删除（不影响其它 {len(ready)} 个副本）: {r}")
+        backends[name] = {"container": ready[0], "gpus": gpus, "util": util,
+                          "in_flight": 0, "last_used": time.time(), "status": "loading",
+                          "engine": engine, "slots": plan["parallel"] if plan else None,
+                          "replicas": len(ready),
+                          "peers": [{"container": c, "gpus": g, "in_flight": 0}
+                                    for c, g in zip(ready, ready_groups)]}
         backends[name]["status"] = "ready"
         backends[name]["last_used"] = time.time()
-        log(f"{name} 就绪")
+        log(f"{name} 就绪"
+            + (f"：{len(ready)} 副本 {list(zip(ready, ready_groups))}"
+               if len(groups) > 1 else ""))
         if op:
             _op_update(op, status="running", stage="ready",
-                       detail=f"{name} 后端就绪（GPU {sorted(gpus)}）",
+                       detail=f"{name} 后端就绪（GPU {sorted(gpus)}）"
+                              + (f"，{len(ready)} 副本每副本 GPU {ready_groups}"
+                                 if len(groups) > 1 else ""),
                        target_gpus=gpus)
         return backends[name]
 
@@ -1029,16 +1122,30 @@ app = FastAPI(lifespan=lifespan)
 
 
 def adopt_existing():
-    """网关重启后认领还活着的后端容器（标 adopted，可被卸载；首次请求时先等健康检查）"""
+    """网关重启后认领还活着的后端容器（标 adopted，可被卸载；首次请求时先等健康检查）。
+    同一模型的多个副本（<model>-r0/-r1…）合并成一个后端条目 + peers：
+    按原名认领会把 "xxx-r0" 当成一个模型注册出来，且后面的副本会覆盖前面的。"""
+    try:
+        man = load_manifest()
+    except Exception as e:
+        log(f"认领后端：读模型清单失败（忽略，按容器原名认领）: {e}")
+        man = {}
+    found = {}   # name -> [(副本序号, engine, gpus, container, slots)]；无后缀记 -1 排最前
     for c in dcli.containers.list(all=True, filters={"status": ["running"]}):
         engine = None
         if c.name.startswith("ai-vllm-"):
-            engine, name = "vllm", c.name[len("ai-vllm-"):]
+            engine, raw = "vllm", c.name[len("ai-vllm-"):]
         elif c.name.startswith("ai-llamacpp-"):
-            engine, name = "llamacpp", c.name[len("ai-llamacpp-"):]
+            engine, raw = "llamacpp", c.name[len("ai-llamacpp-"):]
         else:
             continue
         try:
+            # 副本后缀只对"原名不在清单里"的容器生效——模型名本身带 -rN 时以清单为准
+            name, seq = raw, -1
+            if raw not in man:
+                m = re.match(r"^(.+)-r(\d+)$", raw)
+                if m and m.group(1) in man:
+                    name, seq = m.group(1), int(m.group(2))
             req = c.attrs["HostConfig"].get("DeviceRequests") or []
             gpus = [int(x) for r in req for x in (r.get("DeviceIDs") or [])]
             slots = None
@@ -1052,12 +1159,24 @@ def adopt_existing():
                         except ValueError:
                             pass
                         break
-            backends[name] = {"container": c.name, "gpus": gpus, "util": 0.92,
-                              "in_flight": 0, "last_used": time.time(),
-                              "status": "adopted", "engine": engine, "slots": slots}
-            log(f"认领现有后端 {name} gpus={gpus} engine={engine} slots={slots}（待健康确认）")
+            found.setdefault(name, []).append((seq, engine, gpus, c.name, slots))
         except Exception as e:
             log(f"认领 {c.name} 失败（忽略，不影响网关启动）: {e}")
+    for name, items in found.items():
+        try:
+            items.sort(key=lambda t: t[0])
+            gpus = sorted({g for _, _, gs, _, _ in items for g in gs})
+            slots = next((s for _, _, _, _, s in items if s is not None), None)
+            backends[name] = {"container": items[0][3], "gpus": gpus, "util": 0.92,
+                              "in_flight": 0, "last_used": time.time(),
+                              "status": "adopted", "engine": items[0][1], "slots": slots,
+                              "replicas": len(items),
+                              "peers": [{"container": cn, "gpus": gs, "in_flight": 0}
+                                        for _, _, gs, cn, _ in items]}
+            log(f"认领现有后端 {name} gpus={gpus} engine={items[0][1]} slots={slots}"
+                + (f" 副本×{len(items)}" if len(items) > 1 else "") + "（待健康确认）")
+        except Exception as e:
+            log(f"认领 {name} 失败（忽略，不影响网关启动）: {e}")
 
 
 @app.get("/v1/models")
@@ -1119,8 +1238,10 @@ async def _unload_idle_backends():
                 busy.append({"model": name, "in_flight": b["in_flight"],
                              "status": b["status"]})
                 continue
-            log(f"手动卸载 {b['container']}（释放 GPU {b['gpus']}）")
-            await asyncio.to_thread(_remove_container, b["container"])
+            log(f"手动卸载 {b['container']}"
+                + (f" 等 {b.get('replicas') or 1} 个副本" if (b.get("replicas") or 1) > 1 else "")
+                + f"（释放 GPU {b['gpus']}）")
+            await asyncio.to_thread(_remove_backend_containers, b)
             backends.pop(name, None)
             unloaded.append(name)
     return unloaded, busy
@@ -1487,11 +1608,14 @@ async def gateway_unload(request: Request):
 
     op = _new_op("unload", model)
     _op_update(op, status="running", stage="unloading",
-               detail=f"卸载 {b['container']}（释放 GPU {sorted(b['gpus'])}）")
+               detail=f"卸载 {b['container']}"
+                      + (f" 等 {b.get('replicas') or 1} 个副本"
+                         if (b.get("replicas") or 1) > 1 else "")
+                      + f"（释放 GPU {sorted(b['gpus'])}）")
     async with ops_lock:
         b = backends.get(model)
         if b and b["in_flight"] == 0 and b["status"] != "loading":
-            await asyncio.to_thread(_remove_container, b["container"])
+            await asyncio.to_thread(_remove_backend_containers, b)
             backends.pop(model, None)
             _op_update(op, status="success", stage="unloaded", detail=f"{model} 已卸载")
         else:
@@ -1560,11 +1684,13 @@ async def proxy(name, request: Request):
                                        "type": "backend_error"}}, status_code=502)
 
     b["in_flight"] += 1
+    p = _pick_peer(b)          # 多副本：挑在途最少的副本；单副本时 peers 只 1 个元素，分流退化为自己
+    p["in_flight"] = p.get("in_flight", 0) + 1   # 与 b 的自增同一原子段，中间不 await
     b["last_used"] = time.time()
     body = await request.body()
     body = clamp_max_tokens(name, man, body)
     qs = request.url.query
-    url = f"http://{b['container']}:8000{request.url.path}" + (f"?{qs}" if qs else "")
+    url = f"http://{p['container']}:8000{request.url.path}" + (f"?{qs}" if qs else "")
     headers = {"content-type": request.headers.get("content-type", "application/json")}
     client_stream = False
     live_tokens = False
@@ -1589,10 +1715,12 @@ async def proxy(name, request: Request):
     except httpx.ConnectError:
         # 后端半死（如网关重启后认领的容器里 vLLM 已挂）：剔除后走重新加载流程重试一次
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         log(f"后端 {name} 连接失败，剔除并重新加载")
         async with ops_lock:
             if backends.get(name) is b:
-                await asyncio.to_thread(_remove_container, b["container"])
+                # 整组副本一起删：只删一个会让其它副本占着显存变成孤儿
+                await asyncio.to_thread(_remove_backend_containers, b)
                 backends.pop(name, None)
         try:
             b = await ensure_loaded(name, man)
@@ -1600,15 +1728,20 @@ async def proxy(name, request: Request):
             return JSONResponse({"error": {"message": f"后端重建失败: {e}",
                                            "type": "backend_error"}}, status_code=502)
         b["in_flight"] += 1
+        p = _pick_peer(b)
+        p["in_flight"] = p.get("in_flight", 0) + 1
+        url = f"http://{p['container']}:8000{request.url.path}" + (f"?{qs}" if qs else "")
         try:
             req = http.build_request(request.method, url, content=body, headers=headers)
             r = await http.send(req, stream=True)
         except Exception as e:
             b["in_flight"] -= 1
+            p["in_flight"] -= 1
             return JSONResponse({"error": {"message": f"转发失败: {e}", "type": "proxy_error"}},
                                 status_code=502)
     except Exception as e:
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         return JSONResponse({"error": {"message": f"转发失败: {e}", "type": "proxy_error"}},
                             status_code=502)
 
@@ -1617,6 +1750,7 @@ async def proxy(name, request: Request):
         err = await r.aread()
         await r.aclose()
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         log(f"{name} 上游 {r.status_code}: {err.decode(errors='replace')[:500]}")
         return StreamingResponse(iter([err]), status_code=r.status_code,
                                  headers={"content-type": r.headers.get(
@@ -1627,6 +1761,7 @@ async def proxy(name, request: Request):
             return await _buffered_openai_response(name, r)
         finally:
             b["in_flight"] -= 1
+            p["in_flight"] -= 1
             b["last_used"] = time.time()
 
     async def gen():
@@ -1640,6 +1775,7 @@ async def proxy(name, request: Request):
             if live_tokens and _token_state(name).get("live_start"):
                 finish_live_tokens(name)
             b["in_flight"] -= 1
+            p["in_flight"] -= 1
             b["last_used"] = time.time()
     return StreamingResponse(gen(), status_code=r.status_code,
                              headers={"content-type": r.headers.get("content-type", "application/json")})
@@ -2243,16 +2379,19 @@ async def anthropic_messages(request: Request):
             status_code=502)
 
     b["in_flight"] += 1
+    p = _pick_peer(b)          # 多副本：挑在途最少的副本；单副本时 peers 只 1 个元素，分流退化为自己
+    p["in_flight"] = p.get("in_flight", 0) + 1
     b["last_used"] = time.time()
 
     qs = request.url.query
-    url = f"http://{b['container']}:8000/v1/chat/completions" + (f"?{qs}" if qs else "")
+    url = f"http://{p['container']}:8000/v1/chat/completions" + (f"?{qs}" if qs else "")
     headers = {"content-type": "application/json"}
     try:
         req = http.build_request("POST", url, content=json.dumps(oa_body).encode(), headers=headers)
         r = await http.send(req, stream=True)
     except Exception as e:
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         return JSONResponse(
             {"type": "error", "error": {"type": "api_error", "message": f"转发失败: {e}"}},
             status_code=502)
@@ -2263,10 +2402,12 @@ async def anthropic_messages(request: Request):
             oa_resp = json.loads(await r.aread())
         except Exception:
             b["in_flight"] -= 1
+            p["in_flight"] -= 1
             return JSONResponse(
                 {"type": "error", "error": {"type": "api_error", "message": "读取响应失败"}},
                 status_code=502)
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         anth_resp = _build_anthropic_response(oa_resp)
         return JSONResponse(anth_resp)
 
@@ -3074,9 +3215,11 @@ async def _handle_anthropic_responses(request: Request, body: dict):
             status_code=502)
 
     b["in_flight"] += 1
+    p = _pick_peer(b)          # 多副本：挑在途最少的副本；单副本时 peers 只 1 个元素，分流退化为自己
+    p["in_flight"] = p.get("in_flight", 0) + 1
     b["last_used"] = time.time()
 
-    url = f"http://{b['container']}:8000/v1/chat/completions"
+    url = f"http://{p['container']}:8000/v1/chat/completions"
     qs = request.url.query
     if qs:
         url += f"?{qs}"
@@ -3086,6 +3229,7 @@ async def _handle_anthropic_responses(request: Request, body: dict):
         r = await http.send(req, stream=True)
     except Exception as e:
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         return JSONResponse(
             {"type": "error", "error": {"type": "api_error", "message": f"转发失败: {e}"}},
             status_code=502)
@@ -3095,10 +3239,12 @@ async def _handle_anthropic_responses(request: Request, body: dict):
             oa_resp = json.loads(await r.aread())
         except Exception:
             b["in_flight"] -= 1
+            p["in_flight"] -= 1
             return JSONResponse(
                 {"type": "error", "error": {"type": "api_error", "message": "读取响应失败"}},
                 status_code=502)
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         resp = _build_responses_output(oa_resp)
         return JSONResponse(resp)
 
@@ -3208,9 +3354,11 @@ async def _handle_openai_responses(request: Request, body: dict):
             status_code=502)
 
     b["in_flight"] += 1
+    p = _pick_peer(b)          # 多副本：挑在途最少的副本；单副本时 peers 只 1 个元素，分流退化为自己
+    p["in_flight"] = p.get("in_flight", 0) + 1
     b["last_used"] = time.time()
 
-    url = f"http://{b['container']}:8000/v1/chat/completions"
+    url = f"http://{p['container']}:8000/v1/chat/completions"
     qs = request.url.query
     if qs:
         url += f"?{qs}"
@@ -3220,6 +3368,7 @@ async def _handle_openai_responses(request: Request, body: dict):
         r = await http.send(req, stream=True)
     except Exception as e:
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         return JSONResponse(
             {"error": {"message": f"转发失败: {e}", "type": "api_error"}},
             status_code=502)
@@ -3230,10 +3379,12 @@ async def _handle_openai_responses(request: Request, body: dict):
             oa_resp = json.loads(await r.aread())
         except Exception:
             b["in_flight"] -= 1
+            p["in_flight"] -= 1
             return JSONResponse(
                 {"error": {"message": "读取响应失败", "type": "api_error"}},
                 status_code=502)
         b["in_flight"] -= 1
+        p["in_flight"] -= 1
         resp = _openai_chat_to_responses_output(oa_resp)
         return JSONResponse(resp)
 
