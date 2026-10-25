@@ -27,6 +27,57 @@ services:
           devices:
             - driver: nvidia
               capabilities: [gpu]
+  # 管理后台（GUI console）：http://<宿主IP>:9001 —— 每台同构节点跑一个，浏览器直连各节点聚合。
+  # 必须宿主网络：要本机回环访问 gateway(8000)/sysmon(8088)；挂 docker.sock+HOST_ROOT 是为了
+  # 把"宿主上的 manage.sh/menu.py/init.sh"原样驱动起来——agent 不复制任何摆放/下载逻辑，
+  # 配置的唯一写者仍是 menu.py（网关对 models.json 只读的边界在 GUI 层同样成立）。
+  console:
+    image: ai-console:local
+    build:
+      context: .
+      dockerfile: docker/console/Dockerfile
+    container_name: ai-console
+    restart: unless-stopped
+    network_mode: host          # 9001 直通 + 127.0.0.1:8000/8088 本机服务
+    environment:
+      - HOST_ROOT=${HOST_ROOT:-/home/pc/AI}
+      # - CONSOLE_TOKEN=xxx    # 打开后 /api/* 需带 Bearer（默认空=内网信任级，同 8088/8188）
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./console:/opt/console:ro
+      - ${HOST_ROOT:-/home/pc/AI}:${HOST_ROOT:-/home/pc/AI}
+      # 宿主静态 compose 插件（init.sh 需要 docker compose；agent 镜像只装了 docker CLI）
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]   # menu.py/hwprofile 要 nvidia-smi；本容器只读探测不算力
+  # 监控 Web 看板：常驻 http://<宿主IP>:8088（sysmonitor/ 代码 bind-mount，改代码 restart 即生效）
+  # 与手工启动的 CLI（python3 sysmonitor/sysmon.py）互不影响，可同时运行
+  sysmon-web:
+    image: ai-sysmon-web:local
+    build:
+      context: .
+      dockerfile: docker/sysmonitor/Dockerfile
+    container_name: ai-sysmon-web
+    restart: unless-stopped
+    network_mode: host          # 直接占用宿主 8088 + 读宿主网卡计数（↓入/↑出）
+    pid: host                   # 进程表/CPU 每核 = 宿主真实视图
+    environment:
+      - SYSMON_GATEWAY=http://127.0.0.1:8000
+      - SYSMON_DISK_PATH=/host-root        # 磁盘用量看宿主根分区
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./sysmonitor:/opt/sysmonitor:ro
+      - /:/host-root:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]          # 容器内 nvidia-smi（GPU 面板数据源）
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: ai-open-webui
@@ -37,6 +88,8 @@ services:
       - OPENAI_API_KEY=${LLM_API_KEY:-sk-local}
       - WEBUI_AUTH=false
       - HOST=0.0.0.0
+      # 默认 embedding 模型(all-MiniLM-L6-v2)首次启动需从 HF 下载，国内直连 huggingface.co 不可达会卡死启动
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

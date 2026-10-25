@@ -1,0 +1,9 @@
+{
+  "relay": {
+    "dgx-spark-pair": {
+      "gateway": "http://100.106.146.21:8000",
+      "sysmon": "http://100.106.146.21:8088",
+      "allow_paths": ["/v1/models", "/api/snapshot"]
+    }
+  }
+}

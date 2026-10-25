@@ -120,8 +120,8 @@
       "ctx_default": 262144,
       "max_ctx": 262144,
       "think": true,
-      "desc": "旗舰单卡版：GSQ-RCO IQ3_S 83.6G + mmproj，llama.cpp 加载，独占单卡（~200B MoE，支持图/视频，视频不可共存）",
-      "menu_brief": "[视觉·图+视频] 【旗舰单卡】200B级 IQ3_S 84G，单卡 96GB 独占，无视频共存",
+      "desc": "旗舰量化版：GSQ-RCO IQ3_S 83.6G + mmproj，llama.cpp 加载；96GB 卡机独占单卡，更小的卡自动跨卡分层（--split-mode layer），~200B MoE，支持图/视频，视频不可共存",
+      "menu_brief": "[视觉·图+视频] 【旗舰量化】200B级 IQ3_S 84G，96GB 单卡独占或 2×48GB 双卡分层，无视频共存",
       "gw": {
         "gpus": "1",
         "util": 0.92,

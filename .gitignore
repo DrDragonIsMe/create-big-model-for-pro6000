@@ -22,3 +22,6 @@ __pycache__/
 
 # 本机部署报告（含局域网地址等机器特定信息，如需公开可手动加入）
 部署报告.md
+
+# console agent 的任务运行日志（运行时数据）
+data/console-jobs/

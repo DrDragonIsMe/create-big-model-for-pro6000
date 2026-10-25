@@ -202,9 +202,15 @@ def get_llm_models(timeout=0.8):
         if (rate is None or rate <= 0) and isinstance(gw_rate, (int, float)):
             rate = gw_rate
         rate = float(rate or 0.0)
-        p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
-
         active = b.get("in_flight", 0) or 0
+        prefill = bool(tokens.get("prefill_active"))
+        p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
+        # 防御：旧版网关会把已完成请求的 prefill_rate 永久锁存。in_flight=0 且
+        # prefill_active=false 时，非零 p/s 只可能是残留读数，忽略它——否则空闲时长
+        # 被顶在 0，面板一直画 Prompt。prefill_active=true 是网关侧的合法短期保持
+        # （PREFILL_HOLD_SEC，突发 prefill 只存在一次采样），原样透传。
+        if p_rate > 0 and not prefill and active <= 0:
+            p_rate = 0.0
         if active > 0 or rate > 0 or p_rate > 0:
             _last_active[name] = now
         idle = now - _last_active[name] if name in _last_active else None
@@ -221,7 +227,7 @@ def get_llm_models(timeout=0.8):
             "generation_total": total,
             "rate": rate,
             "prompt_rate": p_rate,
-            "prefill_active": bool(tokens.get("prefill_active")),
+            "prefill_active": prefill,
             "prefill_tokens": tokens.get("prefill_tokens"),
             "prefill_progress": tokens.get("prefill_progress"),
             "idle": idle,
@@ -564,7 +570,7 @@ def render_memory():
 
 def render_disk():
     lines = [section("磁盘")]
-    for path in ("/",):
+    for path in (os.environ.get("SYSMON_DISK_PATH", "/"),):
         du = psutil.disk_usage(path)
         lines.append(row(
             path, du.percent,
@@ -697,11 +703,14 @@ def render_llm(snap):
         cum = dim(f"Σprompt {fmt_tokens(m.get('prompt_total'))} · "
                   f"Σgen {fmt_tokens(m.get('generation_total'))}")
         if prefill:
-            progress = (m.get("prefill_progress") or 0) * 100
+            prog = m.get("prefill_progress")
+            ptoks = m.get("prefill_tokens")
             phase = c(COL_WARN, anim_char(SPINNER, _frame) + " Prompt")
-            detail = (c(COL_WARN, progress_bar(progress / 100, 10))
-                      + c(COL_WARN, f" {progress:3.0f}% ")
-                      + dim(fmt_tokens(m.get("prefill_tokens")) + "tok"))
+            tail = dim(fmt_tokens(ptoks) + "tok") if ptoks is not None else ""
+            # vLLM 只报速率、没有单请求进度：不画进度条，免得恒显 0%
+            detail = ((c(COL_WARN, progress_bar(prog, 10))
+                       + c(COL_WARN, f" {prog * 100:3.0f}% ") + tail)
+                      if prog is not None else tail)
         elif loading:
             phase = c(COL_ACCENT, anim_char(LOAD_SPIN, _frame) + " 加载")
             detail = ""

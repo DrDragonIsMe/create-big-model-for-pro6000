@@ -173,9 +173,15 @@ def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list
         if (rate is None or rate <= 0) and isinstance(gw_rate, (int, float)):
             rate = gw_rate
         rate = float(rate or 0.0)
-        p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
-
         active = b.get("in_flight", 0) or 0
+        prefill = bool(tokens.get("prefill_active"))
+        p_rate = float(tokens.get("prompt_rate") or tokens.get("prefill_rate") or 0.0)
+        # 防御：旧版网关会把已完成请求的 prefill_rate 永久锁存。in_flight=0 且
+        # prefill_active=false 时，非零 p/s 只可能是残留读数，忽略它——否则空闲时长
+        # 被顶在 0，面板一直画 Prompt。prefill_active=true 是网关侧的合法短期保持
+        # （PREFILL_HOLD_SEC，突发 prefill 只存在一次采样），原样透传。
+        if p_rate > 0 and not prefill and active <= 0:
+            p_rate = 0.0
         if active > 0 or rate > 0 or p_rate > 0:
             _last_active[name] = now
         idle = now - _last_active[name] if name in _last_active else None
@@ -192,7 +198,7 @@ def get_llm_models(gateway: str = DEFAULT_GATEWAY, timeout: float = 0.6) -> list
             "generation_total": total,
             "rate": rate,
             "prompt_rate": p_rate,
-            "prefill_active": bool(tokens.get("prefill_active")),
+            "prefill_active": prefill,
             "prefill_tokens": tokens.get("prefill_tokens"),
             "prefill_progress": tokens.get("prefill_progress"),
             "prefill_elapsed": tokens.get("prefill_elapsed"),
@@ -427,7 +433,7 @@ def get_mem_info() -> dict:
 
 def get_disk_info() -> dict:
     try:
-        du = psutil.disk_usage("/")
+        du = psutil.disk_usage(os.environ.get("SYSMON_DISK_PATH", "/"))
     except OSError:
         du = None
     read_bps = write_bps = 0.0
@@ -774,7 +780,8 @@ def panel_llm(stdscr, y, x, w, models, max_rows, frame):
         loading = m["status"] == "loading"
         slots = m.get("slots")
         queueing = bool(slots and m["active"] > slots)
-        prog = (m.get("prefill_progress") or 0) * 100
+        prog_raw = m.get("prefill_progress")   # None=引擎不报单请求进度（vLLM），只显速率不画条
+        prog = (prog_raw or 0) * 100
 
         # ── 第一行：模型名 + 引擎/GPU + 阶段动画 + Prompt 进度 ──
         name = clip(m["name"], 30)
@@ -790,15 +797,19 @@ def panel_llm(stdscr, y, x, w, models, max_rows, frame):
             seg = f"{sp} Prompt "
             put(stdscr, y, cx, seg, cpair(PAIR_WARN, True), disp_width(seg))
             cx += disp_width(seg)
-            barw = max(6, min(14, x + w - cx - 18))
-            fn = int(round(max(0.0, min(1.0, m.get("prefill_progress") or 0)) * barw))
-            put(stdscr, y, cx, METER_ON * fn, cpair(PAIR_WARN, True), barw)
-            put(stdscr, y, cx + fn, METER_OFF * (barw - fn), cpair(PAIR_BORDER),
-                barw - fn)
-            cx += barw + 1
-            tail = f"{prog:3.0f}% " + (f"{fmt_tokens(m.get('prefill_tokens'))}tok "
-                                       f"{float(elapsed):.0f}s" if elapsed else
-                                       fmt_tokens(m.get("prefill_tokens")))
+            head = ""
+            if prog_raw is not None:
+                barw = max(6, min(14, x + w - cx - 18))
+                fn = int(round(max(0.0, min(1.0, prog_raw)) * barw))
+                put(stdscr, y, cx, METER_ON * fn, cpair(PAIR_WARN, True), barw)
+                put(stdscr, y, cx + fn, METER_OFF * (barw - fn), cpair(PAIR_BORDER),
+                    barw - fn)
+                cx += barw + 1
+                head = f"{prog:3.0f}% "
+            ptoks = m.get("prefill_tokens")
+            tail = head + (f"{fmt_tokens(ptoks)}tok {float(elapsed):.0f}s"
+                           if elapsed and ptoks is not None
+                           else fmt_tokens(ptoks) if ptoks is not None else "")
             tw = disp_width(tail)
             put(stdscr, y, min(cx, x + w - tw - 1), tail, cpair(PAIR_WARN, True), tw)
         elif loading:

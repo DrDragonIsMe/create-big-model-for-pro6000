@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 算力集群控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">⬢ AI 集群控制台 <span class="sub">gateway-layout-v1 · sysmonitor 集成</span></div>
+  <div class="hright">
+    <span id="clock"></span>
+    <button id="btnNodes" class="ghost" title="编辑节点地址">节点</button>
+    <button id="btnToken" class="ghost" title="设置 CONSOLE_TOKEN 对应的 Bearer">令牌</button>
+  </div>
+</header>
+
+<main>
+  <section id="grid" class="grid"></section>
+
+  <section id="detail" class="detail hidden">
+    <div class="dhead">
+      <button id="btnBack" class="ghost">← 总览</button>
+      <h2 id="dTitle">—</h2>
+      <div class="dtabs">
+        <button data-tab="ov" class="tab on">概览</button>
+        <button data-tab="cat" class="tab">模型库</button>
+        <button data-tab="lay" class="tab">布局切换</button>
+        <button data-tab="jobs" class="tab">任务</button>
+      </div>
+      <button id="btnDanger" class="danger ghost">初始化…</button>
+    </div>
+    <div id="tab-ov" class="tabpane"></div>
+    <div id="tab-cat" class="tabpane hidden"></div>
+    <div id="tab-lay" class="tabpane hidden"></div>
+    <div id="tab-jobs" class="tabpane hidden"></div>
+  </section>
+</main>
+
+<div id="modal" class="modal hidden"><div class="mbox">
+  <div class="mhead"><span id="mTitle"></span><button id="mClose" class="ghost">✕</button></div>
+  <pre id="mBody" class="mono"></pre>
+  <div class="mfoot"><span id="mNote"></span><button id="mOk" class="primary">执行</button></div>
+</div></div>
+
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

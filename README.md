@@ -1,6 +1,7 @@
 # 本地 AI 服务（LLM + 视频生成 + 对口型数字人）
 
-双 RTX PRO 6000 96GB，Docker 部署，GPU 数量 1~2 张自适应。
+Docker 部署，GPU 数量 1~2 张、单卡 48~96GB 自适应（摆放按本机 nvidia-smi 实算）。
+本目录是全网同构服务器的源参考蓝本（家庭 `home-pro6000-dual`）；`tju-pro6000-single`（1×96GB）与 `workstation-4090-dual`（2×48GB）跑同一套代码。
 
 ## 日常使用
 
@@ -17,6 +18,9 @@ curl http://<服务器IP>:8000/v1/gateway/capabilities    # 说明接口：能�
 curl http://<服务器IP>:8000/v1/gateway/gpus            # GPU 发现：数量、每卡占用、谁占了卡
 # 把模型加载到指定 GPU（wait=false 异步返回 request_id，轮询 ops/{id} 拿加载状态）：
 curl -X POST http://<服务器IP>:8000/v1/gateway/load -H 'Content-Type: application/json' -d '{"model":"qwen3.8-27b","gpus":[0],"wait":false}'
+# 布局模式（2026-10-26）：查每个模型本机可用摆放（dual/tp/replica/pool/auto）+ ctx 估算 + 宿主持久化命令，mode 参数当场切：
+curl http://<服务器IP>:8000/v1/gateway/modes?model=qwen3.8-27b
+curl -X POST http://<服务器IP>:8000/v1/gateway/load -H 'Content-Type: application/json' -d '{"model":"qwen3.8-27b","mode":"tp","wait":false}'
 ./scripts/start.sh --down           # 停止全部服务（只停不删；--clean 才删容器）
 ./scripts/manage.sh list    # 查看模型清单与下载状态
 ./scripts/manage.sh download <名称>       # 下载模型主仓库（LLM 或视频）
@@ -24,19 +28,25 @@ curl -X POST http://<服务器IP>:8000/v1/gateway/load -H 'Content-Type: applica
 ./scripts/manage.sh add     # 新增模型到清单（下次启动菜单可见）
 ./scripts/manage.sh check [--fix]  # 按模型文件校准清单（think/上下文/工具格式）
 ./scripts/manage.sh verify  # 通过网关逐模型实测：正文非空 + 工具调用解析
+# GUI 管理后台（集群总览/下载/布局切换/任务/监控，等价上面这些命令的点点点）：浏览器开 http://<本机IP>:9001
 python3 scripts/gen_video.py "提示词"   # MiniMax H3 文生视频（--turbo 加速，--first/--last 首/尾帧）
 python3 sysmonitor/sysmon.py            # 实时监控：GPU/CPU/网速/磁盘IO/进程/模型吞吐，全当前值仪表（q退出 Space暂停 A动画 P进程排序 T切主题）
+python3 sysmonitor/sysmon_web.py        # 实时监控 Web 版：浏览器看板 http://<本机IP>:8088（已随 compose 常驻 ai-sysmon-web；与 CLI 可同开）
 ```
 
 非交互启动示例：
 ```bash
 ./scripts/start.sh --llm qwen3.8-27b --video wan2.2-s2v -y
+./scripts/start.sh --llm qwen3.8-27b --tp 2 -y          # 跨卡 TP：整池显存换单请求 ctx（2×48GB：193K→895K），解码速度不涨
+./scripts/start.sh --llm qwen3.8-27b --replicas 2 -y    # 每卡一份副本：聚合吞吐≈×2、每流 ctx 不变，视频让位
 ```
 
 ## 服务入口
 
 - LLM API（OpenAI 兼容）: http://localhost:8000/v1/chat/completions
 - ComfyUI 图形界面: http://localhost:8188（第二实例 8189）
+- 监控看板（Web，常驻）: http://localhost:8088 —— sysmonitor GPU/吞吐/网速/磁盘/进程实时仪表；终端版 `python3 sysmonitor/sysmon.py` 可同时开
+- **管理后台（GUI，常驻）**: http://localhost:9001 —— 集群总览 + 每台节点的模型下载/布局切换（gateway-layout-v1 目录）/任务日志/sysmonitor 集成；打开任意一台即可看到四台（浏览器直连各节点 agent:9001，DGX 经 relay 只读）。agent 只是遥控器：下载=manage.sh、持久布局=menu.py、运行态切换=网关，写配置的仍然只有 menu.py
 
 文本模型 ↔ 视频的切换、`--switch` 快速切换（含远程 `gateway/switch` 接口）、显存腾挪、管理接口（`status` / `unload_all` / `switch`）、以及客户端 agent 的细粒度协商接口（`capabilities` 说明接口 / `gpus` GPU 发现 / `load` 指定 GPU 加载 / `ops` 状态轮询 / `unload` 按模型卸载）见 **`模型切换说明.md`**。
 
@@ -82,7 +92,7 @@ sudo ./scripts/install-prereqs.sh   # ① Docker + NVIDIA Container Toolkit（�
 | 模型 | 实际上限 | 说明 |
 |---|---|---|
 | qwen3.8-flash-next | 1M | 官方 YaRN factor 4.0（混合注意力，KV 开销小） |
-| qwen3.8-flash-next-iq3s | 1M | llama.cpp 引擎 + YaRN factor 4.0（`--rope-scaling yarn`），与 vLLM 旗舰同语义；实测单卡 96GB 显存 85GB 可跑 |
+| qwen3.8-flash-next-iq3s | 1M | llama.cpp 引擎 + YaRN factor 4.0（`--rope-scaling yarn`），与 vLLM 旗舰同语义；实测单卡 96GB 显存 85GB 可跑，2×48GB 机自动跨卡分层（`--split-mode layer`）摊分 |
 | qwen3.6-35b-a3b | 1.01M | 官方 YaRN factor 4.0；需 FP8 变体（bf16 下 KV 余量不够） |
 | qwen3.8-27b | 900K | 官方 YaRN factor 4.0；vLLM 实测 KV 上限 907088，1M 差 ~6GB |
 | qwen3-coder-30b-a3b | 512K | 稠密注意力 KV 开销大，factor 2.0；需 FP8 变体（bf16 下 512K 放不下） |
@@ -97,9 +107,11 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 | 模式 | 触发 | 说明 |
 |---|---|---|
 | 双卡分工 | 2 张卡（默认） | LLM 默认占 GPU1，视频占 GPU0，真并行；视频未用时第二个 LLM 可放 GPU0 并存（按模型名路由） |
-| 双卡旗舰 | 2 张卡 + 选大模型 | qwen3.8-flash-next 占双卡，start.sh 会自动停止运行中的 ComfyUI 腾显存（有任务在跑先提示确认）；下次选回视频时自动拉起 |
+| 双卡 TP | 2 张卡 + `--tp 2` | vLLM 单引擎跨卡：整池 KV 换单请求 ctx（27b fp8 @2×48GB：193K→895K）；解码速度**不涨**（无 NVLink 卡 all-reduce 净亏，实测 bf16TP2 611 < fp8 单卡 658 tok/s）；视频/副本让位；远程等价 `gateway/load {"mode":"tp"}`（ctx 持久化仍需本命令落 gw.max_len） |
+| 双卡副本 | 2 张卡 + `--replicas 2` | 每卡一份完整副本，网关按在途数分流，聚合吞吐≈×2、每流 ctx 不变；视频让位；远程等价 `gateway/load {"mode":"replica"}` |
+| 双卡旗舰 | 2 张卡 + 选大模型 | qwen3.8-flash-next（125GB FP8）占双卡，准入按整机池 `gmem×张数×0.92`（2×48GB 机池容 88GB 会被拒，应选 iq3s）；start.sh 会自动停止运行中的 ComfyUI 腾显存（有任务在跑先提示确认）；下次选回视频时自动拉起 |
 | 单卡共享 | 1 张卡 | LLM 限 ≤38GB（FP8），与视频分时共享显存 |
-| 单卡独占 | 1 张卡 + 选旗舰 | qwen3.8-flash-next-iq3s（GGUF 84G，llama.cpp）吃满整卡，视频自动灰化；`--switch video` 自动降回 27B 共存 |
+| 独占模式 | 旗舰量化模型 | qwen3.8-flash-next-iq3s（GGUF 84G，llama.cpp）：96GB 卡机吃满整卡；2×48GB 机自动跨卡按层摊分（`--split-mode layer` + 按显存比例的 `--tensor-split`）；视频自动灰化；`--switch video` 自动降回 27B 共存 |
 
 ## 已部署能力速查
 
@@ -142,7 +154,8 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - `models.json` — 模型清单（显存/卡数/下载源），新增模型唯一入口
 - `models/llm` — 文本模型 ｜ `models/comfy` — 视频模型（ComfyUI 目录结构）
 - `scripts/` — init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
-- `sysmonitor/` — 实时监控（curses/文本/截图；GPU/网速/磁盘IO/进程/模型吞吐 当前值仪表 + 7 套主题；详见 `sysmonitor/README.md`）
+- `sysmonitor/` — 实时监控（curses/文本/Web看板/截图；GPU/网速/磁盘IO/进程/模型吞吐 当前值仪表 + 7 套主题；详见 `sysmonitor/README.md`）
+- `console/` — GUI 管理后台 agent（9001；agent.py + web/ 静态前端 + console.json relay 白名单。读网关/sysmon、驱动 manage.sh/menu.py；bind-mount 代码，`docker compose restart console` 即生效）
 - `模型切换说明.md` — 文本/视频切换与管理接口（客户端操作依据）
 - `部署文档.md` — 通用部署指南（硬件要求 / 一键或手动部署 / 踩坑）
 - `data/output` — 生成结果输出目录
@@ -153,7 +166,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - 下载走 hf-mirror 镜像站；LTX-2 需先在 HuggingFace 网页接受协议
 - 网关会钳制过大的 `max_tokens`（vLLM 对 prompt+输出超上下文一律 400，客户端会误判为"上下文溢出"提前 compact）；钳制设有保底预算（思考模型 16384 / 非思考 4096），低于保底说明上下文真满了，放开让 vLLM 原生 400 透传触发 compact，避免思考模型预算被钳光后只吐 thinking 报错
 - 多模型放置策略：装得下就并存（每卡按已加载模型的 util 预算扣减，为其保留 KV cache 空间）；任何卡都装不下才卸最久未用的空闲模型；正忙的模型绝不驱逐，直接返回 503 让客户端稍后重试
-- 客户端 agent 细粒度协商（2026-10-20 新增）：首次连接先 `GET /v1/gateway/capabilities` 学习能力与协议 → `GET /v1/gateway/gpus` 查 GPU 数量与占用 → `POST /v1/gateway/load {"model":...,"gpus":[0],"wait":false}` 指定 GPU 异步加载 → 轮询 `GET /v1/gateway/ops/{id}` 拿加载/切换状态（`transitions[]`）。推理请求也可带 `X-Gateway-Load-Async:1`（+可选 `X-Gateway-GPUs:0`）免预加载、202 异步协商。详见 `模型切换说明.md` 第五节。
+- 客户端 agent 细粒度协商（2026-10-20 新增）：首次连接先 `GET /v1/gateway/capabilities` 学习能力与协议 → `GET /v1/gateway/gpus` 查 GPU 数量与占用 → `POST /v1/gateway/load {"model":...,"gpus":[0],"wait":false}` 指定 GPU 异步加载 → 轮询 `GET /v1/gateway/ops/{id}` 拿加载/切换状态（`transitions[]`）。推理请求也可带 `X-Gateway-Load-Async:1`（+可选 `X-Gateway-GPUs:0`）免预加载、202 异步协商。2026-10-26 起再加一步**布局协商**：`GET /v1/gateway/modes` 查每个模型的摆放模式（dual/tp/replica/pool/auto）、现行布局与 ctx 上限，`load` 带 `"mode":"…"` 或 `"replicas":N` 当场切摆放（可加推理头 `X-Gateway-Mode`）；网关对 models.json 只读，新 ctx 持久化按目录给的 `host_command` 在宿主执行。详见 `模型切换说明.md` 第 5.3 / 5.8 节。
 - 自动卸载只由文本请求触发；视频请求直连 ComfyUI 不经过网关，跑大视频任务前需手动腾显存：`curl -X POST http://localhost:8000/v1/gateway/unload_all`（正忙/加载中的模型跳过并在 `busy` 字段列出，网关保持常驻、请求来了自动重载）
 - 详细设计见方案文档（plans/miles-morales-siryn-batgirl.md）
 

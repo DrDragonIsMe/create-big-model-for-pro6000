@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """启动入口核心：检测 GPU → 选 LLM → 按余量灰化视频选项 → 生成 .env + compose.selected.yaml"""
-import argparse, json, os, re, shutil, subprocess, sys
+import argparse, fnmatch, json, os, re, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
@@ -21,9 +21,22 @@ def llm_downloaded(name):
     return os.path.isdir(d) and bool(os.listdir(d))
 
 def video_downloaded(name, man):
-    d = man["video"][name]["dest"]
-    p = os.path.join("models/comfy", d)
-    return os.path.isdir(p) and bool(os.listdir(p))
+    """按 includes 模式逐条命中才算已下载：多个视频共用 diffusion_models 目录，
+    只看"目录非空"会让任何一个在位就把全家标成★，ensure_assets 跟着跳过下载，
+    ComfyUI 起来后才发现缺的是另一个模型的权重。"""
+    vd = man["video"][name]
+    p = os.path.join("models/comfy", vd["dest"])
+    if not os.path.isdir(p):
+        return False
+    files = os.listdir(p)
+    return all(any(fnmatch.fnmatch(f, pat) for f in files)
+               for pat in (vd.get("includes") or ["*"]))
+
+def image_downloaded(name, man):
+    """image 段的 dest 是 {comfy子目录: 文件名} 映射：全部文件在位才算已下载。"""
+    dest = man["image"][name].get("dest") or {}
+    return bool(dest) and all(os.path.isfile(os.path.join("models/comfy", d, f))
+                              for d, f in dest.items())
 
 def _nonempty_dir(p):
     return os.path.isdir(p) and bool(os.listdir(p))
@@ -66,6 +79,33 @@ def pick_variant(llm, budget_gb):
             best = v
     return best
 
+def pool_cap(gpu_count, gmem):
+    """旗舰池准入上限（GB）：独占全部卡、整池按 0.92 用。
+    与 compute 里 flagship 分支的硬校验同口径——准入和使用必须是同一个数。"""
+    return int(gmem * gpu_count * 0.92)
+
+def vllm_ctx(d, vram_eff, gmem, mem_util, tp):
+    """vLLM 单请求上下文：(每卡预算×卡数 − 权重 − 4GB 运行预留) × 实测 KV 密度，
+    封顶 max(原生上限, YaRN 扩展上限)。真实摆放（compute）与互推面板（suggest_modes）
+    共用这一份——建议数和摆放数不同源的话，迟早会漂成两套。
+
+    密度两个来源：kv_tokens_per_gb 是 calib_vram.py text 从 vLLM 自己日志里量的
+    （qwen3.8-27b@48GB：KV 11.99GiB / 190,622 tokens = 15898 tokens/GB）；
+    15300 是更早那台 96GB 机器上估出来的旧值，留着当"没量过"的兜底。
+    这数是 per-model 的属性、不是机器的：27B 是 Qwen3_5ForConditionalGeneration
+    混合 Mamba cache，KV 才这么密；换成纯 attention 模型会低一个量级。"""
+    ctx_cap = max(int(d.get("max_ctx") or d["ctx_default"]), yarn_override_limit(d))
+    total = gmem * mem_util * (tp if tp > 1 else 1)
+    kv_gb = max(0.0, total - vram_eff - 4)  # 权重之外可用于 KV 的显存
+    density = int(d.get("kv_tokens_per_gb") or 15300)
+    est = int(kv_gb * density)
+    if d.get("kv_tokens_per_gb"):
+        # 实测密度采自 vLLM 启动日志，不含 ≥0.21 默认开启的 CUDA-graph 显存预留
+        #（27B@48GB 实测吃掉 ~0.5GB KV）：按预算×密度算出 193319，vLLM 实只肯给
+        # 11.94GiB（上限 190512），引擎直接 ValueError 起不来。实测路径统一留 2%。
+        est = int(est * 0.98)
+    return max(32768, min(ctx_cap, est)), kv_gb, density
+
 def video_tier(vdef, free_gb, slack):
     """返回 (标记, 说明, max_res)：'720' / '480' / 'risky480' / 'no'
 
@@ -90,6 +130,84 @@ def video_tier(vdef, free_gb, slack):
     if not meas_480 and free_gb >= need_480 - slack:
         return "risky480", "480p+offload(慢)", 480
     return "no", "", None
+
+def suggest_modes(man, *, gmem, gpu_count, bud, meta, llm_name, d, variant,
+                  vram_eff, engine, mode, replicas, comfy_devices,
+                  comfy_enabled, free_video, max_len, args):
+    """摆放完成后的互推面板：只打印、不改摆放。数字全部与摆放同源
+    （vllm_ctx / video_tier / pool_cap）——"选完一个方案，自动看到别的方案
+    买到了什么、让掉了什么"，这就是这个面板存在的全部理由。"""
+    def fmt_ctx(n):
+        return f"{n/1000:.0f}K" if n < 1000000 else f"{n/1048576:.1f}M"
+
+    rows = []
+
+    # ① 生图模型不在第 2 步菜单里，别让它们永远不会出现在屏幕上
+    if comfy_enabled and man.get("image") and free_video > 0:
+        items = []
+        for n, im in man["image"].items():
+            need = float(im.get("size_gb") or 0)
+            if 0 < need <= free_video:
+                tag = "" if image_downloaded(n, man) else "（未下载：./scripts/manage.sh download " + n + "）"
+                items.append(f"{n}（权重~{need:.0f}G{tag}）")
+        if items:
+            rows.append(f"GPU[{comfy_devices}] 还有 ~{int(free_video)}GB，生图与视频同卡可轮流加载："
+                        + "、".join(items) + " → scripts/gen_image.py")
+
+    # ② 现在被挡住/降档的视频模型，整卡给视频能解锁什么
+    if mode == "flagship":
+        rows.append("当前 LLM 独占全部卡位，视频让位；要文本+视频并行 → 重选单卡放得下的变体（不带 --tp / 不选旗舰）")
+    elif comfy_enabled:
+        upgrade = []
+        for n, vd in man["video"].items():
+            cur = video_tier(vd, free_video, 12)
+            full = video_tier(vd, bud["video_card"], 12)
+            if full[2] and full[2] > (cur[2] or 0):
+                upgrade.append(f"{n}（{cur[2] or '不可'}p→{full[2]}p）")
+        if upgrade:
+            rows.append("让一张整卡给视频可解锁：" + "、".join(upgrade)
+                        + " → ./scripts/start.sh --switch video（文本卸载，之后请求自动重载）")
+
+    # ③ 同模型每卡一份副本：吞吐换共存
+    if engine == "vllm" and gpu_count >= 2 and mode == "dual" and replicas == 1:
+        rows.append(f"并发优先：./scripts/start.sh --llm {llm_name} --replicas {gpu_count} -y"
+                    f" → 每卡一份 {variant}，聚合吞吐≈×{gpu_count}、每流 ctx 仍≈{fmt_ctx(max_len)}；GPU[0..{gpu_count-1}] 全数服务文本，视频让位")
+
+    # ④ 跨卡 TP：整池显存换单请求上下文，速度不涨
+    if engine == "vllm" and gpu_count >= 2 and mode == "dual" and not args.tp:
+        tp_len, _, _ = vllm_ctx(d, vram_eff, gmem, 0.92, gpu_count)
+        if tp_len > max_len * 1.5:
+            rows.append(f"长上下文优先：./scripts/start.sh --llm {llm_name} --tp {gpu_count} -y"
+                        f" → {variant} 跨卡 TP 单请求 ctx≈{fmt_ctx(tp_len)}（现 {fmt_ctx(max_len)}）；解码速度不涨（无 NVLink 的消费卡实测 TP≈单卡），视频与副本全部让位")
+
+    # ⑤ 整机池还装得下哪些 LLM（独占位候选，互斥关系点破）
+    pool_gb = pool_cap(gpu_count, gmem)
+    alts = []
+    for n2, d2 in man["llm"].items():
+        if n2 == llm_name or d2.get("deprecated") or d2["min_gpus"] > gpu_count:
+            continue
+        v2 = pick_variant(d2, pool_gb)
+        if not v2:
+            continue
+        star = "★" if llm_downloaded(n2) else " "
+        vs = "/".join(sorted(d2["variants"], key=lambda k: d2["variants"][k]))
+        if d2.get("engine") == "llamacpp":
+            cl = int(d2.get("gw", {}).get("max_len") or 0)
+            hint = f"，ctx≈{fmt_ctx(cl)}" if cl else ""
+        else:
+            est = vllm_ctx(d2, d2["variants"][v2], gmem, 0.92, gpu_count)[0]
+            hint = f"，ctx≈{fmt_ctx(est)}"
+        alts.append(f"{star}{n2}（{vs}{hint}）")
+    if alts:
+        rows.append(f"本机整池 {int(pool_gb)}GB 的独占位还放得下（任一个都会锁死全部卡）："
+                    + "；".join(alts[:4]))
+
+    if rows:
+        print("\n" + "─" * 62)
+        print("布局互推（按本机剩余显存推导，仅提示，不改变当前摆放）：")
+        for r in rows:
+            print("  · " + r)
+        print("─" * 62)
 
 def compute(args, man, gpu_count, gpu_mem):
     meta = man["meta"]
@@ -132,10 +250,20 @@ def compute(args, man, gpu_count, gpu_mem):
             star = "★" if llm_downloaded(n) else " "
             vs = " / ".join(f"{v}:{gb}GB" for v, gb in d["variants"].items())
             fit = pick_variant(d, budget)
+            # 旗舰池模式：单卡/半池预算都装不下时，按整机池再判一次
+            # （如 2×48GB 上的 84GB GGUF 走跨卡分层，与 compute 的 flagship 准入同口径）
+            pool_fit = None if (fit or gpu_count < 2) else pick_variant(d, pool_cap(gpu_count, gmem))
             full_cap = gmem - meta["safety_gap_gb"] - 2
             full_fit = pick_variant(d, full_cap) if (gpu_count == 1 and not fit) else None
-            selectable = bool(fit) or bool(full_fit)
-            mark = "" if fit else ("  ⚠ 独占单卡（视频不可用）" if full_fit else "  ✗ 单卡放不下")
+            selectable = bool(fit) or bool(full_fit) or bool(pool_fit)
+            if fit:
+                mark = ""
+            elif pool_fit:
+                mark = f"  ⚠ 独占 {gpu_count} 卡分层（视频不可用）"
+            elif full_fit:
+                mark = "  ⚠ 独占单卡（视频不可用）"
+            else:
+                mark = "  ✗ 单卡放不下"
             risk = " ⚠" if d.get("arch_risk") else ""
             dep = " ✗已弃用" if d.get("deprecated") else ""
             brief = d.get("menu_brief", d.get("desc", ""))
@@ -168,9 +296,14 @@ def compute(args, man, gpu_count, gpu_mem):
         if gpu_count == 1:
             vbudget = bud["single_llm"]
         elif d["min_gpus"] == 2:
-            vbudget = 10 ** 6  # 旗舰模型：直接取最大变体
+            vbudget = pool_cap(gpu_count, gmem)  # 旗舰模型：整池放得下的变体才可选（原来无条件取最大，48GB 双卡会误放 125GB FP8）
         else:
             vbudget = round(gmem * meta["dual_llm_util"])
+            # 半池预算内没变体时按整机池再选一次：2×48GB 上的 84GB GGUF 走
+            # flagship 分支跨卡分层——原来选不到变体就在这里直接拒绝，
+            # 下面 186 行的池准入形同虚设（只有手传 --variant 才进得去）
+            if pick_variant(d, vbudget) is None:
+                vbudget = pool_cap(gpu_count, gmem)
         variant = pick_variant(d, vbudget)
         if variant is None and gpu_count == 1:
             # 单卡独占：single 预算内装不下，退而求其次吃满整卡（视频不可共存）
@@ -192,6 +325,22 @@ def compute(args, man, gpu_count, gpu_mem):
             sys.exit(f"错误：{llm_name}:{variant}（{vram}GB）单卡放不下，"
                      f"{gpu_count} 卡总可用 {pool_gb}GB 也放不下，请换更小的量化版")
 
+    # ---------- 显式 TP（--tp N）：用整池显存换单请求上下文，不是换速度 ----------
+    # 本机实测（2×RTX4090 48GB / qwen3.8-27b）：bf16 TP=2 双卡 611 tok/s < fp8 单卡
+    # 658——带宽聚合与 dtype 节省互相抵消，无 NVLink 卡的 all-reduce 是净亏。
+    # 所以吞吐交给 --replicas，--tp 只在"单请求上下文装不下"时才值得。
+    if args.tp:
+        if engine != "vllm":
+            sys.exit(f"错误：--tp 只支持 vLLM 后端（{llm_name} 用 {engine}；"
+                     f"GGUF 量化版独占整池时自动跨卡分层，不需要该参数）")
+        if int(args.replicas or 1) > 1:
+            sys.exit("错误：--tp 与 --replicas 互斥：TP 是单引擎跨卡换上下文，副本是每卡一份换吞吐")
+        if not 2 <= args.tp <= gpu_count:
+            sys.exit(f"错误：--tp 需要 2..{gpu_count}（本机 {gpu_count} 卡）")
+        if vram > gmem * args.tp * 0.92:
+            sys.exit(f"错误：{llm_name}:{variant}（{vram}GB）超过 {args.tp} 卡可用 "
+                     f"{int(gmem * args.tp * 0.92)}GB，TP 放不下")
+
     # ---------- 摆放 ----------
     comfy_enabled = 1
     comfy_devices, llm_devices, tp = "0", "0", 1
@@ -212,6 +361,18 @@ def compute(args, man, gpu_count, gpu_mem):
         else:
             sys.exit(f"错误：单卡可用显存约 {gmem - meta['safety_gap_gb'] - 2}GB，"
                      f"{llm_name}:{variant} 为 {vram}GB，装不下")
+    elif args.tp and args.tp > 1:
+        # 显式整池 TP：KV 会吃满整池，同卡塞不下 ComfyUI；少用的卡才留给视频
+        mode = "flagship"
+        tp = args.tp
+        llm_devices = ",".join(str(i) for i in range(tp))
+        mem_util = 0.92
+        if tp < gpu_count:
+            comfy_devices = ",".join(str(i) for i in range(tp, gpu_count))
+            free_video = bud["video_card"]
+        else:
+            comfy_enabled = 0
+            free_video = 0
     elif vram <= round(gmem * meta["dual_llm_util"]):
         mode = "dual"
         llm_devices = "1"
@@ -269,9 +430,7 @@ def compute(args, man, gpu_count, gpu_mem):
             free_video = 0
 
     # ---------- 上下文长度：按显卡剩余显存尽量开大 ----------
-    # 天花板取"原生上限"与"YaRN 扩展上限"的较大者：配了 YaRN 的模型本就是为跑超长而配，
-    # 只按 max_ctx 封顶会把刻意扩出来的上下文当越界砍掉（27B：262144 → 1048576）。
-    ctx_cap = max(int(d.get("max_ctx") or d["ctx_default"]), yarn_override_limit(d))
+    # 天花板（原生 vs YaRN）与 KV 估算规则收在 vllm_ctx()，互推面板用同一个函数。
     # KV 预算要按"网关实际加载的那份权重"算。model_dir 在没有显式指定精度时优先用
     # <name>-fp8 目录，而 variants 里的 vram 是 menu 选中的变体——两者不一致时
     # （如 96GB 机上 menu 自动选 bf16:54GB、网关却加载 fp8:28GB）会低估可用 KV，
@@ -281,16 +440,7 @@ def compute(args, man, gpu_count, gpu_mem):
        and _nonempty_dir(f"models/llm/{llm_name}-fp8") and "fp8" in d["variants"]:
         vram_eff = d["variants"]["fp8"]
     if engine == "vllm":
-        total_budget = gmem * mem_util * (tp if tp > 1 else 1)
-        kv_gb = max(0.0, total_budget - vram_eff - 4)  # 权重之外可用于 KV 的显存
-        # 密度两个来源：kv_tokens_per_gb 是 calib_vram.py text 从 vLLM 自己日志里量的
-        # （qwen3.8-27b@48GB：KV 11.99GiB / 190,622 tokens = 15898 tokens/GB）；
-        # 15300 是更早那台 96GB 机器上估出来的旧值，留着当"没量过"的兜底。
-        # 这数是 per-model 的属性、不是机器的：27B 是 Qwen3_5ForConditionalGeneration
-        # 混合 Mamba cache，KV 才这么密；换成纯 attention 模型会低一个量级。
-        density = int(d.get("kv_tokens_per_gb") or 15300)
-        est_tokens = int(kv_gb * density)
-        max_len = max(32768, min(ctx_cap, est_tokens))
+        max_len, kv_gb, density = vllm_ctx(d, vram_eff, gmem, mem_util, tp)
         if d.get("kv_tokens_per_gb"):
             # 有实测值就再拿它反查一遍并发度：max_len 超过 kv_gb×密度就意味着一个完整请求
             # 都装不满（并发 <1.0），vLLM 起来也只是摆设。防的是陈旧实测值——
@@ -361,6 +511,12 @@ def compute(args, man, gpu_count, gpu_mem):
     if video_name == "none" and not args.yes and args.video is None:
         comfy_enabled = 0
 
+    suggest_modes(man, gmem=gmem, gpu_count=gpu_count, bud=bud, meta=meta,
+                  llm_name=llm_name, d=d, variant=variant, vram_eff=vram_eff,
+                  engine=engine, mode=mode, replicas=replicas,
+                  comfy_devices=comfy_devices, comfy_enabled=comfy_enabled,
+                  free_video=free_video, max_len=max_len, args=args)
+
     # ---------- 模型就位：缺则下载，有则校准（新机器一键起） ----------
     ensure_assets(llm_name, variant, d, video_name, man)
 
@@ -375,6 +531,17 @@ def compute(args, man, gpu_count, gpu_mem):
     gw_new = {"gpus": llm_devices}
     if mem_util is not None:          # llamacpp 旗舰走 tensor_split，没有 util 概念
         gw_new["util"] = mem_util
+    if engine == "llamacpp":
+        # 多卡 llama.cpp：把本机摆放推导的拆分策略落盘，网关按它拼
+        # --split-mode/--tensor-split；单卡时清键，防别台机器的多卡快照残留。
+        # gw 已有显式值（人工精调过）则尊重人工值。
+        n_dev = len(llm_devices.split(","))
+        if n_dev > 1:
+            gw_new["split_mode"] = gw_old.get("split_mode") or "layer"
+            gw_new["tensor_split"] = (gw_old.get("tensor_split")
+                                      or tensor_split)  # coexist 分支算的比例
+        else:
+            gw_new["split_mode"] = gw_new["tensor_split"] = None
     if engine == "vllm":
         # 精度只在用户显式 --variant 时钉住；没指定就删键、回到 model_dir 的默认口径
         # （-fp8 优先）。否则上一次 --variant bf16 会一直赖在配置里，变成
@@ -435,7 +602,9 @@ def compute(args, man, gpu_count, gpu_mem):
     print(f"\n已生成 .env（模式 {mode}）与 compose.selected.yaml：")
     print(f"  LLM : {llm_name}:{variant} ({vram}GB, GPU [{llm_devices}]"
           + (f", TP={tp}" if tp > 1 else "")
-          + (f", tensor-split={tensor_split}" if tensor_split else "") + ")")
+          + (f", ×{replicas} 副本" if replicas > 1 else "")
+          + (f", tensor-split={tensor_split}" if tensor_split else "")
+          + f", 单请求 ctx≈{max_len:,})")
     print(f"  视频: {video_name}" + (f"（上限 {max_res}p, GPU [{comfy_devices}]）" if video_name != "none" else "（不启动 ComfyUI）"))
     return env
 
@@ -533,6 +702,10 @@ def main():
     ap.add_argument("--replicas", type=int, default=1,
                     help="同一 LLM 起几个后端副本（每副本一卡，网关按在途请求数分流）。"
                          "如 2×48GB 双卡各跑一份 fp8 把吞吐翻倍")
+    ap.add_argument("--tp", type=int, default=0, metavar="N",
+                    help="vLLM 独占 N 卡张量并行：整池显存换单请求上下文"
+                         "（如 27b fp8 双卡：193K→895K tokens），解码速度不涨；"
+                         "与 --replicas 互斥。GGUF 量化版不需要它（独占整池自动分层）")
     ap.add_argument("--strict", action="store_true",
                     help="发现本系统之外的显存占用者时直接退出（等价 AI_STRICT=1）")
     ap.add_argument("-y", "--yes", action="store_true", help="跳过确认")

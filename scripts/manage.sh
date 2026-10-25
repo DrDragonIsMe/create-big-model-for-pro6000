@@ -5,6 +5,7 @@
 #   ./manage.sh download qwen3.8-27b        下载 LLM 主仓库（下完自动校准 think/max_ctx）
 #   ./manage.sh download qwen3.8-27b fp8    下载官方 FP8 变体到 <名称>-fp8（网关优先使用）
 #   ./manage.sh download wan2.2-s2v         下载视频模型（自动附带 common 组件）
+#   ./manage.sh download qwen-image         下载生图模型（image 段，按 dest 文件表逐个归位）
 #   ./manage.sh download common             只下载共享组件
 #   ./manage.sh add                         交互式新增模型到 models.json
 #   ./manage.sh check [--fix]               按已下载模型文件校准 models.json（think/上下文/工具格式）
@@ -21,16 +22,26 @@ cmd="${1:-list}"; shift || true
 case "$cmd" in
 list)
   python3 - <<'EOF'
-import json, os
+import fnmatch, json, os
 man = json.load(open("models.json"))
 def has(d): return os.path.isdir(d) and bool(os.listdir(d))
+def vhas(d):
+    p = f"models/comfy/{d['dest']}"
+    if not os.path.isdir(p): return False
+    files = os.listdir(p)
+    return all(any(fnmatch.fnmatch(f, pat) for f in files) for pat in (d.get("includes") or ["*"]))
 print("== LLM ==")
 for n, d in man["llm"].items():
     vs = "/".join(f"{v}:{g}GB" for v, g in d["variants"].items())
     print(f"  {'★' if has(f'models/llm/{n}') else ' '} {n:<24} {vs:<18} {d['engine']}, min_gpus={d['min_gpus']}  {d['desc']}")
 print("== 视频 ==")
 for n, d in man["video"].items():
-    print(f"  {'★' if has('models/comfy/' + d['dest']) else ' '} {n:<24} 480p:{d['vram_480p_fp8']}GB 720p:{d['vram_720p_bf16']}GB  {d['desc']}")
+    print(f"  {'★' if vhas(d) else ' '} {n:<24} 480p:{d['vram_480p_fp8']}GB 720p:{d['vram_720p_bf16']}GB  {d['desc']}")
+print("== 生图 ==")
+for n, d in man.get("image", {}).items():
+    dest = d.get("dest", {})
+    ok = bool(dest) and all(os.path.isfile(f"models/comfy/{dd}/{ff}") for dd, ff in dest.items())
+    print(f"  {'★' if ok else ' '} {n:<24} ~{d.get('size_gb','?')}GB  {d.get('desc', n)}  → {d.get('cli', '')}")
 print("== 共享组件 ==")
 for n, d in man["common"].items():
     print(f"  {'★' if has('models/comfy/' + d['dest']) else ' '} {n:<24} -> comfy/{d['dest']}")
@@ -60,6 +71,13 @@ elif name in man["video"]:
         tasks.append({"mode": "comfy", "name": f"{name}/{en}", **ed})
     for cn, cd in man["common"].items():
         tasks.append({"mode": "comfy", "name": f"common/{cn}", **cd})
+elif name in man.get("image", {}):
+    d = man["image"][name]
+    for dest_dir, fname in d["dest"].items():
+        tasks.append({"mode": "comfy", "name": f"image/{name}/{dest_dir}", "repo": d["repo"],
+                      "includes": [fname], "dest": dest_dir})
+    for cn, cd in man["common"].items():
+        tasks.append({"mode": "comfy", "name": f"common/{cn}", **cd})
 elif name in man["llm"]:
     d = man["llm"][name]
     if variant == "fp8":
@@ -82,7 +100,9 @@ EOF
   echo "==> 下载任务: $(python3 -c "import json;print(len(json.load(open('$JOB'))['tasks']))") 项"
   docker pull python:3.12-slim >/dev/null 2>&1 || true
   docker run --rm \
-    --user "$(id -u):$(id -g)" \
+    # MANAGE_RUN_AS：console agent 容器内是 root，直接 id -u 会把宿主 models/ 文件下成 root-owned；
+    # agent 按 models 目录真实属主注入该变量。宿主手跑时未设置，行为与从前完全一致。
+    --user "${MANAGE_RUN_AS:-$(id -u):$(id -g)}" \
     -v "$PWD/models:/models" -v "$JOB:/job.json:ro" -v "$PWD/scripts:/opt:ro" \
     -e HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
     -e HF_TOKEN="${HF_TOKEN:-}" -e HF_HUB_ENABLE_HF_TRANSFER=1 \

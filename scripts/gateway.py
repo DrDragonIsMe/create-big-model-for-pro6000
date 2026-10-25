@@ -8,7 +8,8 @@
              /v1/gateway/switch（远程切换文本/视频，等价 start.sh --switch）
 • 协商     — /v1/gateway/capabilities（说明接口，供客户端 agent 首次连接时学习）、
              /v1/gateway/gpus（GPU 发现：数量/容量/占用/利用率）、
-             /v1/gateway/load（把模型加载到指定 GPU，wait=false 异步返回 request_id）、
+             /v1/gateway/modes（布局模式目录：每个模型在本机的现行摆放与可切布局，2026-10-26 新增）、
+             /v1/gateway/load（把模型加载到指定 GPU / 按布局模式切换，wait=false 异步返回 request_id）、
              /v1/gateway/unload（按模型细粒度卸载）、/v1/gateway/ops[/{id}]（操作状态轮询）。
              推理请求还可带 X-Gateway-Load-Async:1（+可选 X-Gateway-GPUs:0）走 202 异步协商，
              网关把 loading→ready / failed 状态机（transitions）返回给客户端。
@@ -34,7 +35,7 @@
 仅加入 ai_default 内网，不暴露宿主机端口。
 所有 docker/nvidia-smi 同步调用均经 asyncio.to_thread 包裹，不阻塞事件循环。
 """
-import asyncio, fnmatch, json, os, re, subprocess, time, urllib.request
+import asyncio, calendar, fnmatch, json, os, re, subprocess, time, urllib.request
 from contextlib import asynccontextmanager
 
 import docker
@@ -284,25 +285,118 @@ _PREFILL_RE = re.compile(
     r"prompt processing, n_tokens\s*=\s*(\d+),\s*progress\s*=\s*([\d.]+),\s*"
     r"t\s*=\s*([\d.]+)\s*s\s*/\s*([\d.]+) tokens per second"
 )
+# slot 日志行的前缀 'slot print_timing: id  0 | task 12 | ...'，--parallel N 时用它分槽
+_SLOT_TAG_RE = re.compile(r"\bid\s*(-?\d+)\s*\|\s*task\s*(-?\d+)")
+# vLLM 引擎自己的窗口统计（loggers.py，默认每 10s 一条）：
+#   Engine 000: Avg prompt throughput: 781.8 tokens/s, Avg generation throughput: 83.8 tokens/s,
+#               Running: 2 reqs, Waiting: 0 reqs, GPU KV cache usage: 43.5%, ...
+_VLLM_STATS_RE = re.compile(r"Avg prompt throughput:\s*([\d.]+)\s*tokens/s")
+_VLLM_ENGINE_RE = re.compile(r"Engine\s+(\d+)")
+_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?"
+                        r"(Z|[+-]\d{2}:?\d{2})?\s+(.*)$")
+
+PREFILL_LOG_WINDOW = 40      # 读后端容器日志尾部的秒数
+LLAMA_PREFILL_FRESH = 4.0    # 距最后一条 prefill 日志多久内算"该 slot 仍在预填充"
+VLLM_STATS_WINDOW = 10.0     # vLLM 统计行的打印周期（速率是该窗口的平均值）
+VLLM_PREFILL_FRESH = VLLM_STATS_WINDOW + 3.0
+TOKEN_SAMPLE_INTERVAL = 2.0  # 后台吞吐采样周期
+TOKEN_SAMPLE_MIN_DT = 1.0    # 同一后端两次采样的最小间隔（轮询再快也只是读缓存）
+PREFILL_MIN_RATE = 20.0      # 低于此 p/s 不算"正在预填充"：step 差分在纯 decode 期只有一两个 token 的错位噪声
+PREFILL_HOLD_SEC = 4.0       # 突发 prefill 的最近一次实测速率保留这么久，免得监控端只看到一闪
+PREFILL_HOLD_MIN_TOKENS = 2048   # 只有这么大规模的突发 prefill 才保持显示
 
 
-def _llamacpp_prefill(backend):
-    """从 llama-server 日志尾部解析 prompt prefill 实时进度与吞吐。
+def _log_epoch(m):
+    """docker 日志时间戳（RFC3339，可能带小数秒与时区）-> epoch 秒。"""
+    sec = float(calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")))
+    if m.group(2):
+        sec += float("0." + m.group(2)[:6])
+    off = m.group(3)
+    if off and off != "Z":
+        digits = off[1:].replace(":", "")
+        delta = int(digits[:2]) * 3600 + int(digits[2:4] or 0) * 60
+        sec += -delta if off[0] == "+" else delta
+    return sec
 
-    prefill 阶段 /metrics 的 prompt/generation counter 都要等请求结束才更新，
-    但日志每秒打印 'prompt processing, n_tokens=..., progress=..., x tokens/second'。
+
+def _container_log(backend, window):
+    """后端容器最近 window 秒的日志，返回 [(epoch|None, 文本)]。
+
+    取不到（网关没挂 docker.sock、容器消失等）抛异常，由调用方退回 /metrics 差分兜底。
+    """
+    c = dcli.containers.get(backend["container"])
+    raw = c.logs(tail=800, since=int(time.time()) - window - 1, timestamps=True)
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+    out = []
+    for line in str(raw).splitlines():
+        m = _LOG_TS_RE.match(line)
+        out.append((_log_epoch(m) if m else None, m.group(4) if m else line))
+    return out
+
+
+def _llamacpp_prefill(backend, now):
+    """llama.cpp 的实时预填充进度与吞吐（来自 slot 日志，/metrics 要等请求结束才动）。
+
+    这行日志只在某个 slot 预填充期间每秒打印，所以"最近打印过"就是活跃判据；
+    n_tokens 是每个请求各自从 0 重新计数的，拿它跨请求/跨 slot 比增长只会失真。
+    --parallel N 并发预填充时按 slot 各取最新一行，速率与已处理 token 相加。
+    absolute=True：日志给的就是该请求的绝对进度，监控端可以直接画进度条。
     """
     try:
-        c = dcli.containers.get(backend["container"])
-        logs = c.logs(tail=300, since=int(time.time()) - 30).decode(errors="replace")
+        lines = _container_log(backend, PREFILL_LOG_WINDOW)
     except Exception:
         return None
-    matches = list(_PREFILL_RE.finditer(logs))
-    if not matches:
+    slots = {}
+    for ts, text in lines:
+        m = _PREFILL_RE.search(text)
+        if not m:
+            continue
+        tag = _SLOT_TAG_RE.search(text)
+        slots[tag.group(1) if tag else "0"] = {
+            "tokens": int(m.group(1)), "progress": float(m.group(2)),
+            "elapsed": float(m.group(3)), "rate": float(m.group(4)),
+            "seen": ts if ts is not None else now}   # 无时间戳时保守当作刚发生
+    last_seen = max((s["seen"] for s in slots.values()), default=0.0)
+    live = [s for s in slots.values() if now - s["seen"] <= LLAMA_PREFILL_FRESH]
+    if not live:
+        return {"available": True, "absolute": True, "rate": 0.0, "tokens": None,
+                "progress": None, "elapsed": None, "seen_at": last_seen}
+    done = float(sum(s["tokens"] for s in live))
+    # progress = 该 slot 已处理 / 该请求 prompt 总长，反推总长才能把多槽合并成一个总进度
+    total = sum(s["tokens"] / s["progress"] for s in live if s["progress"] > 0)
+    return {"available": True, "absolute": True,
+            "rate": sum(s["rate"] for s in live), "tokens": done,
+            "progress": done / total if total > 0 else None,
+            "elapsed": max(s["elapsed"] for s in live), "seen_at": now}
+
+
+def _vllm_prefill(backend, now):
+    """vLLM 预填充吞吐的兜底来源：引擎统计行（step 计数缺失的 vLLM 才用）。
+
+    首选是 /metrics 的 iteration_tokens_total 差分——实时、且只统计真正算过的 token。
+    统计行的 Avg prompt throughput 也能用，但它是 10s 窗口均值（滞后最多一个窗口）、
+    没有单请求进度。vllm:prompt_tokens_total 则根本不能拿来算速率：它按请求一次性入账，
+    还把 prefix cache 命中算进去（本机累计 2.69e9 里 93% 是命中），虚高几个数量级。
+    """
+    try:
+        lines = _container_log(backend, PREFILL_LOG_WINDOW)
+    except Exception:
         return None
-    m = matches[-1]
-    return {"tokens": int(m.group(1)), "progress": float(m.group(2)),
-            "elapsed": float(m.group(3)), "rate": float(m.group(4))}
+    engines = {}
+    for ts, text in lines:
+        m = _VLLM_STATS_RE.search(text)
+        if not m:
+            continue
+        eid = _VLLM_ENGINE_RE.search(text)
+        engines[eid.group(1) if eid else "0"] = {
+            "rate": float(m.group(1)), "seen": ts if ts is not None else now}
+    seen_at = max((e["seen"] for e in engines.values()), default=0.0)
+    live = [e for e in engines.values()
+            if now - e["seen"] <= VLLM_PREFILL_FRESH and e["rate"] > 0]
+    return {"available": True, "absolute": False,
+            "rate": sum(e["rate"] for e in live), "tokens": None,
+            "progress": None, "elapsed": None, "seen_at": seen_at}
 
 
 
@@ -445,48 +539,100 @@ def _fetch_backend_metrics(backend):
         ))
     if generated is None:
         raise ValueError("generation token not found")
-    prefill = None
+    step = None
+    if backend.get("engine") == "vllm":
+        # 每个 step 实际计算的 token 数（含 prefill 与 decode）：prefix cache 命中不产生
+        # step，所以这个计数只统计真算过的 token，是 vLLM 侧唯一实时的 prefill 信号
+        step = _metric_total(text, ("vllm:iteration_tokens_total_sum",))
+    # prompt 速率的另一条来源是引擎日志：llama.cpp 的 slot 行带单请求进度；
+    # vLLM 的统计行是 10s 窗口均值、且没有单请求进度，只在 step 计数缺失时兜底
     if backend.get("engine") == "llamacpp":
-        prefill = _llamacpp_prefill(backend)
-    return prompt, generated, prefill
+        prefill = _llamacpp_prefill(backend, time.time())
+    elif backend.get("engine") == "vllm" and step is None:
+        prefill = _vllm_prefill(backend, time.time())
+    else:
+        prefill = None
+    return {"prompt": prompt, "generated": generated, "step": step, "prefill": prefill}
 
 
 def _apply_backend_metrics(name, backend, metrics=None, error=False):
     now = time.time()
     item = _token_state(name)
     if error:
-        item.update({"time": now, "metrics_ok": False})
+        # 后端不可达：阶段与速率一并清零，免得监控端停在最后一次的 Prompt 画面
+        item.update({"time": now, "metrics_ok": False, "prefill_active": False,
+                     "prefill_rate": 0.0, "prompt_rate": 0.0, "prefill_tokens": None,
+                     "prefill_progress": None, "prefill_elapsed": None})
         if not item.get("live_start"):
             item["generation_rate"] = 0.0
         return item
-    prompt, generated, prefill = metrics
+    prompt, generated, step, prefill = (metrics.get(k) for k in ("prompt", "generated",
+                                                                 "step", "prefill"))
     if prompt is not None:
         item["prompt_total"] = prompt
     item["metrics_ok"] = True
-    if prefill:
-        prev_tokens = item.get("prefill_tokens")
-        prev_seen = item.get("prefill_seen_at")
-        growing = prev_seen and prefill["tokens"] > (prev_tokens or 0)
-        first_seen_active = prev_seen is None and backend.get("in_flight", 0) > 0
-        active = bool(growing or first_seen_active)
-        if prefill["progress"] >= 0.999 and backend.get("in_flight", 0) == 0:
-            active = False  # prefill 已完成且请求结束：最后一帧不再显示 prefill
-        item["prefill_tokens"] = prefill["tokens"]
-        item["prefill_progress"] = prefill["progress"]
-        item["prefill_rate"] = prefill["rate"]
-        item["prefill_elapsed"] = prefill["elapsed"]
-        item["prefill_active"] = active
-        item["prefill_seen_at"] = now
-        # llama.cpp：prefill 速率来自 slot 日志（parallel=1 时与 decode 互斥）
-        item["prompt_rate"] = float(prefill["rate"] or 0.0) if active else 0.0
-    elif item.get("prefill_active") and (now - item.get("prefill_seen_at", 0)) > 10:
-        item["prefill_active"] = False
-        item["prefill_rate"] = 0.0
-        item["prompt_rate"] = 0.0
-    elif backend.get("engine") == "llamacpp":
-        item.setdefault("prompt_rate", 0.0)
-        if not item.get("prefill_active"):
-            item["prompt_rate"] = 0.0
+    # ── counter 差分 ──
+    # iteration 计数 = 每个 step 真正计算的 token（prefill + decode），减掉同期 generation
+    # 增量就是纯预填充吞吐。prompt_tokens_total 不能用来算 p/s：它按请求一次性入账，
+    # 还把 prefix cache 命中算进去（本机累计 2.69e9 里 93% 是命中），
+    # 既看不见进行中的预填充，请求结束瞬间又虚高几个数量级。
+    prev_at, prev_step = item.get("counter_time"), item.get("counter_step")
+    prev_gen = item.get("counter_total")
+    dt = (now - prev_at) if prev_at and now > prev_at else 0.0
+    item["counter_time"], item["counter_step"], item["counter_total"] = now, step, generated
+    computed = 0.0
+    if (step is not None and prev_step is not None and dt > 0
+            and prev_gen is not None and step >= prev_step and generated >= prev_gen):
+        computed = max(0.0, (step - prev_step) - (generated - prev_gen))
+
+    # ── p/s 取源：llama.cpp 走 slot 日志（带单请求进度）；vLLM 走 step 差分，
+    #    引擎统计行只在缺 step 计数的 vLLM 上兜底（10s 窗口均值，且没有单请求进度）──
+    src = None
+    if prefill is not None and prefill.get("available"):
+        rate = float(prefill.get("rate") or 0.0)
+        src = {"rate": rate, "tokens": prefill.get("tokens"),
+               "progress": prefill.get("progress"), "elapsed": prefill.get("elapsed"),
+               "delta": None if prefill.get("absolute") else rate * dt, "gated": True}
+    elif step is not None and prev_step is not None and dt > 0:
+        src = {"rate": computed / dt, "tokens": None, "progress": None,
+               "elapsed": None, "delta": computed, "gated": False}
+    # gated：日志类来源要多一道"网关侧确有在飞请求"的佐证——vLLM 统计行是 10s 窗口
+    # 均值、slot 日志最长可能晚了 LLAMA_PREFILL_FRESH 秒，光看值会把已结束的阶段画成在进行。
+    # step 差分不受此限：它统计的就是上一个采样间隔，整段 prefill 一步算完也能抓到。
+    active = bool(src and src["rate"] >= PREFILL_MIN_RATE
+                  and (not src["gated"] or backend.get("in_flight", 0) > 0))
+    held = False
+    if (not active and src is not None and not src["gated"] and item.get("prefill_active")
+            and (item.get("prefill_tokens") or 0) >= PREFILL_HOLD_MIN_TOKENS
+            and now - item.get("prefill_measured_at", 0) < PREFILL_HOLD_SEC):
+        # 整段 prefill 一个 step 就完成时，非零值只存在一次采样：把最近一次实测值
+        # 保留 PREFILL_HOLD_SEC 秒，否则 p/s 一闪而过，监控端看着还是"没值"。
+        # 只有足够大的 prefill 才保持——几十 token 的小预填充没必要停留显示
+        active, held = True, True
+        src = dict(src, rate=item.get("prefill_rate", 0.0), delta=None,
+                   tokens=item.get("prefill_tokens"))
+    if active and not held:
+        item["prefill_measured_at"] = now
+    if active and not item.get("prefill_active"):
+        item["prefill_streak_at"], item["prefill_streak_tokens"] = now, 0.0
+    if active:
+        if src["delta"]:      # 窗口均值/step 差分：积分出这轮已处理多少 token
+            item["prefill_streak_tokens"] = (item.get("prefill_streak_tokens") or 0.0) + src["delta"]
+        tokens = src["tokens"]
+        if tokens is None:
+            tokens = item.get("prefill_streak_tokens")
+        elapsed = src["elapsed"]
+        if elapsed is None:
+            elapsed = now - item.get("prefill_streak_at", now)
+    else:
+        tokens = elapsed = None
+    item["prefill_active"] = active
+    item["prefill_rate"] = src["rate"] if active else 0.0
+    item["prompt_rate"] = src["rate"] if active else 0.0
+    item["prefill_tokens"] = tokens
+    item["prefill_progress"] = src["progress"] if active else None
+    item["prefill_elapsed"] = elapsed
+    item["prefill_seen_at"] = now
     if backend.get("engine") == "llamacpp":
         total = max(float(generated), item.get("generation_total") or 0.0)
         if item.get("live_start"):
@@ -497,45 +643,55 @@ def _apply_backend_metrics(name, backend, metrics=None, error=False):
         if not item.get("live_start"):
             item["generation_rate"] = 0.0
     else:
-        # vLLM continuous batching：prefill 与 decode 可并发，
-        # 用 prompt_tokens_total / generation_tokens_total 各自差分得到独立速率
-        last_time = item.get("counter_time")
-        last_generated = item.get("counter_total")
-        last_prompt = item.get("counter_prompt")
-        item["counter_time"] = now
-        item["counter_total"] = generated
-        item["counter_prompt"] = prompt
-        if last_generated is not None and generated >= last_generated and last_time:
-            dt = now - last_time
-            item["generation_rate"] = (generated - last_generated) / dt if dt > 0 else 0.0
+        # vLLM continuous batching：generation counter 每步都涨，差分即实时 t/s
+        item["generation_total"] = generated
+        if prev_gen is not None and generated >= prev_gen and dt > 0:
+            item["generation_rate"] = (generated - prev_gen) / dt
         else:
             item["generation_rate"] = 0.0
-        if last_prompt is not None and prompt is not None and prompt >= last_prompt and last_time:
-            dt = now - last_time
-            item["prompt_rate"] = (prompt - last_prompt) / dt if dt > 0 else 0.0
-        else:
-            item["prompt_rate"] = 0.0
-        item["generation_total"] = generated
     item["time"] = now
     return item
 
 
-async def sample_all_backend_tokens():
+async def sample_all_backend_tokens(force=False):
+    """采样各后端的吞吐与阶段。
+
+    速率是差分/窗口算出来的，两次采样挨太近只剩噪声，所以默认跳过
+    TOKEN_SAMPLE_MIN_DT 内刚采过的后端、直接回缓存：/v1/gateway/status 可以被
+    多个监控端高频轮询，后端的采样节奏不受影响。
+    """
+    now = time.time()
     alive = set(backends)
     for dead in set(token_metrics_cache) - alive:
         token_metrics_cache.pop(dead, None)
-    names = [n for n, b in backends.items() if b.get("status") in ("ready", "adopted")]
-    if not names:
-        return {}
+    live = [n for n, b in backends.items() if b.get("status") in ("ready", "adopted")]
+    names = [n for n in live
+             if force or now - (token_metrics_cache.get(n) or {}).get("time", 0) >= TOKEN_SAMPLE_MIN_DT]
 
     async def one(name):
+        b = backends.get(name)
+        if not b:
+            return name, None      # 卸载/mode 切换随时可能摘掉登记（采样集是快照）
         try:
-            metrics = await asyncio.to_thread(_fetch_backend_metrics, backends[name])
-            return name, _apply_backend_metrics(name, backends[name], metrics=metrics)
+            metrics = await asyncio.to_thread(_fetch_backend_metrics, b)
+            return name, _apply_backend_metrics(name, b, metrics=metrics)
         except Exception:
-            return name, _apply_backend_metrics(name, backends[name], error=True)
+            return name, _apply_backend_metrics(name, b, error=True)
 
-    return dict(await asyncio.gather(*(one(n) for n in names)))
+    if names:
+        await asyncio.gather(*(one(n) for n in names))
+    return {n: token_metrics_cache[n] for n in live if n in token_metrics_cache}
+
+
+async def _token_metrics_loop():
+    """后台定时采样：以前只有 status 被请求时才采一次，dt 等于客户端轮询间隔，
+    没人看监控就不推进，速率忽有忽无。改成定时采、监控端只读缓存。"""
+    while True:
+        try:
+            await sample_all_backend_tokens(force=True)
+        except Exception as e:
+            log(f"吞吐采样失败: {e}")
+        await asyncio.sleep(TOKEN_SAMPLE_INTERVAL)
 
 
 def _find_gguf(dirname, pattern=None):
@@ -622,6 +778,21 @@ def plan_llamacpp(gpus, weights_gb, max_len, gw=None):
             n -= 1
 
     cache_type = gw.get("kv_quant")  # 如 "q8_0"；默认 None = FP16，不自动量化
+
+    # 多卡 llama.cpp：按层跨卡拆分（84GB 权重摊到 2×48GB 这类"整池放得下、
+    # 单卡放不下"的场景）。比例默认按各卡总显存推导；gw.tensor_split 可显式
+    # 覆盖（menu 的共存模式会写 "0.948,0.052" 这类权重），"none" 表示禁用拆分。
+    split_mode = gw.get("split_mode")
+    tensor_split = gw.get("tensor_split")
+    if len(gpus) > 1:
+        if split_mode in (None, ""):
+            split_mode = "layer"
+        if split_mode != "none" and tensor_split in (None, "", "auto"):
+            per = [max(1, round(free[g]["total"] / 1024.0)) for g in gpus if g in free]
+            tensor_split = ",".join(str(x) for x in per) if per else None
+    else:
+        split_mode = tensor_split = None
+
     return {
         "parallel": n,
         "ctx_size": int(max_len),
@@ -630,6 +801,8 @@ def plan_llamacpp(gpus, weights_gb, max_len, gw=None):
         "weights_gb": round(float(weights_gb), 2),
         "total_gb": round(total_gb, 2),
         "cache_type": cache_type,
+        "split_mode": split_mode,
+        "tensor_split": tensor_split,
         "tight": kv_budget_gb < slot_kv_gb,
     }
 
@@ -668,7 +841,7 @@ def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env
     if engine == "llamacpp":
         # llama.cpp 不做多副本：单容器吃整组卡，cname 忽略
         _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args, kwargs,
-                      plan=plan)
+                      plan=plan, env=env)
         return
     tp = len(gpus)
     cmd = [f"/models/{dirname}", "--served-model-name", name,
@@ -716,13 +889,14 @@ def _find_mmproj(dirname):
 
 
 def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=None,
-                  kwargs=None, plan=None):
+                  kwargs=None, plan=None, env=None):
     """启动 llama.cpp 后端（llama-server，OpenAI 兼容）。GGUF 多分片只传第一个文件，
     llama.cpp 按命名约定自动续载其余分片。flag 以 2026 版 llama-server --help 实测为准：
     -ngl 默认 auto（按显存自动分层）；工具调用由默认启用的 Jinja 聊天解析自动提取；
     思考模型用 --reasoning-format deepseek 把思考放进 message.reasoning_content；
     YaRN 扩上下文（如 --rope-scaling yarn --rope-scale 4.0）经 extra_args 透传。
-    --parallel / KV 量化由 plan（plan_llamacpp 按硬件自动规划）决定。"""
+    --parallel / KV 量化 / 多卡 --split-mode+--tensor-split 由 plan（plan_llamacpp
+    按硬件自动规划）决定：一组卡且权重单卡放不下时按层跨卡摊分。"""
     gguf = _find_gguf(dirname, gguf_include)
     plan = plan or {"parallel": 1, "ctx_size": int(max_len), "per_slot_ctx": int(max_len),
                     "cache_type": None, "kv_budget_gb": None, "weights_gb": None,
@@ -736,6 +910,13 @@ def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=
         # KV cache 量化（默认不开；models.json gw.kv_quant 显式指定才加）
         cmd += ["--cache-type-k", str(plan["cache_type"]),
                 "--cache-type-v", str(plan["cache_type"])]
+    # 多卡分层：由 plan 拼 --split-mode/--tensor-split（单卡时 plan 里就是 None）。
+    # extra_args 里已手传同名 flag 时以手传为准，不重复注入。
+    _ea = [str(a) for a in (extra_args or [])]
+    if plan.get("split_mode") and not any(a.startswith("--split-mode") for a in _ea):
+        cmd += ["--split-mode", str(plan["split_mode"])]
+        if plan.get("tensor_split") and not any(a.startswith("--tensor-split") for a in _ea):
+            cmd += ["--tensor-split", str(plan["tensor_split"])]
     if think:
         # 思考模型：正文与推理分开返回（非思考模型不需要，强制反而可能吞正文）
         cmd += ["--reasoning-format", "deepseek"]
@@ -752,6 +933,7 @@ def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=
         + (f" 显存={plan.get('total_gb')}GB 权重={plan.get('weights_gb')}GB"
            f" KV预算={plan.get('kv_budget_gb')}GB" if plan.get("total_gb") else "")
         + (f" KV量化={plan['cache_type']}" if plan.get("cache_type") else "")
+        + (f" 分层={plan['split_mode']}:{plan['tensor_split']}" if plan.get("split_mode") else "")
         + (f" extra_args={extra_args}" if extra_args else ""))
     if plan.get("tight") and plan["parallel"] <= 1 and not plan.get("cache_type"):
         log(f"{name}: KV 预算紧张仅够单 slot；如需更高并发，可在 models.json 的 "
@@ -766,7 +948,7 @@ def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=
         device_requests=[docker.types.DeviceRequest(
             device_ids=[str(g) for g in gpus], capabilities=[["gpu"]])],
         network=NETWORK, shm_size="16g",
-        environment={},
+        environment=dict(env or {}),
         healthcheck=hc,
         volumes={f"{HOST_ROOT}/models/llm": {"bind": "/models", "mode": "rw"}},
         **kwargs)
@@ -886,7 +1068,7 @@ def clamp_max_tokens(name, man, body):
     return json.dumps(payload).encode()
 
 
-async def ensure_loaded(name, man, want_gpus=None, op=None):
+async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
     b = backends.get(name)
     if b and b["status"] == "ready":
         return b
@@ -941,6 +1123,13 @@ async def ensure_loaded(name, man, want_gpus=None, op=None):
                 fb = sorted(free)[-1]
                 log(f"{name}: 配置的 GPU{gpus[0]} 不存在，改用 GPU{fb}")
                 gpus = [fb]
+            elif engine == "llamacpp" and free:
+                # llama.cpp 按层拆分与"哪几张卡"无关：配置的卡有缺失时改用本机全部卡，
+                # 显存够不够由下面放置预算把关（vLLM 的 TP 语义不同，保持严格报错）
+                fb = sorted(free)
+                log(f"{name}: 配置的 GPU{gpus} 与本机 {fb} 不符，"
+                    f"llama.cpp 跨卡分层改用全部卡 {fb}")
+                gpus = fb
             else:
                 raise RuntimeError(
                     f"{name} 需要 GPU {gpus}，但本机只有 {sorted(free)}")
@@ -1034,7 +1223,9 @@ async def ensure_loaded(name, man, want_gpus=None, op=None):
         # 多副本：放置定了才切副本组——每组一个容器，请求按在途数分流。
         # replicas 缺省/为 1 时 groups 就是 [gpus]，容器名无后缀，与旧行为完全一致。
         # llama.cpp 不支持多副本（单容器吃整组卡，起两个会同名互删），整组交给一个容器。
-        replicas = int(gw.get("replicas", 1))
+        # want_replicas：客户端 mode/replicas 的运行时覆盖；缺省沿用 gw 落盘值。
+        # 网关对 models.json 是只读挂载，覆盖只影响本次拉起，持久化归宿主 menu.py。
+        replicas = int(want_replicas if want_replicas else gw.get("replicas", 1))
         groups = _replica_groups(gpus, replicas) if engine != "llamacpp" else [list(gpus)]
         cnodes = ([cname] if len(groups) == 1
                   else [f"{cname}-r{i}" for i in range(len(groups))])
@@ -1114,9 +1305,11 @@ async def ensure_loaded(name, man, want_gpus=None, op=None):
 @asynccontextmanager
 async def lifespan(app):
     adopt_existing()
+    sampler = asyncio.create_task(_token_metrics_loop())
     for m in PRELOAD:
         asyncio.create_task(_preload(m))
     yield
+    sampler.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -1363,12 +1556,15 @@ async def gateway_switch(request: Request):
     return result
 
 
-async def _run_load(op, model, man, want_gpus):
+async def _run_load(op, model, man, want_gpus, want_replicas=None):
     """执行一次加载并把状态写回 op（同步可等/异步后台共用）。"""
     _op_update(op, status="running", stage="loading",
-               detail=f"准备加载 {model}", target_gpus=want_gpus)
+               detail=f"准备加载 {model}"
+                      + (f"（副本×{want_replicas}）" if want_replicas else ""),
+               target_gpus=want_gpus)
     try:
-        b = await ensure_loaded(model, man, want_gpus=want_gpus, op=op)
+        b = await ensure_loaded(model, man, want_gpus=want_gpus, op=op,
+                                want_replicas=want_replicas)
         _op_update(op, status="success", stage="ready",
                    detail=f"{model} 就绪 on GPU {sorted(b['gpus'])}",
                    target_gpus=b["gpus"])
@@ -1443,7 +1639,7 @@ async def gateway_capabilities():
     gpus = await _gpu_discovery()
     return {
         "name": "ai-gateway",
-        "version": "2.0",
+        "version": "2.1",
         "description": "局域网 AI 模型网关：OpenAI / Anthropic / Responses 兼容推理 + 按 GPU 协商加载。",
         "protocol": "gateway-negotiation-v1",
         "capabilities": {
@@ -1453,6 +1649,8 @@ async def gateway_capabilities():
             "load_status_polling": True,
             "per_model_unload": True,
             "video_switch": True,
+            "layout_modes": True,        # GET /v1/gateway/modes + load 的 mode/replicas
+            "runtime_replica_override": True,
             "api_styles": ["openai-chat", "anthropic-messages", "openai-responses"],
         },
         "endpoints": [
@@ -1460,8 +1658,12 @@ async def gateway_capabilities():
              "purpose": "本说明接口：网关能力、协商协议、GPU 拓扑与模型目录"},
             {"method": "GET", "path": "/v1/gateway/gpus",
              "purpose": "GPU 发现：数量、每卡容量/占用/利用率、谁占用了卡"},
+            {"method": "GET", "path": "/v1/gateway/modes",
+             "purpose": "布局模式目录：各模型现行摆放/可切布局（dual/tp/replica/pool/auto）、"
+                        "ctx 估算与宿主持久化命令；?model= 查单个"},
             {"method": "POST", "path": "/v1/gateway/load",
-             "purpose": "加载模型到指定 GPU；wait=false 异步返回 request_id 供轮询"},
+             "purpose": "加载模型到指定 GPU 或按 mode 切布局（布局不符会先卸后装；"
+                        "正忙 409）；wait=false 异步返回 request_id 供轮询"},
             {"method": "GET", "path": "/v1/gateway/ops/{request_id}",
              "purpose": "查询加载/切换/卸载操作状态（轮询直到 status=success/failed）"},
             {"method": "GET", "path": "/v1/gateway/ops",
@@ -1488,6 +1690,9 @@ async def gateway_capabilities():
             "inference": "模型 ready 后正常调 /v1/chat/completions（GPU 已固化在该模型后端）",
             "async_on_demand": "推理请求带 header X-Gateway-Load-Async:1（可选 X-Gateway-GPUs:0）→ 202 + request_id，轮询后再发",
             "switch": "POST /v1/gateway/switch {'target':'video'|'llm','wait':false} 异步切换显存归属",
+            "layout_modes": "GET /v1/gateway/modes 查本机布局目录 → "
+                            "POST /v1/gateway/load {'model':...,'mode':'tp'|'replica'|'dual'|'auto'} "
+                            "当场切摆放（max_len 增益需先跑目录里的 host_command 落 gw，网关不写配置）",
         },
         "gpus": gpus,
         "models": models,
@@ -1496,8 +1701,182 @@ async def gateway_capabilities():
             "load 的 gpus 为硬性指定：指定卡放不下时返回 503 并说明各卡可用量，不做静默改道",
             "显存不足时网关会先卸载空闲模型让位（in_flight==0 的最久未用；正忙的绝不驱逐）",
             "后端状态取值：unloaded / adopted / loading / ready；op.status：queued/running/success/failed",
+            "布局模式边界：网关对 models.json 只读——摆放（哪几张卡/几副本/TP）当场执行，"
+            "ctx 持久化（gw.max_len/gw.replicas 落盘）必须宿主 menu.py；"
+            "modes 目录同时给 enforced_max_len（现在切过去的实际值）与 est_ctx_ceiling（持久化后的上限）",
         ],
     }
+
+
+# ---------- 布局模式（gateway-layout-v1） ----------
+# 与 models.json 的只读挂载死死对齐：网关能当场执行"纯摆放"（哪几张卡、几个副本、
+# TP=每引擎卡数——拉起参数全在运行时），绝不写回配置；凡涉及把 max_len/gpus 持久化
+# 的新布局，返回 host_command 指路宿主侧 menu.py——权威 ctx 值永远出自本机实算，
+# 网关报的是同一公式的估算值（menu.py 与这里各写一份公式才是真隐患，估算仅供选型）。
+
+def _weights_gb(d, dirname):
+    """实际加载目录的权重体量近似值（GB），仅用于目录 ctx 估算。"""
+    v = d.get("variants") or {}
+    if not v:
+        return 0.0
+    if dirname and dirname.endswith("-fp8") and "fp8" in v:
+        return float(v["fp8"])
+    if "bf16" in v:
+        return float(v["bf16"])
+    return float(min(v.values()))
+
+
+def _yarn_cap(d, gw):
+    """YaRN 扩展上限：从 gw.extra_args 的 rope_parameters JSON 解析 factor ×
+    original_max_position_embeddings，与原生 max_ctx 取大者。与宿主侧
+    check_llm_config.yarn_override_limit 同一规则。"""
+    cap = int(d.get("max_ctx") or d.get("ctx_default") or 32768)
+    for a in gw.get("extra_args") or []:
+        s = str(a)
+        m = re.search(r'"factor":\s*([\d.]+)', s)
+        o = re.search(r'"original_max_position_embeddings":\s*(\d+)', s)
+        if m and o:
+            try:
+                cap = max(cap, int(int(o.group(1)) * float(m.group(1))))
+            except ValueError:
+                pass
+    return cap
+
+
+def _ctx_est(d, gw, weights_gb, gmem_gb, cards):
+    """vLLM 单请求 ctx 估算（与 menu.py 的 vllm_ctx 同式）：KV 预算 × 实测密度，
+    封顶 YaRN/原生。weights_gb 为 0（未下载/未声明）时退回 gw.max_len。"""
+    if not weights_gb:
+        return int(gw.get("max_len", 0) or 0)
+    density = int(d.get("kv_tokens_per_gb") or 15300)
+    total = gmem_gb * float(gw.get("util", 0.92)) * cards
+    kv = max(0.0, total - weights_gb - 4)
+    est = int(kv * density)
+    if d.get("kv_tokens_per_gb"):
+        est = int(est * 0.98)   # 与 menu.py vllm_ctx 同口径：实测密度没含 CUDA-graph 预留
+    return max(32768, min(_yarn_cap(d, gw), est))
+
+
+def _active_layout(name, d):
+    """当前布局：优先运行中后端，退回 gw 落盘值。"""
+    gw = d.get("gw", {})
+    b = backends.get(name)
+    if b and b["status"] in ("ready", "adopted", "loading"):
+        gpus = sorted(b["gpus"])
+        reps = int(b.get("replicas") or 1)
+        src = "backend"
+    else:
+        gpus = sorted(int(x) for x in gw.get("gpus", "1").split(","))
+        reps = int(gw.get("replicas") or 1)
+        src = "manifest"
+    return {"gpus": gpus, "replicas": reps,
+            "tp": max(1, round(len(gpus) / reps)), "source": src}
+
+
+def _mode_catalog(name, d):
+    """某模型在本机可用的布局模式目录（advisory + 可执行参数）。
+
+    enforced_max_len 是"现在走 load 切过去，实际会按哪个值起后端"——网关永远读
+    gw.max_len；est_ctx_ceiling 是该摆放全兑现后 menu.py 会落的权威值。
+    两者不等时 ctx_gain_requires_host=true：先跑宿主命令改写 gw，再 load 才有增益。"""
+    gw = d.get("gw", {})
+    engine = d.get("engine", "vllm")
+    info = gpu_info()
+    n = len(info)
+    if not n:
+        return {"engine": engine, "error": "nvidia-smi 无输出", "modes": []}
+    gmem = round(min(x["total_mb"] for x in info.values()) / 1024)
+    dirname = model_dir(name, d) or ""
+    wgb = _weights_gb(d, dirname)
+    max_len_gw = int(gw.get("max_len", d.get("max_ctx", d.get("ctx_default", 32768))))
+    all_cards = sorted(info)
+    act = _active_layout(name, d)
+    min_gpus = int(d.get("min_gpus", 1))
+    modes = []
+
+    def add(mid, label, gpus, replicas, note, host_cmd=None, runnable=True,
+            ceiling=None, video=False):
+        cards = len(gpus) if gpus else 0
+        modes.append({
+            "id": mid, "label": label, "gpus": gpus, "replicas": replicas,
+            "tp": (max(1, round(cards / replicas))
+                   if engine == "vllm" and replicas else None),
+            "video_coexist": video,
+            "enforced_max_len": max_len_gw,
+            "est_ctx_ceiling": ceiling or max_len_gw,
+            "ctx_gain_requires_host": bool(ceiling and ceiling > max_len_gw),
+            "runnable_via_load": runnable,
+            "active": (gpus == act["gpus"] and replicas == act["replicas"]),
+            "note": note, "host_command": host_cmd})
+
+    if engine == "llamacpp":
+        add("pool", f"独占 {n} 卡跨卡分层（llama.cpp）", all_cards, 1,
+            f"GGUF 按层摊到全部卡（ctx 按 gw.max_len={max_len_gw} 已含 YaRN 配置）；视频让位",
+            ceiling=max_len_gw)
+    elif min_gpus > n:
+        add("tp", f"需 {min_gpus} 卡，本机仅 {n} 卡", all_cards, 1,
+            "卡数不足，任何摆放都起不来；先释放/换机", runnable=False)
+    elif min_gpus >= 2:
+        add("tp", f"原生 {n} 卡 TP（旗舰摆放）", all_cards, 1,
+            "min_gpus≥2 的模型只有整池 TP 一种形态；视频让位",
+            ceiling=_ctx_est(d, gw, wgb, gmem, n))
+    else:
+        # dual 的基准卡优先取 gw 的单卡配置（宿主 menu.py 落的意图，如 111 的 GPU1
+        # =LLM 位、GPU0=视频位）；gw 卡号在本机不存在（单卡机继承蓝本残留）才退回
+        # 运行态或首卡——正在跑多副本时 act["gpus"] 是整池，不能拿来定单卡基准。
+        gw_single = [int(x) for x in gw.get("gpus", "").split(",")
+                     if x.strip().lstrip("-").isdigit()]
+        gw_single = [g for g in gw_single if g in info]
+        if len(gw_single) == 1:
+            single_card = [gw_single[0]]
+        elif len(act["gpus"]) == 1 and act["gpus"][0] in info:
+            single_card = list(act["gpus"])
+        else:
+            single_card = [all_cards[0]]
+        add("dual", "单卡 LLM，其余卡给视频/第二模型（默认）", single_card, 1,
+            f"ctx={max_len_gw}（按单卡 KV 预算落的权威值）；可与 ComfyUI 真并行",
+            ceiling=_ctx_est(d, gw, wgb, gmem, 1), video=True)
+        if n >= 2 and engine == "vllm":
+            tp_c = _ctx_est(d, gw, wgb, gmem, n)
+            add("tp", f"{n} 卡单引擎 TP（整池换单请求上下文）", all_cards, 1,
+                f"解码速度不涨（无 NVLink 时 all-reduce 净亏）；视频让位。"
+                f"ctx 上限 {tp_c}：先跑 host_command 落 gw.max_len，再 load 才吃到",
+                host_cmd=f"./scripts/start.sh --llm {name} --tp {n} -y",
+                ceiling=tp_c)
+            add("replica", f"每卡一份副本（聚合吞吐≈×{n}）", all_cards, n,
+                f"每副本一卡一引擎，零 TP 通信；每流 ctx 仍 {max_len_gw}；视频让位。"
+                "持久副本数走 host_command 写 gw.replicas",
+                host_cmd=f"./scripts/start.sh --llm {name} --replicas {n} -y",
+                ceiling=_ctx_est(d, gw, wgb, gmem, 1))
+    add("auto", "按 models.json gw 缺省摆放（清除覆盖）", None, None,
+        "不带任何摆放覆盖的加载：完全沿用 gw.gpus/replicas/max_len",
+        runnable=True)
+    return {"engine": engine, "weights_gb": wgb,
+            "cards": {"count": n, "gmem_gb": gmem, "pool_gb": int(gmem * n * 0.92)},
+            "active": act, "enforced_max_len": max_len_gw, "modes": modes}
+
+
+@app.get("/v1/gateway/modes")
+async def gateway_modes(model: str = ""):
+    """布局模式目录（gateway-layout-v1）：各模型的现行摆放、可切布局、ctx 估算与
+    宿主侧持久化命令。带 ?model=<名> 只查一个模型。
+
+    选型建议按"你要什么"读：吞吐→replica；单请求超长→tp（先跑 host_command）；
+    并行跑视频→dual；旗舰质量长上下文→pool 型 GGUF。所有摆放冲突（busy/显存不足）
+    最终由 POST /v1/gateway/load 的同一套校验兜底，目录不做乐观承诺。"""
+    man = await asyncio.to_thread(load_manifest)
+    names = [model] if model else list(man)
+    out = {}
+    for nm in names:
+        if nm not in man:
+            return JSONResponse({"error": {"message": f"模型 '{nm}' 不存在",
+                                           "type": "invalid_model_error"}}, status_code=404)
+        if not await asyncio.to_thread(model_dir, nm):
+            continue
+        out[nm] = await asyncio.to_thread(_mode_catalog, nm, man[nm])
+    return {"protocol": "gateway-layout-v1",
+            "boundary": "网关对 models.json 只读：摆放当场执行，max_len/replicas 持久化走 host_command",
+            "models": out}
 
 
 @app.post("/v1/gateway/load")
@@ -1507,6 +1886,9 @@ async def gateway_load(request: Request):
     body:
       model: 模型名（models.json 中的 key）
       gpus:  [0] 或 [0,1]；可选，缺省按 models.json gw.gpus 自动放置（可能回落其它空闲卡）
+      mode:  可选布局模式（dual/tp/replica/pool/auto），gpus+replicas 的语义糖，
+             本机可用值见 GET /v1/gateway/modes?model=…；显式 gpus/replicas 优先于 mode
+      replicas: 可选副本数（每副本至少一卡），运行时覆盖 gw.replicas，不落盘
       wait:  true（默认）= 同步等待就绪后返回最终状态；
              false = 立即 202 返回 request_id，客户端轮询 GET /v1/gateway/ops/{request_id}
     说明：
@@ -1533,6 +1915,25 @@ async def gateway_load(request: Request):
         return JSONResponse({"error": {"message": f"模型 '{model}' 未下载",
                                        "type": "invalid_model_error"}}, status_code=404)
 
+    # 布局模式糖：mode 解析成 (gpus, replicas)，显式参数优先；auto = 不带覆盖
+    mode = (body.get("mode") or "").strip().lower()
+    want_replicas = body.get("replicas")
+    if mode and mode != "auto":
+        cat = await asyncio.to_thread(_mode_catalog, model, man[model])
+        hit = next((m for m in cat["modes"] if m["id"] == mode), None)
+        if hit is None:
+            return JSONResponse({"error": {"message":
+                f"{model} 本机没有模式 '{mode}'，可用: "
+                + " / ".join(m["id"] for m in cat["modes"]),
+                "type": "invalid_request_error"}}, status_code=400)
+        if not hit["runnable_via_load"]:
+            return JSONResponse({"error": {"message":
+                f"模式 {mode} 当前不可执行：{hit['note']}", "type": "mode_unavailable"},
+                "mode": hit}, status_code=409)
+        if body.get("gpus") is None and hit["gpus"] is not None:
+            body["gpus"] = hit["gpus"]
+        if want_replicas is None:
+            want_replicas = hit["replicas"]
     gpus = body.get("gpus")
     if gpus is not None:
         if (not isinstance(gpus, list) or not gpus
@@ -1553,24 +1954,62 @@ async def gateway_load(request: Request):
             return JSONResponse({"error": {"message":
                 f"请求的 GPU {missing} 不存在，本机只有 {sorted(free)}",
                 "type": "invalid_request_error"}}, status_code=400)
+    if want_replicas is not None and (not isinstance(want_replicas, int)
+                                      or want_replicas < 1):
+        return JSONResponse({"error": {"message": "replicas 必须是正整数",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    if want_replicas and gpus and want_replicas > len(gpus):
+        return JSONResponse({"error": {"message":
+            f"replicas={want_replicas} 超过指定卡数 {gpus}（每副本至少一卡）",
+            "type": "invalid_request_error"}}, status_code=400)
     wait = body.get("wait", True)
 
-    # 已加载：直接返回当前状态（幂等）
+    # 已加载且布局一致：直接返回当前状态（幂等）。布局不一致（gpus/replicas/mode
+    # 要求了别的摆放）：先卸旧后端再起新布局——"切模式"要当场生效，不是"确保已加载"。
+    # loading 不抢切：容器正被 create 中，摘登记只会留下没人收的孤儿，让终态收敛后再切。
     b = backends.get(model)
-    if b and b["status"] == "ready":
-        op = _new_op("load", model)
-        _op_update(op, status="success", stage="ready",
-                   detail=f"{model} 已就绪 on GPU {sorted(b['gpus'])}",
-                   target_gpus=b["gpus"])
-        return JSONResponse(await _op_response(op), status_code=200)
+    if b:
+        want_r = want_replicas or int(man[model].get("gw", {}).get("replicas") or 1)
+        same = (gpus is None or sorted(b["gpus"]) == sorted(gpus)) \
+            and int(b.get("replicas") or 1) == want_r
+        if b["status"] == "ready" and same:
+            op = _new_op("load", model)
+            _op_update(op, status="success", stage="ready",
+                       detail=f"{model} 已就绪 on GPU {sorted(b['gpus'])}",
+                       target_gpus=b["gpus"])
+            return JSONResponse(await _op_response(op), status_code=200)
+        if mode or gpus is not None or want_replicas:
+            if b["status"] == "loading":
+                return JSONResponse({"error": {"message":
+                    f"{model} 正在加载（旧布局），拒绝插队改摆放；等其就绪或失败后再切",
+                    "type": "busy_error"}}, status_code=409)
+            if b["in_flight"] > 0:
+                return JSONResponse({"error": {"message":
+                    f"{model} 正在处理请求（{b['in_flight']} 个在途），改摆放需先等其完成",
+                    "type": "busy_error"}}, status_code=409)
+            prev_free = {g: x.get("free", 0)
+                         for g, x in (await asyncio.to_thread(gpu_free)).items()
+                         if g in b["gpus"]}
+            await asyncio.to_thread(_remove_backend_containers, b)
+            backends.pop(model, None)
+            log(f"{model}: 布局切换（{mode or (str(gpus) + f' x{want_r}')}），旧后端已卸载")
+            # 强删的显存释放有数秒延迟；同卡立刻起新后端会把显存算少、CUDA graph 预算
+            # 挤爆（本机实测：adopted 后端被删后立刻 replica×2，两副本双双起不来）。
+            # 轮询旧卡的 free 回还到删除前水平，最多 15s。
+            for _ in range(30):
+                f2 = await asyncio.to_thread(gpu_free)
+                if all(f2.get(g, {}).get("free", 0) >= fr - 256
+                       for g, fr in prev_free.items()):
+                    break
+                await asyncio.sleep(0.5)
 
     op = _new_op("load", model)
     if wait is False:
-        asyncio.create_task(_run_load(op, model, man, gpus))
+        asyncio.create_task(_run_load(op, model, man, gpus, want_replicas))
         return JSONResponse({"status": "accepted", "model": model,
                              "op": await _op_response(op)}, status_code=202)
 
-    await _run_load(op, model, man, gpus)
+    await _run_load(op, model, man, gpus, want_replicas)
     if op["status"] == "success":
         return JSONResponse(await _op_response(op), status_code=200)
     code = 503 if op.get("error_type") == "insufficient_resources" else 502
@@ -1665,10 +2104,23 @@ async def proxy(name, request: Request):
                     return JSONResponse({"error": {"message":
                         f"X-Gateway-GPUs 非法: '{hg}'（应为逗号分隔的 GPU 序号，如 0 或 0,1）",
                         "type": "invalid_request_error"}}, status_code=400)
+            want_replicas = None
+            hm = request.headers.get("x-gateway-mode", "").strip().lower()
+            if hm and hm != "auto":
+                cat = await asyncio.to_thread(_mode_catalog, name, man[name])
+                hit = next((m for m in cat["modes"] if m["id"] == hm), None)
+                if hit is None or not hit["runnable_via_load"]:
+                    return JSONResponse({"error": {"message":
+                        f"X-Gateway-Mode '{hm}' 不可用，可选: "
+                        + " / ".join(m["id"] for m in cat["modes"] if m["runnable_via_load"]),
+                        "type": "invalid_request_error"}}, status_code=400)
+                if want_gpus is None and hit["gpus"] is not None:
+                    want_gpus = hit["gpus"]
+                want_replicas = hit["replicas"]
             op = _new_op("load", name)
             _op_update(op, status="running", stage="loading",
                        detail=f"异步加载 {name}", target_gpus=want_gpus)
-            asyncio.create_task(_run_load(op, name, man, want_gpus))
+            asyncio.create_task(_run_load(op, name, man, want_gpus, want_replicas))
             return JSONResponse({"status": "accepted", "model": name,
                                  "message": f"{name} 正在异步加载，轮询 "
                                             "GET /v1/gateway/ops/{request_id} 直到 "

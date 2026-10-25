@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sysmonitor · AI 工作站实时看板</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>📈</text></svg>">
+</head>
+<body>
+
+<header id="topbar">
+  <div class="brand"><span class="logo">◎</span> SYSMON
+    <span class="host" id="host"></span>
+  </div>
+  <div class="tb-agg" id="agg"></div>
+  <div class="tb-right">
+    <span id="gw" class="gw"><i class="dot"></i>网关</span>
+    <span id="clock" class="clock dim"></span>
+    <label class="dim">主题 <select id="themeSel"></select></label>
+    <label class="dim">刷新 <select id="intSel">
+      <option value="1000" selected>1s</option><option value="2000">2s</option>
+      <option value="500">0.5s</option><option value="4000">4s</option>
+    </select></label>
+    <button id="pauseBtn" title="Space">⏸ 暂停</button>
+  </div>
+</header>
+
+<main>
+  <section id="gpuGrid" class="gpu-grid"></section>
+
+  <section class="card wide" id="llmCard">
+    <h2>LLM 模型吞吐 <span class="sub dim">t/s=生成速率 · p/s=Prompt 处理速率 · 与 CLI 面板同字段</span></h2>
+    <div id="llmBody"></div>
+  </section>
+
+  <div class="row3">
+    <section class="card" id="cpuCard">
+      <h2>CPU <span class="sub dim" id="cpuMeta"></span></h2>
+      <div class="gauge" id="cpuTotal"></div>
+      <div id="cores" class="cores"></div>
+      <div class="dim small" id="coresLabel"></div>
+    </section>
+
+    <section class="card" id="sysCard">
+      <h2>系统</h2>
+      <div id="sysBody"></div>
+    </section>
+
+    <section class="card" id="netCard">
+      <h2>网络 <span class="sub dim">↓入 ↑出 · 满格=带宽</span></h2>
+      <div id="netBody"></div>
+    </section>
+  </div>
+
+  <div class="row2">
+    <section class="card" id="dioCard">
+      <h2>磁盘 I/O <span class="sub dim">util=盘繁忙度</span></h2>
+      <div id="dioBody"></div>
+    </section>
+    <section class="card" id="llmnoteCard">
+      <h2>读数说明</h2>
+      <div class="legend dim small">
+        <div><i class="sw ok"></i>绿 &lt;60% · <i class="sw warn"></i>黄 60–85% · <i class="sw crit"></i>红 ≥85%（压力分级：算力/带宽/CPU/交换/磁盘/网速/盘util）</div>
+        <div><i class="sw mem"></i>青蓝 = 容量占用（显存/内存）——模型常驻显存是"占"不是"忙"</div>
+        <div>▰▱ 仪表与 CLI 完全同语义；条带光泽扫掠 = 当前值动效（暂停时冻结）</div>
+        <div>Σprompt / Σgen = 模型加载以来累计（换模型/重启清零）；空闲 = 距上次活动时长</div>
+      </div>
+    </section>
+  </div>
+
+  <section class="card wide" id="procCard">
+    <h2>进程
+      <span class="sortbtns">
+        <button data-sort="vram" class="on">显存</button>
+        <button data-sort="cpu">%CPU</button>
+        <button data-sort="pmem">%MEM</button>
+      </span>
+      <span class="sub dim" id="procMeta"></span>
+    </h2>
+    <table id="procTable">
+      <thead><tr>
+        <th>GPU</th><th>PID</th><th>USER</th><th>%CPU</th><th>%MEM</th>
+        <th>RSS</th><th>VRAM</th><th class="wbar">占用</th><th>模型 / 命令行</th>
+      </tr></thead>
+      <tbody id="procBody"></tbody>
+    </table>
+  </section>
+</main>
+
+<footer id="statusbar">
+  <span>Space 暂停 · P 进程排序 · T 切主题（与 CLI 同键位）</span>
+  <span id="refreshInfo"></span>
+  <span id="errInfo" class="crit"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
