@@ -127,12 +127,15 @@ def llm_downloaded(name):
 
 
 def comfy_downloaded(entry):
+    """口径与 menu.py video_downloaded / manage.sh vhas 三处同源（改动须同批）：
+    模式取 basename（common 段 includes 带 repo 路径，落盘是裸文件名）+
+    大小写不敏感（官方文件有 InfiniTetalk 这类大小写笔误，敏感匹配会漏判）。"""
     d = os.path.join(ROOT, "models/comfy", entry.get("dest", ""))
     if not os.path.isdir(d):
         return False
-    files = os.listdir(d)
-    return all(any(fnmatch.fnmatch(f, p) for f in files)
-               for p in (entry.get("includes") or ["*"]))
+    files = [f.lower() for f in os.listdir(d)]
+    pats = [os.path.basename(p).lower() for p in (entry.get("includes") or ["*"])]
+    return all(any(fnmatch.fnmatch(f, p) for f in files) for p in pats)
 
 
 def image_downloaded(entry):

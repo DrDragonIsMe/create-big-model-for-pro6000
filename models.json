@@ -179,7 +179,8 @@
     "wan2.2-i2v": {
       "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
       "includes": [
-        "*i2v*"
+        "*i2v_high_noise*",
+        "*i2v_low_noise*"
       ],
       "dest": "diffusion_models",
       "vram_480p_fp8": 32,
@@ -189,7 +190,7 @@
     "wan2.2-s2v": {
       "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
       "includes": [
-        "*s2v*"
+        "*s2v_14B*"
       ],
       "dest": "diffusion_models",
       "fallback_repo": "Wan-AI/Wan2.2-S2V-14B",
@@ -200,7 +201,7 @@
     "infinitetalk": {
       "repo": "Kijai/WanVideo_comfy",
       "includes": [
-        "*InfiniteTalk*"
+        "*Infini*alk*"
       ],
       "dest": "diffusion_models",
       "extra": {
@@ -241,8 +242,7 @@
     "ltx-2": {
       "repo": "Lightricks/LTX-Video",
       "includes": [
-        "*ltx-2*",
-        "*LTX-2*"
+        "*ltx-2*"
       ],
       "dest": "checkpoints",
       "license": true,

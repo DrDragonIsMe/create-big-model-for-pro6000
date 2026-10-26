@@ -26,10 +26,13 @@ import fnmatch, json, os
 man = json.load(open("models.json"))
 def has(d): return os.path.isdir(d) and bool(os.listdir(d))
 def vhas(d):
+    # 口径与 menu.py video_downloaded / console agent comfy_downloaded 三处同源：
+    # 模式取 basename（common 段 includes 带 repo 路径）+ 大小写不敏感（官方文件名有大小写笔误）
     p = f"models/comfy/{d['dest']}"
     if not os.path.isdir(p): return False
-    files = os.listdir(p)
-    return all(any(fnmatch.fnmatch(f, pat) for f in files) for pat in (d.get("includes") or ["*"]))
+    files = [f.lower() for f in os.listdir(p)]
+    pats = [os.path.basename(pat).lower() for pat in (d.get("includes") or ["*"])]
+    return all(any(fnmatch.fnmatch(f, pat) for f in files) for pat in pats)
 print("== LLM ==")
 for n, d in man["llm"].items():
     vs = "/".join(f"{v}:{g}GB" for v, g in d["variants"].items())

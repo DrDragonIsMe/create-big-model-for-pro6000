@@ -23,14 +23,18 @@ def llm_downloaded(name):
 def video_downloaded(name, man):
     """按 includes 模式逐条命中才算已下载：多个视频共用 diffusion_models 目录，
     只看"目录非空"会让任何一个在位就把全家标成★，ensure_assets 跟着跳过下载，
-    ComfyUI 起来后才发现缺的是另一个模型的权重。"""
+    ComfyUI 起来后才发现缺的是另一个模型的权重。
+    匹配口径（与 manage.sh vhas / console agent comfy_downloaded 三处同源，改动须同批）：
+    • 模式取 basename：common 段的 includes 带 repo 路径（split_files/vae/*），
+      而 dest 目录里落的是裸文件名，整串比对永远命不中；
+    • 大小写不敏感：官方文件名有 InfiniTetalk 这类大小写笔误，Linux fnmatch 敏感会漏判。"""
     vd = man["video"][name]
     p = os.path.join("models/comfy", vd["dest"])
     if not os.path.isdir(p):
         return False
-    files = os.listdir(p)
-    return all(any(fnmatch.fnmatch(f, pat) for f in files)
-               for pat in (vd.get("includes") or ["*"]))
+    files = [f.lower() for f in os.listdir(p)]
+    pats = [os.path.basename(pat).lower() for pat in (vd.get("includes") or ["*"])]
+    return all(any(fnmatch.fnmatch(f, pat) for f in files) for pat in pats)
 
 def image_downloaded(name, man):
     """image 段的 dest 是 {comfy子目录: 文件名} 映射：全部文件在位才算已下载。"""
