@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI 算力集群控制台</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
 <header>
@@ -27,6 +27,7 @@
         <button data-tab="ov" class="tab on">概览</button>
         <button data-tab="cat" class="tab">模型库</button>
         <button data-tab="lay" class="tab">布局切换</button>
+        <button data-tab="combo" class="tab">可行组合</button>
         <button data-tab="jobs" class="tab">任务</button>
       </div>
       <button id="btnDanger" class="danger ghost">初始化…</button>
@@ -34,6 +35,7 @@
     <div id="tab-ov" class="tabpane"></div>
     <div id="tab-cat" class="tabpane hidden"></div>
     <div id="tab-lay" class="tabpane hidden"></div>
+    <div id="tab-combo" class="tabpane hidden"></div>
     <div id="tab-jobs" class="tabpane hidden"></div>
   </section>
 </main>
@@ -45,6 +47,6 @@
 </div></div>
 
 <div id="toast" class="toast"></div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=4"></script>
 </body>
 </html>

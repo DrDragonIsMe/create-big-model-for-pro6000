@@ -84,7 +84,12 @@ async def auth(request: Request, call_next):
     if TOKEN and request.url.path.startswith("/api") \
             and request.headers.get("authorization", "") != f"Bearer {TOKEN}":
         return JSONResponse({"error": "invalid token"}, status_code=401)
-    return await call_next(request)
+    resp = await call_next(request)
+    # 页面与静态资源一律 no-cache：上一轮修了 app.js 的 bug，浏览器却抱着旧缓存
+    # 不放，用户看到的还是坏版本（"模型消失"的错觉来自旧 JS 在详情页抛异常）
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 # 后注册 = 更外层：跨源预检（OPTIONS+Authorization）必须先进 CORS 手里答掉，
 # 再轮到鉴权——浏览器从任意一台 9001 加载页面后要直连另外三台的 agent，没有这两
@@ -221,7 +226,119 @@ def env_summary():
     return out
 
 
+# ---------- 可行组合（与 menu.py 互推面板同一口径的展示性复刻） ----------
+# 边界声明：这里是"组合建议"的估算复刻（不写盘、不改摆放），判档规则与
+# menu.video_tier / hwprofile.budgets 一致：实测峰值优先，slack 只打折声明值。
+# 权威落盘永远由宿主 menu.py 完成；组合被采纳时给的仍是宿主命令。
+
+def video_fit(vd, free_gb, slack=12):
+    """返回 (档位 or None, 需求GB, 是否实测值)"""
+    meas720 = vd.get("vram_720p_bf16_peak_gb")
+    meas480 = vd.get("vram_480p_fp8_peak_gb")
+    n720 = meas720 or vd["vram_720p_bf16"]
+    n480 = meas480 or vd["vram_480p_fp8"]
+    if free_gb >= n720:
+        return "720p", n720, meas720 is not None
+    if free_gb >= n480:
+        return "480p", n480, meas480 is not None
+    if not meas480 and free_gb >= n480 - slack:
+        return "480p+offload", n480, False
+    return None, n480, meas480 is not None
+
+
+def combos():
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    from hwprofile import budgets          # 预算派生与 menu.py 同一实现，绝不另写一份
+    man = load_manifest()
+    import subprocess as _sp
+    out = _sp.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                  capture_output=True, text=True)
+    cards = [int(float(x)) for x in out.stdout.split()]
+    if not cards:
+        return {"error": "nvidia-smi 无输出"}
+    gmem = round(min(cards) / 1024)
+    n = len(cards)
+    bud = budgets(man["meta"], gmem)
+    env = env_summary()
+    free_video = bud["video_card"]
+    half = round(gmem * float(man["meta"].get("dual_llm_util", 0.88)))
+
+    def llm_state(nm, d):
+        """网关实际会加载的变体（-fp8 目录优先，同 menu/model_dir 口径）+ 体量"""
+        v = d.get("variants") or {}
+        chosen = None
+        if os.path.isdir(os.path.join(ROOT, "models/llm", nm + "-fp8")) and "fp8" in v:
+            chosen = "fp8"
+        else:
+            for cand in ("bf16",):
+                if cand in v:
+                    chosen = cand
+                    break
+            chosen = chosen or (min(v, key=lambda k: v[k]) if v else None)
+        return chosen, (v.get(chosen) if chosen else 0), llm_downloaded(nm)
+
+    res = []
+    for nm, d in man.get("llm", {}).items():
+        variant, wgb, have = llm_state(nm, d)
+        if not variant:
+            continue
+        engine = d.get("engine", "vllm")
+        entry = {"llm": nm, "variant": variant, "weights_gb": wgb, "downloaded": have,
+                 "engine": engine,
+                 "ctx_single": int(d.get("gw", {}).get("max_len") or 0),
+                 "combos": []}
+        fits_single = wgb and wgb <= (half if n >= 2 else bud["single_llm"])
+        if engine == "vllm" and n >= 2 and fits_single:
+            slot = {"layout": f"单卡（GPU[{env.get('LLM_DEVICES','1')}]）+ 另一卡给视频/生图",
+                    "kind": "dual", "video_budget_gb": free_video}
+            vids = []
+            for vn, vd in man.get("video", {}).items():
+                tier, need, measured = video_fit(vd, free_video)
+                vids.append({"model": vn, "tier": tier, "need_gb": need,
+                             "measured": measured,
+                             "downloaded": comfy_downloaded(vd), "desc": vd.get("desc", "")})
+            slot["video"] = sorted(vids, key=lambda x: (x["tier"] is None, -(x["need_gb"] or 0)))
+            imgs = []
+            for inn, idd in man.get("image", {}).items():
+                need = float(idd.get("size_gb") or 0)
+                imgs.append({"model": inn, "fits": 0 < need <= free_video,
+                             "need_gb": need, "downloaded": image_downloaded(idd),
+                             "desc": idd.get("desc", "")})
+            slot["image"] = imgs
+            entry["combos"].append(slot)
+        elif engine == "llamacpp" and wgb <= bud.get("pool_gb", gmem * n * 0.92) or \
+                (engine == "vllm" and wgb and wgb > half):
+            entry["combos"].append({"layout": "独占全部卡（无视频组合）",
+                                    "kind": "exclusive", "video_budget_gb": 0,
+                                    "video": [], "image": []})
+        if n == 1:
+            fv = max(0, gmem - wgb - float(man["meta"].get("safety_gap_gb", 4)) - 2)
+            entry["combos"].append({"layout": f"单卡机分时共享（LLM 后余 ~{fv:.0f}G）",
+                                    "kind": "single", "video_budget_gb": round(fv),
+                                    "video": [{"model": vn, "tier": video_fit(vd, fv)[0],
+                                               "need_gb": video_fit(vd, fv)[1],
+                                               "measured": video_fit(vd, fv)[2],
+                                               "downloaded": comfy_downloaded(vd),
+                                               "desc": vd.get("desc", "")}
+                                              for vn, vd in man.get("video", {}).items()],
+                                    "image": []})
+        res.append(entry)
+    return {"cards": {"count": n, "gmem_gb": gmem, "video_card_gb": free_video,
+                      "half_budget_gb": half},
+            "current": {"llm": env.get("LLM_NAME"), "mode": env.get("AI_MODE"),
+                        "video": env.get("VIDEO_NAME", "none"),
+                        "comfy": env.get("COMFY_ENABLED")},
+            "note": "档位=按另一卡预算判档（实测峰值优先）；采纳组合执行对应 "
+                    "start.sh --llm X --video Y，独占布局组合为空",
+            "nodes": res}
+
+
 # ---------- API ----------
+
+@app.get("/api/combos")
+async def api_combos():
+    return await asyncio.to_thread(combos)
+
 
 @app.get("/")
 async def index():

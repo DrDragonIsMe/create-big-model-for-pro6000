@@ -120,7 +120,7 @@ document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>setTab(b.dataset.tab)
 function setTab(t){
   tab = t;
   document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("on", b.dataset.tab===t));
-  ["ov","cat","lay","jobs"].forEach(k=>$("#tab-"+k).classList.toggle("hidden", k!==t));
+  ["ov","cat","lay","combo","jobs"].forEach(k=>$("#tab-"+k).classList.toggle("hidden", k!==t));
   clearInterval(timers.detail);
   timers.detail = setInterval(refreshDetail, t==="lay"||t==="ov" ? 3000 : 4000);
   refreshDetail();
@@ -134,6 +134,7 @@ async function refreshDetail(){
     const proms = {snap: api(cur,"/api/snapshot")};
     if (tab==="cat") proms.catalog = api(cur,"/api/catalog");
     if (tab==="lay") proms.modes = api(cur,"/api/modes");
+    if (tab==="combo") proms.combos = api(cur,"/api/combos");
     if (tab==="jobs") proms.jobs = api(cur,"/api/jobs");
     const got = Object.fromEntries(await Promise.all(
       Object.keys(proms).map(async k => [k, await proms[k]])));
@@ -141,6 +142,7 @@ async function refreshDetail(){
     if (tab==="ov") renderOv(got.snap);
     if (tab==="cat") renderCat(got.snap, got.catalog);
     if (tab==="lay") renderLay(got.snap, got.modes);
+    if (tab==="combo") renderCombo(got.combos);
     if (tab==="jobs") renderJobs(got.jobs);
   } catch(e){ toast("✗ "+e.message); }
 }
@@ -247,6 +249,46 @@ async function fetchLog(id){
   } catch(e){ /* 节点切换竞态时静默 */ }
 }
 
+function renderCombo(cb){
+  if (cb.error) { $("#tab-combo").innerHTML = `<div class="hint">${esc(cb.error)}</div>`; return; }
+  const cur0 = cb.current||{}; const c = cb.cards||{};
+  const head = `<div class="hint">本机 ${c.count}×${c.gmem_gb}GB · 另一卡给视频的预算 <b>${c.video_card_gb}GB</b>
+    · 单卡 LLM 位半池上限 ${c.half_budget_gb}GB · 当前：<b>${esc(cur0.llm||"?")}</b>（${esc(cur0.mode||"?")}）
+    视频 <b>${esc(cur0.video||"none")}</b>${cur0.comfy==="1"?" · ComfyUI 在岗":""}。<br>${esc(cb.note||"")}</div>`;
+  $("#tab-combo").innerHTML = head + (cb.nodes||[]).filter(x=>x.downloaded).map(x=>{
+    return `<h4>${esc(x.llm)} <span class="badge blue">${esc(x.variant)} ${x.weights_gb}G</span>
+      <span class="hint">${esc(x.engine)} · ctx ${x.ctx_single?fmtK(x.ctx_single):"-"}</span></h4>` +
+      (x.combos||[]).map(slot=>{
+        if (slot.kind==="exclusive")
+          return `<div class="modecard"><h4>${esc(slot.layout)}</h4><p class="hint">独占布局没有"另一张卡"，视频/生图让位。</p></div>`;
+        const vids = (slot.video||[]).map(v=>{
+          const ok = !!v.tier;
+          return `<span class="chip ${ok?"ready":""}" title="${esc(v.desc)}">${ok?"✓":"✗"} ${esc(v.model)}
+            ${ok?`·${v.tier}${v.measured?"(实)":"(宣)"}`:""}${v.downloaded?"":" ⇓"}</span>`;
+        }).join(" ");
+        const imgs = (slot.image||[]).map(i=>
+          `<span class="chip ${i.fits?"ready":""}">${i.fits?"✓":"✗"} ${esc(i.model)} ~${i.need_gb}G${i.downloaded?"":" ⇓"}</span>`).join(" ");
+        const best = (slot.video||[]).filter(v=>v.tier&&v.downloaded)[0];
+        return `<div class="modecard"><h4>${esc(slot.layout)} <span class="hint">视频预算 ${slot.video_budget_gb}G</span></h4>
+          <div class="chips">${vids||'<span class="hint">无视频模型</span>'}${imgs?"　生图："+imgs:""}</div>
+          <div class="frow">${best?`<button class="small" onclick='actCombo(${JSON.stringify(x.llm)},${JSON.stringify(best.model)})'>采纳：${esc(x.llm)} + ${esc(best.model)}</button>`:""}
+            ${(slot.video||[]).filter(v=>v.tier).map(v=>`<button class="small ghost" onclick='actCombo(${JSON.stringify(x.llm)},${JSON.stringify(v.model)})'>${esc(v.model)}</button>`).join("")}
+            <button class="small ghost" onclick='actCombo(${JSON.stringify(x.llm)},"none")'>纯文本</button></div></div>`;
+      }).join("");
+  }).join("") + `<div class="hint" style="margin-top:10px">⇓=未下载（采纳时自动先下）；(实)=按实测单卡峰值判档，(宣)=按声明值；
+    独占位候选（iq3s 等）与互斥关系见「布局切换」页。</div>`;
+}
+window.actCombo = async (llm, video) => {
+  const body = {llm, video: video||"none"};
+  let dry;
+  try { dry = await api(cur,"/api/apply",{method:"POST",body:JSON.stringify(Object.assign({dry:1},body))}); }
+  catch(e){ return toast("✗ "+e.message); }
+  modal("采纳组合（宿主 menu.py 持久化）", dry.command,
+    "缺的模型会先自动下载；已加载后端不动，下个请求按新布局拉起", async()=>{
+    await api(cur,"/api/apply",{method:"POST",body:JSON.stringify(body)});
+    toast("已提交 → 任务页看日志"); setTab("jobs"); });
+};
+
 function renderSpark(){
   const s = sparkSnapshot(cur)||{}; const sm = s.sysmon||{};
   $("#tab-ov").innerHTML = `<div class="hint">异构节点（DGX Spark 独立栈，不在 ~/AI 蓝本内）：GUI 仅经 agent 白名单代理做<b>只读</b>监控；
@@ -257,7 +299,7 @@ function renderSpark(){
     <span>GPU <b>${(sm.gpus||[]).length}</b></span></div>
     ${gpuBars(sm.gpus)}
     <h4>模型列表（/v1/models）</h4><table><tr><th>id</th></tr>${(s.models_list||[]).map(m=>`<tr><td class="mono">${esc(m)}</td></tr>`).join("")}</table>`;
-  ["cat","lay","jobs"].forEach(k=>$("#tab-"+k).innerHTML = `<div class="hint">异构节点不支持此视图（只读降级）。</div>`);
+  ["cat","lay","combo","jobs"].forEach(k=>$("#tab-"+k).innerHTML = `<div class="hint">异构节点不支持此视图（只读降级）。</div>`);
 }
 
 /* ---------------- 操作 ---------------- */
