@@ -439,7 +439,7 @@ async def relay(node: str, path: str):
     if not base:
         return JSONResponse({"error": "该节点未配置对应上游"}, 400)
     try:
-        async with httpx.AsyncClient(timeout=6.0) as c:
+        async with httpx.AsyncClient(timeout=10.0) as c:
             r = await c.get(base + path)
             return JSONResponse(r.json(), status_code=r.status_code)
     except Exception as e:

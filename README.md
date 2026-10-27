@@ -46,7 +46,7 @@ python3 sysmonitor/sysmon_web.py        # 实时监控 Web 版：浏览器看板
 - LLM API（OpenAI 兼容）: http://localhost:8000/v1/chat/completions
 - ComfyUI 图形界面: http://localhost:8188（第二实例 8189）
 - 监控看板（Web，常驻）: http://localhost:8088 —— sysmonitor GPU/吞吐/网速/磁盘/进程实时仪表，含温度与系统压力告警区；支持跟随系统 / 浅色 / 深色；终端版 `python3 sysmonitor/sysmon.py` 可同时开
-- **管理后台（GUI，常驻）**: http://localhost:9001 —— 集群总览、健康告警、GPU 温度、模型吞吐、内存/磁盘/网络与进程详情，以及模型下载、布局切换（gateway-layout-v1 目录）和任务日志；打开任意一台即可看到四台（浏览器直连各节点 agent:9001，DGX 经 relay 只读）。控制台支持跟随系统 / 浅色 / 深色。agent 只是遥控器：下载=manage.sh、持久布局=menu.py、运行态切换=网关，写配置的仍然只有 menu.py
+- **管理后台（GUI，常驻）**: http://localhost:9001 —— 集群总览、温度/负载告警、DGX head/worker 统一内存状态、模型吞吐、内存/磁盘/网络与进程详情，以及模型下载、布局切换（gateway-layout-v1 目录）和任务日志；打开任意一台即可看到四台（浏览器直连各节点 agent:9001，DGX 经 relay 只读）。控制台支持跟随系统 / 浅色 / 深色。agent 只是遥控器：下载=manage.sh、持久布局=menu.py、运行态切换=网关，写配置的仍然只有 menu.py
 
 文本模型 ↔ 视频的切换、`--switch` 快速切换（含远程 `gateway/switch` 接口）、显存腾挪、管理接口（`status` / `unload_all` / `switch`）、以及客户端 agent 的细粒度协商接口（`capabilities` 说明接口 / `gpus` GPU 发现 / `load` 指定 GPU 加载 / `ops` 状态轮询 / `unload` 按模型卸载）见 **`模型切换说明.md`**。
 
@@ -154,7 +154,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - `models.json` — 模型清单（显存/卡数/下载源），新增模型唯一入口
 - `models/llm` — 文本模型 ｜ `models/comfy` — 视频模型（ComfyUI 目录结构）
 - `scripts/` — init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
-- `sysmonitor/` — 实时监控（curses/文本/Web看板/截图；GPU/网速/磁盘IO/进程/模型吞吐 当前值仪表；Web 支持跟随系统、浅色与 7 套暗色配色，并提供统一健康告警；详见 `sysmonitor/README.md`）
+- `sysmonitor/` — 实时监控（curses/文本/Web看板/截图；GPU/网速/磁盘IO/进程/模型吞吐 当前值仪表；Web 支持跟随系统、浅色与 7 套暗色配色、统一健康告警，并可分节点显示 DGX Spark head/worker 的统一内存与模型驻留；详见 `sysmonitor/README.md`）
 - `console/` — GUI 管理后台 agent（9001；agent.py + web/ 静态前端 + console.json relay 白名单。读网关/sysmon、驱动 manage.sh/menu.py；bind-mount 代码，`docker compose restart console` 即生效）
 - `模型切换说明.md` — 文本/视频切换与管理接口（客户端操作依据）
 - `部署文档.md` — 通用部署指南（硬件要求 / 一键或手动部署 / 踩坑）

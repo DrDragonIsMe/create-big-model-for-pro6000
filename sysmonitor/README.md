@@ -3,7 +3,7 @@
 终端里的 nvtop 式监控（另有同数据的 **Web 看板**），**只呈现当前的压力与负载**（不画时间曲线）：
 **GPU 算力/显存/带宽 + CPU/内存/磁盘 + 网络收发 + 磁盘 I/O + 全系统进程 + LLM 模型吞吐**
 （t/s 生成速率、p/s Prompt 处理速率、Prompt 进度动画、slots 占用/排队、累计 tokens）。
-数据源：`nvidia-smi`、`psutil`、网关 `GET /v1/gateway/status`（无需额外服务）。
+数据源：`nvidia-smi`、`psutil`、同构网关 `GET /v1/gateway/status`；若网关返回 404（如 DGX Spark 独立栈），回退 `GET /v1/models`，以 OpenAI 兼容模式报告服务在线与模型列表。
 
 所有百分比都是一行式**当前值仪表**：`▰▱▱▱▱▱` ▰=已占用、▱=余量，即采即画。
 配色语义：压力类（算力/带宽/CPU/交换/磁盘）按值分级着色 —— <span>绿 &lt;60%</span>、
@@ -156,6 +156,20 @@ python3 sysmon_web.py --gateway http://192.168.0.103:8000
 - 网关离线时看板明确横幅提示，其余面板照常
 - API：`GET /api/snapshot`（全量 JSON）、`/api/themes`、`/api/theme?name=`；可对接其它仪表盘
 
+### DGX Spark 双机模式（独立栈）
+
+head 节点读取 `~/gateway/vllm_service.sh` 的 `PEER`（当前 `192.168.177.12`），每 5 秒通过 SSH
+调用两台共同的 `~/sysmonitor/sysmon_peer.py`，在快照中返回 `cluster.nodes[]`。Web 与 9001 控制台
+分别显示 head/worker 的：
+
+- `nvidia-smi` 计算利用率、温度和功耗
+- OS 统一内存已用/可用（Linux `MemTotal-MemAvailable`）
+- vLLM 计算进程驻留量（`nvidia-smi --query-compute-apps` 汇总）
+- `vllm_node` 容器状态与 SSH 在线状态
+
+GB10 无独立显存容量，`nvidia-smi` 的 memory total 为 `[N/A]`；界面显示为**统一内存**，并将
+vLLM 驻留量与 OS 占用分开，避免把两者混为同一指标。可用 `SYSMON_CLUSTER=0` 临时关闭对端采集。
+
 ### 常驻部署（compose）
 
 `sysmon-web` 服务已加入 compose（容器名 `ai-sysmon-web`，`restart: unless-stopped`，
@@ -217,8 +231,10 @@ sysmonitor/
 
 - **主题键按了没反应**：部分终端把 Shift+Tab 映射成别的序列，`T` 正循环总可用。
 - **动画静止**：按 `A` 确认未关动画；数据暂停（`Space`）时相位也会冻结。
-- **LLM 面板显示"--"或离线**：检查 `SYSMON_GATEWAY` 与网关状态 `curl <网关>/v1/gateway/status`；
-  速率需至少 2 个采样窗口才有值。
+- **LLM 面板显示"--"或离线**：先查同构网关 `curl <网关>/v1/gateway/status`；404 时 sysmonitor 会回退
+  `/v1/models`，此时服务在线但 token 速率不可用。速率仍需至少 2 个采样窗口才有值。
+- **DGX 对端不显示**：确认 head 可 `ssh 192.168.177.12 python3 ~/sysmonitor/sysmon_peer.py`，并检查
+  `~/gateway/vllm_service.sh` 的 `PEER`；可用 `SYSMON_CLUSTER=0` 只保留 head 监控。
 - **显存表是蓝的不是红的**：有意设计——显存/内存是容量占用（蓝），算力/CPU 才是压力（绿黄红）。
 - **颜色发灰/错乱**：终端未开 256 色，设 `TERM=xterm-256color`；纯 8 色终端自动回退到语义基础色。
 - **字符显示成口框**：字体需支持 Block Elements（U+2580-259F、▰▱）与 Braille（⠋ 等），
