@@ -102,9 +102,10 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False))
 EOF
   echo "==> 下载任务: $(python3 -c "import json;print(len(json.load(open('$JOB'))['tasks']))") 项"
   docker pull python:3.12-slim >/dev/null 2>&1 || true
+  # 注：注释必须在续行链之外——插进 `\` 链会把命令在 # 处截断（bash -n 查不出，实测踩过）
+  # MANAGE_RUN_AS：console agent 容器内是 root，直接 id -u 会把宿主 models/ 文件下成 root-owned；
+  # agent 按 models 目录真实属主注入该变量。宿主手跑时未设置，行为与从前完全一致。
   docker run --rm \
-    # MANAGE_RUN_AS：console agent 容器内是 root，直接 id -u 会把宿主 models/ 文件下成 root-owned；
-    # agent 按 models 目录真实属主注入该变量。宿主手跑时未设置，行为与从前完全一致。
     --user "${MANAGE_RUN_AS:-$(id -u):$(id -g)}" \
     -v "$PWD/models:/models" -v "$JOB:/job.json:ro" -v "$PWD/scripts:/opt:ro" \
     -e HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
