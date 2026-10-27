@@ -28,7 +28,7 @@ python3 sysmonitor/sysmon_text.py -w    # 文本刷新版（适合 ssh / 窄终�
 |---|---|
 | `sysmon.py` | curses 交互式 TUI，全功能 + 快捷键 |
 | `sysmon_text.py` | 纯文本快照/刷新，可管道、可重定向日志 |
-| `sysmon_web.py` | **Web GUI**：浏览器实时看板（catppuccin 等 7 主题，自动刷新，见下） |
+| `sysmon_web.py` | **Web GUI**：浏览器实时看板（支持跟随系统 / 浅色 / 深色，内含 7 套暗色配色，自动刷新，见下） |
 | `sysmon_capture.py` | 离线渲染一屏存 `sysmon_screenshot.txt`（写文档/报告用；环境变量 `CAP_ROWS/CAP_COLS/CAP_FRAMES` 控制画布） |
 
 ## sysmon.py（curses 版）
@@ -128,9 +128,10 @@ CPU 42.3% ▰▰▰▰▱▱ load 3.9 3.0 1.8 3.96GHz │内存  70.2% ▰▰▰
 | 紫 | 模型名标签 |
 | 主题强调底 | 面板标题/状态栏（深字浅底，随主题） |
 
-## 主题（7 套）
+## 主题（CLI 7 套暗色；Web 另有浅色）
 
-`catppuccin-mocha`（默认）、`tokyo-night`、`nord`、`dracula`、`gruvbox-dark`、`one-dark`、`solarized-dark`
+CLI：`catppuccin-mocha`（默认）、`tokyo-night`、`nord`、`dracula`、`gruvbox-dark`、`one-dark`、`solarized-dark`
+Web：`catppuccin-latte`（浅色）+ 上述 7 套暗色配色，并支持“跟随系统”
 
 - 运行时：`T` / `Shift+Tab` 循环切换（curses 版）
 - 启动指定：`--theme <名>` 或环境变量 `SYSMON_THEME=<名>`，也可直接给 JSON 文件路径
@@ -150,8 +151,8 @@ python3 sysmon_web.py --gateway http://192.168.0.103:8000
   后台线程采样、页面轮询最新快照；纯 Python 标准库，无额外依赖
 - **同语义可视化**：▰▱ 横条 = 当前值仪表，绿黄红压力分级 / 青蓝容量占用与 CLI 相同；条带光泽扫掠 = CLI 的 glint，
   宽度缓动 = CLI 的 ease-out 平滑，网速箭头流动、Prompt braille 转圈、生成脉冲、排队闪烁一应俱全
-- **同快捷键**：`Space` 暂停（画面冻结后台仍采样）、`P` 进程排序循环、`T` 循环主题；也可用顶栏下拉与按钮
-- **主题联动**：读取 `themes/*.json`（含自定义），7 套精选底色与 CLI 同名主题同色系；支持 `?theme=nord` URL 参数直链分享
+- **同快捷键**：`Space` 暂停（画面冻结后台仍采样）、`P` 进程排序循环、`T` 在浅色与暗色配色间循环；也可用顶栏“外观 / 配色”下拉与按钮
+- **主题与告警**：读取 `themes/*.json`（含自定义），7 套暗色精选底色与 CLI 同名主题同色系，另有 `catppuccin-latte` 浅色；支持 `?theme=nord` 或 `?theme=light` 直链分享。Web 首页固定展示健康告警区，温度 70°C/85°C、压力 85%、排队和网关离线按“严重 / 预警 / 信息”分层
 - 网关离线时看板明确横幅提示，其余面板照常
 - API：`GET /api/snapshot`（全量 JSON）、`/api/themes`、`/api/theme?name=`；可对接其它仪表盘
 

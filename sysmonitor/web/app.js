@@ -34,9 +34,47 @@ function fmtDur(s) {
   return `${Math.floor(s / 86400)}d${String(Math.floor((s % 86400) / 3600)).padStart(2, "0")}h`;
 }
 const sevClass = (p) => (p >= 85 ? "crit" : p >= 60 ? "warn" : "ok");
+const TEMP_WARN = 70, TEMP_CRIT = 85, PRESSURE_WARN = 85, PRESSURE_CRIT = 95;
+const LEVEL_RANK = {critical:0, warning:1, info:2, ok:3};
+const tempClass = (t) => t >= TEMP_CRIT ? "temp-crit" : t >= TEMP_WARN ? "temp-warn" : "normal";
+const pctOf = (a,b) => b ? 100 * (Number(a)||0) / Number(b) : 0;
+const escHTML = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function healthAlerts(snap){
+  const out=[],mem=snap.mem||{},disk=snap.disk||{};
+  if(snap.error)out.push({label:"critical",title:"采集异常",detail:snap.error});
+  if(!snap.gateway_connected)out.push({label:"critical",title:"网关不可达",detail:snap.gateway||"监控服务无法读取模型指标"});
+  for(const g of snap.gpus||[]){
+    if(Number(g.temp||0)>=TEMP_CRIT)out.push({label:"critical",title:`GPU ${g.index} 温度过高`,detail:`${g.temp}°C，告警阈值 ${TEMP_CRIT}°C`});
+    else if(Number(g.temp||0)>=TEMP_WARN)out.push({label:"warning",title:`GPU ${g.index} 温度偏高`,detail:`${g.temp}°C，注意阈值 ${TEMP_WARN}°C`});
+    if(pctOf(g.power,g.power_limit)>=PRESSURE_CRIT)out.push({label:"warning",title:`GPU ${g.index} 接近功率上限`,detail:`${(g.power||0).toFixed(0)} / ${(g.power_limit||0).toFixed(0)} W`});
+    if(Number(g.mem_util||0)>=95)out.push({label:"warning",title:`GPU ${g.index} 显存带宽饱和`,detail:`${(g.mem_util||0).toFixed(0)}%`});
+  }
+  if((snap.agg?.queued||0)>0)out.push({label:"warning",title:"推理请求排队",detail:`${snap.agg.queued} 个请求等待槽位`});
+  for(const m of snap.models||[])if(m.status==="loading")out.push({label:"info",title:`${m.name} 正在加载`,detail:"模型冷启动通常需要 1–5 分钟"});
+  if((mem.swap_pct||0)>=PRESSURE_WARN)out.push({label:"warning",title:"交换分区偏高",detail:`${mem.swap_pct}% · ${fmtBytes(mem.swap_used)} / ${fmtBytes(mem.swap_total)}`});
+  if((disk.pct||0)>=PRESSURE_WARN)out.push({label:"warning",title:"系统盘空间不足",detail:`${disk.pct}% · 剩余 ${fmtBytes(disk.free)}`});
+  if((snap.cpu?.total||0)>=PRESSURE_WARN)out.push({label:"warning",title:"CPU 压力偏高",detail:`${snap.cpu.total}% · load ${snap.cpu.load?.[0]??"-"}`});
+  return out.sort((a,b)=>LEVEL_RANK[a.label]-LEVEL_RANK[b.label]);
+}
+function renderAlerts(snap){
+  const alerts=healthAlerts(snap),body=$id("alerts");
+  const count=(l)=>alerts.filter(a=>a.label===l).length;
+  const c=count("critical"),w=count("warning"),i=count("info"),status=c?"critical":w?"warning":"ok";
+  const cards=alerts.length?alerts.map(a=>`<article class="alert ${escHTML(a.label)}"><span class="alert-icon">${a.label==="critical"?"▲":a.label==="warning"?"△":"●"}</span><div class="alert-copy"><b>${escHTML(a.title)}</b><p>${escHTML(a.detail)}</p></div><span class="alert-level">${a.label==="critical"?"严重":a.label==="warning"?"预警":"信息"}</span></article>`).join(""):`<article class="alert ok"><span class="alert-icon">✓</span><div class="alert-copy"><b>系统健康</b><p>温度、网关、队列、交换分区与磁盘压力均低于预警阈值。</p></div><span class="alert-level">正常</span></article>`;
+  body.className=`alert-panel ${status}`;
+  body.innerHTML=`<div class="alert-head"><div><h2>${c?"严重告警":w?"运行预警":"系统健康"}</h2><p>阈值：温度 ${TEMP_WARN}°C / ${TEMP_CRIT}°C · 系统压力 ${PRESSURE_WARN}%</p></div><div class="alert-counts"><b class="critical">${c}</b><span>严重</span><b class="warning">${w}</b><span>预警</span><b class="info">${i}</b><span>信息</span></div></div><div class="alert-list">${cards}</div>`;
+}
 
 /* ── 精选主题底色（官方调色板的真值；未知主题用服务端换算色）── */
 const CURATED = {
+  "catppuccin-latte": {
+    "--bg": "#f4f5f8", "--bg2": "#e9ebf1", "--card": "#ffffff", "--surface": "#e2e6ed",
+    "--border": "#ccd3df", "--text": "#26364c", "--subtext": "#526177", "--dim": "#718096",
+    "--accent": "#276fbf", "--ok": "#147a52", "--warn": "#9a5a08", "--crit": "#c43855",
+    "--mem": "#087f8c", "--model": "#7652b5", "--disk": "#a85420",
+    "--header-fg": "#ffffff", "--header-bg": "#276fbf",
+    "--gpu0": "#7652b5", "--gpu1": "#276fbf", "--gpu2": "#087f8c", "--gpu3": "#147a52",
+  },
   "catppuccin-mocha": {
     "--bg": "#1e1e2e", "--bg2": "#181825", "--card": "#24243a", "--surface": "#313244",
     "--border": "#45475a", "--text": "#cdd6f4", "--subtext": "#a6adc8", "--dim": "#6c7086",
@@ -97,6 +135,10 @@ const CURATED = {
 const ROLE2VAR = { accent: "--accent", ok: "--ok", warn: "--warn", crit: "--crit",
                    mem: "--mem", model: "--model", disk: "--disk", dim: "--dim", border: "--border" };
 
+const THEME_VARS = new Set([
+  ...Object.values(CURATED).flatMap(vars => Object.keys(vars)),
+  ...Object.values(ROLE2VAR),
+]);
 async function applyTheme(name) {
   let vars = CURATED[name];
   if (!vars) {
@@ -112,7 +154,9 @@ async function applyTheme(name) {
       if (Array.isArray(t.gpu)) t.gpu.slice(0, 4).forEach((h, i) => (vars[`--gpu${i}`] = h));
     } catch (e) { return; }
   }
+  for (const key of THEME_VARS) document.documentElement.style.removeProperty(key);
   for (const [k, v] of Object.entries(vars)) document.documentElement.style.setProperty(k, v);
+  document.documentElement.dataset.theme = name === "catppuccin-latte" ? "light" : "dark";
 }
 
 /* ── 小组件工厂 ── */
@@ -156,18 +200,19 @@ function renderGpus(snap) {
       gpuCache.set(g.index, card);
       grid.appendChild(card.el);
     }
+    const tcls = tempClass(g.temp), powerPct = pctOf(g.power, g.power_limit);
+    card.el.className = `card gpu-card ${tcls}`;
     card.el.style.setProperty("--gc", `var(--gpu${g.index % 4})`);
-    card.name.textContent = `[GPU ${g.index}] ${g.name}`;
+    card.name.textContent = `GPU ${g.index} · ${g.name.replace(/^NVIDIA /, "")}`;
     const memPct = g.mem_total ? g.mem_used / g.mem_total * 100 : 0;
     const free = (g.mem_total || 0) - g.mem_used;
     setGauge(card.gauges["算力"], g.util, "sev");
     setGauge(card.gauges["显存"], memPct, "mem",
       `${fmtMB(g.mem_used)}/${fmtMB(g.mem_total)} 空闲${fmtMB(free)}`);
     setGauge(card.gauges["带宽"], g.mem_util || 0, "sev");
-    const tcls = g.temp >= 85 ? "t-crit" : g.temp >= 70 ? "t-hot" : "";
     $(".badges", card.el).innerHTML =
-      `<span class="badge ${tcls}">${g.temp}°C</span>` +
-      (g.power_limit ? `<span class="badge">${g.power.toFixed(0)}/${g.power_limit.toFixed(0)}W</span>` : "") +
+      `<span class="badge temp ${tcls}">${g.temp ?? "-"}°C<small>${tcls === "temp-crit" ? " 严重" : tcls === "temp-warn" ? " 偏高" : " 正常"}</small></span>` +
+      (g.power_limit ? `<span class="badge ${powerPct >= PRESSURE_CRIT ? "temp-warn" : ""}">${g.power.toFixed(0)} / ${g.power_limit.toFixed(0)} W · ${powerPct.toFixed(0)}%</span>` : "") +
       (g.fan != null ? `<span class="badge">风扇 ${g.fan.toFixed(0)}%</span>` : "");
   }
   for (const [idx, c] of gpuCache) if (!seen.has(idx)) { c.el.remove(); gpuCache.delete(idx); }
@@ -444,7 +489,7 @@ async function tick() {
 }
 let lastSnap = null;
 function paint(snap) {
-  renderTop(snap); renderGpus(snap); renderLlm(snap);
+  renderTop(snap); renderAlerts(snap); renderGpus(snap); renderLlm(snap);
   renderCpu(snap); renderSys(snap); renderNet(snap); renderDio(snap); renderProcs(snap);
 }
 function setPaused(v) {
@@ -481,13 +526,49 @@ setInterval(() => {
 (async function boot() {
   try {
     const t = await fetch("/api/themes").then((r) => r.json());
-    const sel = $id("themeSel");
-    sel.innerHTML = t.themes.map((n) => `<option ${n === t.default ? "selected" : ""}>${n}</option>`).join("");
-    sel.value = new URLSearchParams(location.search).get("theme")
-      || localStorage.getItem("sysmonTheme") || t.default;
-    if (!t.themes.includes(sel.value)) sel.value = t.default;
-    applyTheme(sel.value);
-    sel.onchange = () => { localStorage.setItem("sysmonTheme", sel.value); applyTheme(sel.value); };
+    const sel = $id("themeSel"), appearanceSel = $id("appearanceSel");
+    const media = matchMedia("(prefers-color-scheme: dark)");
+    let appearance = localStorage.getItem("sysmonAppearance") || "auto";
+    let darkTheme = localStorage.getItem("sysmonTheme") || t.default;
+    if (!t.themes.includes(darkTheme)) darkTheme = t.default;
+    if (!["auto", "light", "dark"].includes(appearance)) appearance = "auto";
+    const urlTheme = new URLSearchParams(location.search).get("theme");
+    if (urlTheme === "light" || urlTheme === "catppuccin-latte") appearance = "light";
+    else if (urlTheme === "dark") appearance = "dark";
+    else if (t.themes.includes(urlTheme)) { darkTheme = urlTheme; appearance = "dark"; }
+    sel.innerHTML = t.themes.map(n => `<option>${n}</option>`).join("");
+    sel.value = darkTheme;
+    const resolvedTheme = () => appearance === "light" || (appearance === "auto" && !media.matches)
+      ? "catppuccin-latte" : darkTheme;
+    const paintTheme = () => {
+      appearanceSel.value = appearance;
+      sel.value = darkTheme;
+      sel.disabled = resolvedTheme() === "catppuccin-latte";
+      sel.title = sel.disabled ? "浅色外观使用 Catppuccin Latte；切换到深色后可选择配色" : "深色配色主题";
+      applyTheme(resolvedTheme());
+    };
+    appearanceSel.onchange = () => {
+      appearance = appearanceSel.value;
+      localStorage.setItem("sysmonAppearance", appearance);
+      paintTheme();
+    };
+    sel.onchange = () => {
+      darkTheme = sel.value;
+      localStorage.setItem("sysmonTheme", darkTheme);
+      paintTheme();
+    };
+    media.addEventListener("change", () => { if (appearance === "auto") paintTheme(); });
+    document.addEventListener("keydown", (e) => {
+      if ((e.key !== "t" && e.key !== "T") || e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+      const sequence = ["catppuccin-latte", ...t.themes];
+      const next = sequence[(sequence.indexOf(resolvedTheme()) + 1) % sequence.length];
+      appearance = next === "catppuccin-latte" ? "light" : "dark";
+      if (next !== "catppuccin-latte") darkTheme = next;
+      localStorage.setItem("sysmonAppearance", appearance);
+      localStorage.setItem("sysmonTheme", darkTheme);
+      paintTheme();
+    });
+    paintTheme();
   } catch (e) { /* 主题列表失败不阻塞数据 */ }
 
   $id("pauseBtn").onclick = () => setPaused(!paused);
@@ -501,10 +582,6 @@ setInterval(() => {
     else if (e.key === "p" || e.key === "P") {
       procSort = { vram: "cpu", cpu: "pmem", pmem: "vram" }[procSort];
       if (lastSnap) renderProcs(lastSnap);
-    } else if (e.key === "t" || e.key === "T") {
-      const sel = $id("themeSel");
-      sel.selectedIndex = (sel.selectedIndex + 1) % sel.options.length;
-      sel.onchange();
     }
   });
 

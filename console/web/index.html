@@ -1,37 +1,49 @@
 <!doctype html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>AI 算力集群控制台</title>
-<link rel="stylesheet" href="/static/style.css?v=4">
+<script>
+(()=>{const saved=localStorage.getItem("ai-theme")||"auto";const dark=saved==="auto"?matchMedia("(prefers-color-scheme: dark)").matches:saved==="dark";document.documentElement.dataset.theme=dark?"dark":"light";})();
+</script>
+<link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
-<header>
-  <div class="brand">⬢ AI 集群控制台 <span class="sub">gateway-layout-v1 · sysmonitor 集成</span></div>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark" aria-hidden="true">⬢</span><span>AI 算力集群<span class="brand-sub">COMPUTE CONTROL</span></span></div>
   <div class="hright">
-    <span id="clock"></span>
+    <span id="clock" class="clock"></span>
+    <label class="theme-control"><span>外观</span><select id="themeSel" aria-label="界面外观"><option value="auto">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label>
     <button id="btnNodes" class="ghost" title="编辑节点地址">节点</button>
     <button id="btnToken" class="ghost" title="设置 CONSOLE_TOKEN 对应的 Bearer">令牌</button>
   </div>
 </header>
 
 <main>
-  <section id="grid" class="grid"></section>
+  <section id="overview" class="overview">
+    <div class="hero">
+      <div><div class="eyebrow">UNIFIED COMPUTE OBSERVABILITY</div><h1>集群运行总览</h1><p>跨节点算力、模型服务与系统资源，一屏掌握。</p></div>
+      <div id="clusterSummary" class="cluster-summary"><span class="hint">正在连接节点…</span></div>
+    </div>
+    <section id="clusterAlerts" aria-live="polite"></section>
+    <div id="grid" class="grid"></div>
+  </section>
 
   <section id="detail" class="detail hidden">
     <div class="dhead">
-      <button id="btnBack" class="ghost">← 总览</button>
+      <button id="btnBack" class="ghost">← 返回总览</button>
       <h2 id="dTitle">—</h2>
-      <div class="dtabs">
-        <button data-tab="ov" class="tab on">概览</button>
-        <button data-tab="cat" class="tab">模型库</button>
-        <button data-tab="lay" class="tab">布局切换</button>
-        <button data-tab="combo" class="tab">可行组合</button>
-        <button data-tab="jobs" class="tab">任务</button>
-      </div>
       <button id="btnDanger" class="danger ghost">初始化…</button>
     </div>
+    <nav class="dtabs" aria-label="节点详情">
+      <button data-tab="ov" class="tab on">实时概览</button>
+      <button data-tab="cat" class="tab">模型库</button>
+      <button data-tab="lay" class="tab">布局切换</button>
+      <button data-tab="combo" class="tab">可行组合</button>
+      <button data-tab="jobs" class="tab">任务日志</button>
+    </nav>
     <div id="tab-ov" class="tabpane"></div>
     <div id="tab-cat" class="tabpane hidden"></div>
     <div id="tab-lay" class="tabpane hidden"></div>
@@ -40,13 +52,13 @@
   </section>
 </main>
 
-<div id="modal" class="modal hidden"><div class="mbox">
-  <div class="mhead"><span id="mTitle"></span><button id="mClose" class="ghost">✕</button></div>
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="mTitle"><div class="mbox">
+  <div class="mhead"><span id="mTitle"></span><button id="mClose" class="ghost" aria-label="关闭">✕</button></div>
   <pre id="mBody" class="mono"></pre>
   <div class="mfoot"><span id="mNote"></span><button id="mOk" class="primary">执行</button></div>
 </div></div>
 
-<div id="toast" class="toast"></div>
-<script src="/static/app.js?v=4"></script>
+<div id="toast" class="toast" role="status"></div>
+<script src="/static/app.js?v=7"></script>
 </body>
 </html>
