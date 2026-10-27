@@ -34,7 +34,7 @@ function fmtDur(s) {
   return `${Math.floor(s / 86400)}d${String(Math.floor((s % 86400) / 3600)).padStart(2, "0")}h`;
 }
 const sevClass = (p) => (p >= 85 ? "crit" : p >= 60 ? "warn" : "ok");
-const TEMP_WARN = 70, TEMP_CRIT = 85, PRESSURE_WARN = 85, PRESSURE_CRIT = 95;
+const TEMP_WARN = 83, TEMP_CRIT = 88, PRESSURE_WARN = 85, PRESSURE_CRIT = 95;
 const LEVEL_RANK = {critical:0, warning:1, info:2, ok:3};
 const tempClass = (t) => t >= TEMP_CRIT ? "temp-crit" : t >= TEMP_WARN ? "temp-warn" : "normal";
 const pctOf = (a,b) => b ? 100 * (Number(a)||0) / Number(b) : 0;
@@ -59,10 +59,12 @@ function healthAlerts(snap){
 function renderAlerts(snap){
   const alerts=healthAlerts(snap),body=$id("alerts");
   const count=(l)=>alerts.filter(a=>a.label===l).length;
-  const c=count("critical"),w=count("warning"),i=count("info"),status=c?"critical":w?"warning":"ok";
-  const cards=alerts.length?alerts.map(a=>`<article class="alert ${escHTML(a.label)}"><span class="alert-icon">${a.label==="critical"?"▲":a.label==="warning"?"△":"●"}</span><div class="alert-copy"><b>${escHTML(a.title)}</b><p>${escHTML(a.detail)}</p></div><span class="alert-level">${a.label==="critical"?"严重":a.label==="warning"?"预警":"信息"}</span></article>`).join(""):`<article class="alert ok"><span class="alert-icon">✓</span><div class="alert-copy"><b>系统健康</b><p>温度、网关、队列、交换分区与磁盘压力均低于预警阈值。</p></div><span class="alert-level">正常</span></article>`;
-  body.className=`alert-panel ${status}`;
-  body.innerHTML=`<div class="alert-head"><div><h2>${c?"严重告警":w?"运行预警":"系统健康"}</h2><p>阈值：温度 ${TEMP_WARN}°C / ${TEMP_CRIT}°C · 系统压力 ${PRESSURE_WARN}%</p></div><div class="alert-counts"><b class="critical">${c}</b><span>严重</span><b class="warning">${w}</b><span>预警</span><b class="info">${i}</b><span>信息</span></div></div><div class="alert-list">${cards}</div>`;
+  const c=count("critical"),w=count("warning"),i=count("info"),status=c?"critical":w?"warning":i?"info":"ok";
+  const statusText=c?"需要处理":w?"运行预警":i?"信息提示":"全部正常";
+  const top=alerts.length?`${alerts[0].title}${alerts[0].detail?` · ${alerts[0].detail}`:""}`:"温度、网关与队列均在正常范围";
+  const cards=alerts.length?alerts.map(a=>`<article class="alert ${escHTML(a.label)}"><span class="alert-icon">${a.label==="critical"?"▲":a.label==="warning"?"△":"●"}</span><div class="alert-copy"><b>${escHTML(a.title)}</b><p>${escHTML(a.detail)}</p></div><span class="alert-level">${a.label==="critical"?"严重":a.label==="warning"?"预警":"信息"}</span></article>`).join(""):`<article class="alert ok"><span class="alert-icon">✓</span><div class="alert-copy"><b>未发现告警</b><p>温度、系统压力、网关与队列均低于预警阈值。</p></div><span class="alert-level">正常</span></article>`;
+  body.className=`alerts-shell ${status}`;
+  body.innerHTML=`<details class="alert-strip ${status}"><summary><span class="alert-strip-label">系统健康</span><span class="alert-state ${status}">${statusText}</span><span class="alert-counts"><b class="critical">${c}</b><span>严重</span><b class="warning">${w}</b><span>预警</span><b class="info">${i}</b><span>信息</span></span><span class="alert-top" title="${escHTML(top)}">${escHTML(top)}</span><span class="alert-disclosure">详情</span></summary><div class="alert-detail-panel"><p>温度预警 ${TEMP_WARN}°C / 严重 ${TEMP_CRIT}°C · 系统压力预警 ${PRESSURE_WARN}%</p><div class="alert-list">${cards}</div></div></details>`;
 }
 
 /* ── 精选主题底色（官方调色板的真值；未知主题用服务端换算色）── */

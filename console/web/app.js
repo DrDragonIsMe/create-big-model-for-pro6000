@@ -16,7 +16,7 @@ let tab = "ov";
 const timers = {};
 const st = {};
 
-const TEMP_WARN = 70, TEMP_CRIT = 85, PRESSURE_WARN = 85, PRESSURE_CRIT = 95;
+const TEMP_WARN = 83, TEMP_CRIT = 88, PRESSURE_WARN = 85, PRESSURE_CRIT = 95;
 const LEVEL_RANK = {critical:0,warning:1,info:2,ok:3};
 const fmtK = n => n >= 1048576 ? (n/1048576).toFixed(2)+"M" : n >= 1000 ? Math.round(n/1000)+"K" : String(Math.round(n||0));
 const clamp = n => Math.max(0,Math.min(100,Number(n)||0));
@@ -74,13 +74,15 @@ function snapshotAlerts(node,snap){
 }
 function alertSummary(list){return{critical:list.filter(a=>a.label==="critical").length,warning:list.filter(a=>a.label==="warning").length,info:list.filter(a=>a.label==="info").length};}
 function alertCard(a){return `<article class="alert ${esc(a.label)}" role="status"><span class="alert-icon" aria-hidden="true">${a.label==="critical"?"▲":a.label==="warning"?"△":"●"}</span><div class="alert-copy"><b>${esc(a.title)}</b><p>${esc(a.detail||"需要关注当前运行状态")}</p></div><span class="alert-level">${a.label==="critical"?"严重":a.label==="warning"?"预警":"信息"}</span></article>`;}
-function alertPanel(alerts,title,note="阈值：温度 70°C / 85°C，系统压力 85%"){
-  const s=alertSummary(alerts),statusClass=s.critical?"critical":s.warning?"warning":"ok";
-  const body=alerts.length?alerts.map(alertCard).join(""):`<article class="alert ok"><span class="alert-icon" aria-hidden="true">✓</span><div class="alert-copy"><b>${esc(title)}正常</b><p>温度、系统压力、网关与队列均低于预警阈值。</p></div><span class="alert-level">正常</span></article>`;
-  return `<section class="alert-panel ${statusClass}"><div class="alert-panel-head"><div><h3>${esc(title)}</h3><p>${esc(note)}</p></div><div class="alert-counts"><b class="critical">${s.critical}</b><span>严重</span><b class="warning">${s.warning}</b><span>预警</span><b class="info">${s.info}</b><span>信息</span></div></div><div class="alert-list">${body}</div></section>`;
+function alertPanel(alerts,title,note="温度预警 83°C / 严重 88°C · 系统压力预警 85%"){
+  const s=alertSummary(alerts),statusClass=s.critical?"critical":s.warning?"warning":s.info?"info":"ok";
+  const statusText=s.critical?"需要处理":s.warning?"运行预警":s.info?"信息提示":"全部正常";
+  const top=alerts.length?`${alerts[0].title}${alerts[0].detail?` · ${alerts[0].detail}`:""}`:"温度、网关与队列均在正常范围";
+  const body=alerts.length?alerts.map(alertCard).join(""):`<article class="alert ok"><span class="alert-icon" aria-hidden="true">✓</span><div class="alert-copy"><b>未发现告警</b><p>温度、系统压力、网关与队列均低于预警阈值。</p></div><span class="alert-level">正常</span></article>`;
+  return `<details class="alert-strip ${statusClass}"><summary aria-label="${esc(title)}：${esc(statusText)}"><span class="alert-strip-label">${esc(title)}</span><span class="alert-state ${statusClass}">${esc(statusText)}</span><span class="alert-counts"><b class="critical">${s.critical}</b><span>严重</span><b class="warning">${s.warning}</b><span>预警</span><b class="info">${s.info}</b><span>信息</span></span><span class="alert-top" title="${esc(top)}">${esc(top)}</span><span class="alert-disclosure">详情</span></summary><div class="alert-detail-panel"><p>${esc(note)}</p><div class="alert-list">${body}</div></div></details>`;
 }
 function nodeStatusBadge(list){const s=alertSummary(list);if(s.critical)return `<span class="node-status critical">${s.critical} 严重</span>`;if(s.warning)return `<span class="node-status warning">${s.warning} 预警</span>`;if(s.info)return `<span class="node-status info">${s.info} 信息</span>`;return `<span class="node-status ok">正常</span>`;}
-function compactAlerts(list){if(!list.length)return `<div class="compact-alerts ok"><span>✓ 温度与压力均低于预警阈值</span></div>`;return `<div class="compact-alerts ${list[0].label}">${list.slice(0,2).map(a=>`<span>${esc(a.title.replace(/^[^·]+· /,""))} <b>${esc(a.detail)}</b></span>`).join("")}${list.length>2?`<span class="more">+${list.length-2} 项</span>`:""}</div>`;}
+function compactAlerts(list){if(!list.length)return "";const s=alertSummary(list);const label=s.critical?`${s.critical} 项严重`:s.warning?`${s.warning} 项预警`:`${s.info} 项信息`;return `<div class="compact-alerts ${list[0].label}" title="${esc(list[0].title)} ${esc(list[0].detail||"")}"><b>${esc(label)}</b><span>${esc(list[0].title.replace(/^[^·]+· /,""))}</span></div>`;}
 
 function bar(value,kind="u"){const p=clamp(value),cls=p>=PRESSURE_CRIT?"crit":p>=PRESSURE_WARN?"warn":p>=60?"elevated":"";return `<div class="bar"><div class="${kind} ${cls}" style="width:${p}%"></div></div>`;}
 function gpuBars(gs){return (gs||[]).map(g=>{const mem=pct(g.mem_used,g.mem_total);return `<div class="gpubar"><div class="glabel"><span>GPU${g.index} ${esc((g.name||"").replace(/^NVIDIA /,""))}</span><span class="gpu-inline"><b class="${tempClass(g.temp)}">${g.temp??"-"}°C</b> · ${Math.round(g.util||0)}% 算力 · ${fmtMB(g.mem_used)} / ${fmtMB(g.mem_total)}</span></div>${bar(mem,"m")}<div class="bar util"><div class="u" style="width:${clamp(g.util)}%"></div></div></div>`;}).join("");}

@@ -152,7 +152,7 @@ python3 sysmon_web.py --gateway http://192.168.0.103:8000
 - **同语义可视化**：▰▱ 横条 = 当前值仪表，绿黄红压力分级 / 青蓝容量占用与 CLI 相同；条带光泽扫掠 = CLI 的 glint，
   宽度缓动 = CLI 的 ease-out 平滑，网速箭头流动、Prompt braille 转圈、生成脉冲、排队闪烁一应俱全
 - **同快捷键**：`Space` 暂停（画面冻结后台仍采样）、`P` 进程排序循环、`T` 在浅色与暗色配色间循环；也可用顶栏“外观 / 配色”下拉与按钮
-- **主题与告警**：读取 `themes/*.json`（含自定义），7 套暗色精选底色与 CLI 同名主题同色系，另有 `catppuccin-latte` 浅色；支持 `?theme=nord` 或 `?theme=light` 直链分享。Web 首页固定展示健康告警区，温度 70°C/85°C、压力 85%、排队和网关离线按“严重 / 预警 / 信息”分层
+- **主题与告警**：读取 `themes/*.json`（含自定义），7 套暗色精选底色与 CLI 同名主题同色系，另有 `catppuccin-latte` 浅色；支持 `?theme=nord` 或 `?theme=light` 直链分享。Web 健康告警默认压缩为一行状态条，显示温度 83°C（预警）/88°C（严重）、压力 85%、排队与网关离线分级统计；点击“详情”展开完整告警列表
 - 网关离线时看板明确横幅提示，其余面板照常
 - API：`GET /api/snapshot`（全量 JSON）、`/api/themes`、`/api/theme?name=`；可对接其它仪表盘
 
