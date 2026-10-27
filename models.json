@@ -312,7 +312,7 @@
       "desc": "Wan 2.1/2.2 VAE"
     },
     "clip-vision-h": {
-      "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
       "includes": [
         "split_files/clip_vision/*"
       ],
