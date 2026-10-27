@@ -60,10 +60,17 @@ download)
     HF_TOKEN="$(tr -d '[:space:]' < .hf_token)"
   fi
   python3 - "$name" "$variant" > "$JOB" <<'EOF'
-import json, sys
+import fnmatch, json, os, sys
 man = json.load(open("models.json"))
 name, variant = sys.argv[1], sys.argv[2]
 tasks = []
+def chas(d):
+    """common 组件已在位则不再重下（口径同 menu/manage/console 三处：basename+大小写不敏感）。"""
+    p = os.path.join("models/comfy", d.get("dest", ""))
+    if not os.path.isdir(p): return False
+    files = [f.lower() for f in os.listdir(p)]
+    pats = [os.path.basename(pat).lower() for pat in (d.get("includes") or ["*"])]
+    return all(any(fnmatch.fnmatch(f, pat) for f in files) for pat in pats)
 if name == "common":
     for n, d in man["common"].items():
         tasks.append({"mode": "comfy", "name": n, **d})
@@ -73,14 +80,18 @@ elif name in man["video"]:
     for en, ed in man["video"][name].get("extra", {}).items():
         tasks.append({"mode": "comfy", "name": f"{name}/{en}", **ed})
     for cn, cd in man["common"].items():
-        tasks.append({"mode": "comfy", "name": f"common/{cn}", **cd})
+        if not chas(cd):
+            tasks.append({"mode": "comfy", "name": f"common/{cn}", **cd})
 elif name in man.get("image", {}):
     d = man["image"][name]
     for dest_dir, fname in d["dest"].items():
+        # Comfy-Org repackaged 全部藏在 split_files/<类>/ 下：裸文件名在 hf allow_patterns
+        # 里命不中嵌套路径（实测 0 文件），补 "*/" 通配（fnmatch 的 * 跨斜杠）
         tasks.append({"mode": "comfy", "name": f"image/{name}/{dest_dir}", "repo": d["repo"],
-                      "includes": [fname], "dest": dest_dir})
+                      "includes": [fname, "*/" + fname], "dest": dest_dir})
     for cn, cd in man["common"].items():
-        tasks.append({"mode": "comfy", "name": f"common/{cn}", **cd})
+        if not chas(cd):
+            tasks.append({"mode": "comfy", "name": f"common/{cn}", **cd})
 elif name in man["llm"]:
     d = man["llm"][name]
     if variant == "fp8":
