@@ -34,6 +34,29 @@ python3 sysmonitor/sysmon.py            # 实时监控：GPU/CPU/网速/磁盘IO
 python3 sysmonitor/sysmon_web.py        # 实时监控 Web 版：浏览器看板 http://<本机IP>:8088（已随 compose 常驻 ai-sysmon-web；与 CLI 可同开）
 ```
 
+### 集群统一管理 CLI
+
+`./scripts/ai` 是四节点统一的远程管理入口，直接复用各节点现有 VPN/HTTP 网关，不需要 SSH，也不会修改节点信任关系。节点可用完整 `node_id` 或别名 `home` / `111` / `tju` / `dgx`；默认节点为 `home`。
+
+```bash
+./scripts/ai nodes                         # 节点、VPN 地址与协议能力
+./scripts/ai status --all                  # 并发查询四节点；单点失败不影响其他节点
+./scripts/ai models --all                  # 全部模型与加载状态
+./scripts/ai --node 111 gpus               # GPU 容量、占用与在途请求
+./scripts/ai --node tju modes --model qwen3.8-27b
+./scripts/ai --node tju load qwen3.8-27b --async
+./scripts/ai --node tju ops <request_id> --watch
+./scripts/ai --node tju unload qwen3.8-27b
+./scripts/ai --node home load qwen3.8-27b --mode dual
+./scripts/ai --node home unload --all
+./scripts/ai --node home switch llm
+./scripts/ai --json status --all           # 机器可读输出，错误也为 JSON
+```
+
+`load` 默认同步等待就绪，`--async` 返回 `request_id`；`ops --watch` 默认最多等待 900 秒。`--gpus` / `--mode` / `--replicas` 只透传给网关，布局校验、显存调度和繁忙保护仍由网关执行。`--timeout` 控制单次 HTTP 超时，`ops` 另有 `--watch-timeout` 与 `--interval`。
+
+DGX 是独立栈，只支持 `nodes` / `status` / `models` 只读查询；`load` / `unload` / `switch` / `modes` / `ops` 会明确报告不支持管理协议。任何节点不可达都会打印真实 HTTP/网络原因；`--all` 查询继续覆盖其他节点，全部完成后如有失败退出码为 1（用法错误为 2）。
+
 非交互启动示例：
 ```bash
 ./scripts/start.sh --llm qwen3.8-27b --video wan2.2-s2v -y
@@ -153,7 +176,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 
 - `models.json` — 模型清单（显存/卡数/下载源），新增模型唯一入口
 - `models/llm` — 文本模型 ｜ `models/comfy` — 视频模型（ComfyUI 目录结构）
-- `scripts/` — init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
+- `scripts/` — ai（四节点统一网关管理 CLI）、init.sh（新机器一键初始化）、start.sh（启动）、manage.sh（模型）、menu.py（菜单与守卫逻辑）、comfyui_gpu1.sh（GPU1 第二 ComfyUI 实例，幂等）
 - `sysmonitor/` — 实时监控（curses/文本/Web看板/截图；GPU/网速/磁盘IO/进程/模型吞吐 当前值仪表；Web 支持跟随系统、浅色与 7 套暗色配色、统一健康告警，并可分节点显示 DGX Spark head/worker 的统一内存与模型驻留；详见 `sysmonitor/README.md`）
 - `console/` — GUI 管理后台 agent（9001；agent.py + web/ 静态前端 + console.json relay 白名单。读网关/sysmon、驱动 manage.sh/menu.py；bind-mount 代码，`docker compose restart console` 即生效）
 - `模型切换说明.md` — 文本/视频切换与管理接口（客户端操作依据）

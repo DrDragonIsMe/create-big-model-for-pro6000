@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""算力集群网关统一管理 CLI；仅使用现有 VPN/HTTP 接口。"""
+
+import argparse
+import concurrent.futures
+import json
+import socket
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0"
+NODES = {
+    "home-pro6000-dual": {
+        "aliases": ("home",),
+        "url": "http://100.95.107.118:8000",
+        "protocol": "gateway-negotiation-v1",
+    },
+    "workstation-4090-dual": {
+        "aliases": ("111", "4090"),
+        "url": "http://100.78.215.20:8000",
+        "protocol": "gateway-negotiation-v1",
+    },
+    "tju-pro6000-single": {
+        "aliases": ("tju",),
+        "url": "http://100.119.153.75:8000",
+        "protocol": "gateway-negotiation-v1",
+    },
+    "dgx-spark-pair": {
+        "aliases": ("dgx", "spark"),
+        "url": "http://100.106.146.21:8000",
+        "protocol": "openai-compatible-readonly",
+    },
+}
+ALIASES = {alias: node for node, spec in NODES.items() for alias in spec["aliases"]}
+
+
+class CLIError(Exception):
+    def __init__(self, node, url, kind, message, status=None):
+        super().__init__(message)
+        self.node = node
+        self.url = url
+        self.kind = kind
+        self.message = message
+        self.status = status
+
+    def as_dict(self):
+        error = {"kind": self.kind, "message": self.message, "url": self.url}
+        if self.status is not None:
+            error["http_status"] = self.status
+        return {"node": self.node, "ok": False, "error": error}
+
+
+def node_id(value):
+    if value in NODES:
+        return value
+    if value in ALIASES:
+        return ALIASES[value]
+    choices = ", ".join([*NODES, *ALIASES])
+    raise argparse.ArgumentTypeError(f"未知节点 {value!r}；可选：{choices}")
+
+
+def gateway_url(args, node):
+    return (args.url or NODES[node]["url"]).rstrip("/")
+
+
+def require_management(node):
+    if NODES[node]["protocol"] != "gateway-negotiation-v1":
+        raise CLIError(
+            node,
+            NODES[node]["url"],
+            "unsupported",
+            "该节点只有 OpenAI 兼容只读入口，不支持 /v1/gateway 管理协议；可用 nodes/status/models",
+        )
+
+
+def error_message(payload, fallback):
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if isinstance(error, str):
+            return error
+        if payload.get("detail"):
+            return str(payload["detail"])
+    return fallback
+
+
+def request(args, node, path, method="GET", body=None, timeout=None):
+    base = gateway_url(args, node)
+    url = base + path
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or args.timeout) as response:
+            raw = response.read().decode("utf-8")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+        message = error_message(payload, raw.strip() or exc.reason or "HTTP 错误")
+        raise CLIError(node, url, "http", f"HTTP {exc.code}: {message}", exc.code) from None
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            raise CLIError(node, url, "timeout", f"请求超时（{timeout or args.timeout} 秒）") from None
+        raise CLIError(node, url, "network", f"连接失败：{reason}") from None
+    except (TimeoutError, socket.timeout) as exc:
+        raise CLIError(node, url, "timeout", f"请求超时（{timeout or args.timeout} 秒）") from None
+    except OSError as exc:
+        raise CLIError(node, url, "network", f"连接失败：{exc}") from None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        raise CLIError(node, url, "protocol", "响应不是合法 JSON") from None
+    return payload, status
+
+
+def get_models(args, node):
+    if NODES[node]["protocol"] == "gateway-negotiation-v1":
+        data, _ = request(args, node, "/v1/gateway/capabilities")
+        return data.get("models", {}), data
+    data, _ = request(args, node, "/v1/models")
+    models = {
+        item["id"]: {key: value for key, value in item.items() if key != "id"}
+        for item in data.get("data", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    return models, data
+
+
+def get_status(args, node):
+    if NODES[node]["protocol"] == "gateway-negotiation-v1":
+        data, _ = request(args, node, "/v1/gateway/status")
+        return data
+    models, _ = get_models(args, node)
+    return {
+        "protocol": "openai-compatible-readonly",
+        "models": models,
+        "limitations": [
+            "无 /v1/gateway/status，不能提供 GPU、在途请求、token 或 ComfyUI 指标",
+            "不支持 load/unload/switch/modes/ops 管理操作",
+        ],
+    }
+
+
+def print_data(data):
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def print_nodes():
+    for node, spec in NODES.items():
+        aliases = ",".join(spec["aliases"])
+        print(f"{node:<26} {aliases:<12} {spec['url']:<34} {spec['protocol']}")
+
+
+def print_status(node, data):
+    print(f"== {node} ==")
+    if data.get("protocol") == "openai-compatible-readonly":
+        for name, model in data.get("models", {}).items():
+            loaded = "loaded" if model.get("loaded") else "available"
+            print(f"  {name:<32} {loaded}")
+        for limitation in data.get("limitations", []):
+            print(f"  限制：{limitation}")
+        return
+    backends = data.get("backends", {})
+    if not backends:
+        print("  后端：无已加载模型")
+    for name, backend in backends.items():
+        tokens = backend.get("tokens") or {}
+        rate = tokens.get("generation_rate")
+        suffix = f"  {rate:.1f} t/s" if isinstance(rate, (int, float)) else ""
+        print(
+            f"  {name:<32} {backend.get('status', '?'):<9} "
+            f"{backend.get('engine', '?'):<9} GPU={backend.get('gpus', [])} "
+            f"in_flight={backend.get('in_flight', 0)}{suffix}"
+        )
+    for gpu, info in sorted(data.get("gpu_free", {}).items()):
+        free = info.get("free", 0) / 1024
+        total = info.get("total", 0) / 1024
+        print(f"  GPU {gpu}: {free:.1f}/{total:.1f} GiB 空闲")
+    if data.get("comfy_gpus"):
+        print(f"  ComfyUI GPU：{data['comfy_gpus']}")
+
+
+def print_models(node, models):
+    print(f"== {node} ==")
+    if not models:
+        print("  无可用模型")
+    for name, model in models.items():
+        state = "ready" if model.get("loaded") else model.get("backend_status", "available")
+        engine = model.get("engine", "unknown")
+        context = model.get("context_window")
+        ctx = f"ctx={context}" if context else "ctx=unknown"
+        print(f"  {name:<32} {state:<10} {engine:<10} {ctx}")
+
+
+def print_gpus(data):
+    print(f"GPU 数量：{data.get('gpu_count', 0)}")
+    for index, gpu in sorted(data.get("gpus", {}).items()):
+        print(
+            f"GPU {index}: {gpu.get('free_mb', 0) / 1024:.1f}/{gpu.get('total_mb', 0) / 1024:.1f} GiB 空闲，"
+            f"利用率 {gpu.get('util_pct', '?')}%"
+        )
+        for backend in gpu.get("llm_backends", []):
+            print(f"  LLM {backend.get('model')} [{backend.get('status')}] in_flight={backend.get('in_flight')}")
+    for name, comfy in data.get("comfy", {}).items():
+        print(f"  {name}: exists={comfy.get('exists')} status={comfy.get('status')} GPU={comfy.get('gpus')}")
+
+
+def print_modes(data):
+    for name, catalog in data.get("models", {}).items():
+        active = catalog.get("active") or {}
+        print(f"== {name} == active={active}")
+        for mode in catalog.get("modes", []):
+            print(
+                f"  {mode.get('id'):<9} runnable={mode.get('runnable_via_load')} "
+                f"GPU={mode.get('gpus')} replicas={mode.get('replicas')} "
+                f"ctx={mode.get('enforced_max_len')}  {mode.get('note', '')}"
+            )
+
+
+def print_ops(data):
+    ops = data.get("ops", [data])
+    for op in ops:
+        print(
+            f"{op.get('request_id', '-')}  {op.get('kind', '-'):<8} "
+            f"{op.get('status', '-'):<9} {op.get('stage', '-'):<12} "
+            f"{op.get('model') or '-'}  {op.get('detail') or op.get('error') or ''}"
+        )
+
+
+def print_success(node, data):
+    print_data(data)
+
+
+def render(args, node, command, data):
+    if args.json:
+        print_data({"node": node, "ok": True, "data": data})
+        return
+    if command == "status":
+        print_status(node, data)
+    elif command == "models":
+        print_models(node, data)
+    elif command == "gpus":
+        print_gpus(data)
+    elif command == "modes":
+        print_modes(data)
+    elif command == "ops":
+        print_ops(data)
+    else:
+        print_success(node, data)
+
+
+def render_error(args, error):
+    if args.json:
+        print_data(error.as_dict())
+    else:
+        print(f"{error.node}: {error.message} [{error.url}]", file=sys.stderr)
+
+
+def run_all(args, command):
+    def fetch(node):
+        if command == "status":
+            return get_status(args, node)
+        models, _ = get_models(args, node)
+        return models
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(NODES)) as pool:
+        futures = {node: pool.submit(fetch, node) for node in NODES}
+        for node, future in futures.items():
+            try:
+                results.append((node, future.result(), None))
+            except CLIError as exc:
+                results.append((node, None, exc))
+    if args.json:
+        print_data({
+            "ok": not any(error for _, _, error in results),
+            "results": [
+                error.as_dict() if error else {"node": node, "ok": True, "data": data}
+                for node, data, error in results
+            ],
+        })
+    else:
+        for node, data, error in results:
+            if error:
+                render_error(args, error)
+            else:
+                render(args, node, command, data)
+    return 1 if any(error for _, _, error in results) else 0
+
+
+def watch_op(args, node, request_id):
+    deadline = time.monotonic() + args.watch_timeout
+    while True:
+        data, _ = request(args, node, f"/v1/gateway/ops/{request_id}")
+        if data.get("status") in ("success", "failed"):
+            render(args, node, "ops", data)
+            return 1 if data.get("status") == "failed" else 0
+        if not args.json:
+            render(args, node, "ops", data)
+        if time.monotonic() >= deadline:
+            raise CLIError(
+                node,
+                gateway_url(args, node),
+                "timeout",
+                f"等待操作 {request_id} 超过 {args.watch_timeout} 秒；可稍后重跑 ops {request_id} --watch",
+            )
+        time.sleep(args.interval)
+
+
+def parse_gpus(value):
+    try:
+        gpus = [int(item) for item in value.split(",") if item != ""]
+    except ValueError:
+        raise argparse.ArgumentTypeError("GPU 列表应为逗号分隔的非负整数，如 0,1") from None
+    if not gpus or any(gpu < 0 for gpu in gpus) or len(set(gpus)) != len(gpus):
+        raise argparse.ArgumentTypeError("GPU 列表应为不重复的非负整数，如 0,1")
+    return gpus
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ai",
+        description="算力集群统一管理 CLI（直接访问现有 VPN/HTTP 网关，不改变 SSH 信任关系）",
+        epilog="示例：ai status --all；ai --node tju load qwen3.8-27b --async；ai --node tju ops <id> --watch",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--node", type=node_id, default="home", help="节点 ID 或别名 home/111/tju/dgx（默认 home）")
+    parser.add_argument("--url", help="覆盖所选节点的网关 base URL，例如 http://127.0.0.1:8000")
+    parser.add_argument("--json", action="store_true", help="输出稳定 JSON；错误也使用 JSON")
+    parser.add_argument("--timeout", type=float, default=30, help="单次 HTTP 请求超时秒数（默认 30；同步 load 默认 900）")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("nodes", help="列出节点与协议能力")
+
+    for command in ("status", "models"):
+        p = sub.add_parser(command, help=f"查看{command == 'status' and '运行状态' or '模型列表'}")
+        p.add_argument("--all", action="store_true", help="查询全部四节点；单点失败不中断")
+
+    for command in ("capabilities", "gpus"):
+        sub.add_parser(command, help=f"查询网关 {command}")
+
+    p = sub.add_parser("modes", help="查询模型布局目录")
+    p.add_argument("--model", help="只查询指定模型")
+
+    p = sub.add_parser("load", help="加载模型或切换运行布局")
+    p.add_argument("model")
+    layout = p.add_mutually_exclusive_group()
+    layout.add_argument("--gpus", type=parse_gpus, help="硬性指定 GPU，如 0 或 0,1")
+    layout.add_argument("--mode", help="布局模式 dual/tp/replica/pool/auto")
+    layout.add_argument("--replicas", type=int, help="运行态副本数")
+    p.add_argument("--async", dest="async_load", action="store_true", help="立即返回 request_id，不等待就绪")
+
+    p = sub.add_parser("unload", help="卸载空闲模型；正忙模型由网关拒绝")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("model", nargs="?")
+    target.add_argument("--all", action="store_true", help="卸载全部空闲文本后端")
+
+    p = sub.add_parser("switch", help="切换显存归属")
+    p.add_argument("target", choices=("llm", "video"))
+    p.add_argument("--model", help="llm 模式可选模型名，由网关校验")
+    p.add_argument("--async", dest="async_switch", action="store_true", help="异步执行并返回 request_id")
+
+    p = sub.add_parser("ops", help="查询或监视异步管理操作")
+    p.add_argument("request_id", nargs="?")
+    p.add_argument("--watch", action="store_true", help="轮询到 success/failed；需要 request_id")
+    p.add_argument("--watch-timeout", type=float, default=900, help="总等待秒数（默认 900）")
+    p.add_argument("--interval", type=float, default=2, help="轮询间隔秒数（默认 2）")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.error("--timeout 必须大于 0")
+    node = node_id(args.node)
+    command = args.command
+    try:
+        if command == "nodes":
+            if args.json:
+                print_data({"ok": True, "nodes": [{"node": name, **spec} for name, spec in NODES.items()]})
+            else:
+                print_nodes()
+            return 0
+        if command in ("status", "models") and args.all:
+            if args.url:
+                parser.error("--all 不能与 --url 同时使用")
+            return run_all(args, command)
+        if command == "status":
+            data = get_status(args, node)
+        elif command == "models":
+            data, _ = get_models(args, node)
+        elif command == "capabilities":
+            require_management(node)
+            data, _ = request(args, node, "/v1/gateway/capabilities")
+        elif command == "gpus":
+            require_management(node)
+            data, _ = request(args, node, "/v1/gateway/gpus")
+        elif command == "modes":
+            require_management(node)
+            query = "?" + urllib.parse.urlencode({"model": args.model}) if args.model else ""
+            data, _ = request(args, node, "/v1/gateway/modes" + query)
+        elif command == "load":
+            require_management(node)
+            if args.replicas is not None and args.replicas < 1:
+                parser.error("--replicas 必须大于等于 1")
+            body = {"model": args.model, "wait": not args.async_load}
+            for key in ("gpus", "mode", "replicas"):
+                value = getattr(args, key)
+                if value is not None:
+                    body[key] = value
+            timeout = 900 if not args.async_load and args.timeout == 30 else args.timeout
+            data, status = request(args, node, "/v1/gateway/load", "POST", body, timeout)
+            if status == 202 and not args.json:
+                print_data(data)
+                op = data.get("op", {})
+                if op.get("request_id"):
+                    print(f"轮询：ai --node {node} ops {op['request_id']} --watch")
+                return 0
+        elif command == "unload":
+            require_management(node)
+            if args.all:
+                data, _ = request(args, node, "/v1/gateway/unload_all", "POST", {})
+            else:
+                data, _ = request(args, node, "/v1/gateway/unload", "POST", {"model": args.model})
+        elif command == "switch":
+            require_management(node)
+            body = {"target": args.target, "wait": not args.async_switch}
+            if args.model:
+                body["model"] = args.model
+            data, status = request(args, node, "/v1/gateway/switch", "POST", body)
+            if status == 202 and not args.json:
+                print_data(data)
+                op = data.get("op", {})
+                if op.get("request_id"):
+                    print(f"轮询：ai --node {node} ops {op['request_id']} --watch")
+                return 0
+        elif command == "ops":
+            require_management(node)
+            if args.watch and not args.request_id:
+                parser.error("ops --watch 需要 request_id")
+            if args.watch_timeout <= 0 or args.interval <= 0:
+                parser.error("--watch-timeout 和 --interval 必须大于 0")
+            if args.watch:
+                return watch_op(args, node, args.request_id)
+            path = f"/v1/gateway/ops/{args.request_id}" if args.request_id else "/v1/gateway/ops"
+            data, _ = request(args, node, path)
+        else:
+            parser.error(f"未知命令 {command}")
+        render(args, node, command, data)
+        return 0
+    except CLIError as exc:
+        render_error(args, exc)
+        return 1
+    except KeyboardInterrupt:
+        print("操作已中断；远端已接受的任务不会被取消，请用 ops 查询实际状态", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
