@@ -67,7 +67,7 @@ DGX 是独立栈，只支持 `nodes` / `status` / `models` 只读查询；`load`
 ## 服务入口
 
 - LLM API（OpenAI 兼容）: http://localhost:8000/v1/chat/completions
-- ComfyUI 图形界面: http://localhost:8188（第二实例 8189）
+- ComfyUI 图形界面: http://localhost:8188（第二实例 8189）；显存驻留策略按本机派生（整条流水线放得下才 `--highvram`，48GB 卡跑 H3 时阶段间卸到 CPU，见 `模型切换说明.md`）
 - 监控看板（Web，常驻）: http://localhost:8088 —— sysmonitor GPU/吞吐/网速/磁盘/进程实时仪表，含温度与系统压力告警区；支持跟随系统 / 浅色 / 深色；终端版 `python3 sysmonitor/sysmon.py` 可同时开
 - **管理后台（GUI，常驻）**: http://localhost:9001 —— 集群总览、温度/负载告警、DGX head/worker 统一内存状态、模型吞吐、内存/磁盘/网络与进程详情，以及模型下载、布局切换（gateway-layout-v1 目录）和任务日志；打开任意一台即可看到四台（浏览器直连各节点 agent:9001，DGX 经 relay 只读）。控制台支持跟随系统 / 浅色 / 深色。agent 只是遥控器：下载=manage.sh、持久布局=menu.py、运行态切换=网关，写配置的仍然只有 menu.py
 

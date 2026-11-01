@@ -13,6 +13,15 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# 驻留策略与 compose 里的 ai-comfyui 同源：menu.py 按本机显存写 COMFY_VRAM_MODE。
+# 整条流水线驻留集放得下才 --highvram；48GB 卡跑 H3 时保持默认（阶段间卸到 CPU），
+# 否则文本编码器会和 DiT+LoRA 叠在卡上 OOM。旧 .env 没有该键时按 highvram 兼容。
+[[ -f .env ]] && { set -a; source ./.env; set +a; }
+case "${COMFY_VRAM_MODE:-highvram}" in
+  highvram) VRAM_FLAG=--highvram ;;
+  *)        VRAM_FLAG= ;;
+esac
+
 NAME=ai-comfyui-gpu1
 IMAGE=ai-comfyui:local
 GPU=${COMFY_GPU1_INDEX:-1}     # 实例所在的卡
@@ -61,7 +70,7 @@ docker run -d --name "$NAME" --restart unless-stopped --gpus "device=${GPU}" \
   -v "${ROOT}/data:/data:rw" \
   -e HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
   "${LABELS[@]}" \
-  "$IMAGE" python3 main.py --listen 0.0.0.0 --port 8188 --highvram \
+  "$IMAGE" python3 main.py --listen 0.0.0.0 --port 8188 ${VRAM_FLAG} \
   --output-directory /data/output --input-directory /data/input >/dev/null
 
-echo "已创建并启动 $NAME（GPU${GPU} → http://localhost:${HOST_PORT}）"
+echo "已创建并启动 $NAME（GPU${GPU} → http://localhost:${HOST_PORT}，驻留 ${COMFY_VRAM_MODE:-highvram}）"

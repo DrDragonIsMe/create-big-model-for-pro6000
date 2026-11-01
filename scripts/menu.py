@@ -135,6 +135,26 @@ def video_tier(vdef, free_gb, slack):
         return "risky480", "480p+offload(慢)", 480
     return "no", "", None
 
+def comfy_vram_mode(vdef, budget_gb, max_res):
+    """ComfyUI 驻留策略：'highvram' 只给"整条流水线能同时驻留"的机器。
+
+    准入（video_tier）看的是单卡峰值得以发生在阶段之间卸掉上一阶段组件，所以
+    48GB 卡也能跑声明 55GB 的 minimax-h3；但 --highvram 恰恰取消这种卸载。
+    models.json 的 vram_* 是流水线各阶段之和，正是 --highvram 下的驻留集合：
+    它超过本机可用显存时，上一阶段的 32B 文本编码器（int8 ≈25.9GB）会与
+    DiT + turbo LoRA patch 叠在卡上，实测（2×4090/480p）直接 OOM。
+    不带 highvram（默认）时 ComfyUI 在阶段间把上一阶段卸到 CPU，代价只是换阶段重载几秒。
+
+    返回 (模式, 说明)；模式直接落 .env 的 COMFY_VRAM_MODE，compose 与
+    comfyui_gpu1.sh 同源读取，避免两个实例各自判断。
+    """
+    need = vdef.get("vram_720p_bf16" if max_res == 720 else "vram_480p_fp8")
+    if not need:
+        return "normal", "清单无显存声明，保守不全驻留"
+    if budget_gb >= need:
+        return "highvram", f"驻留集 {need:.0f}GB ≤ 可用 {budget_gb:.0f}GB"
+    return "normal", f"驻留集 {need:.0f}GB > 可用 {budget_gb:.0f}GB，阶段间卸到 CPU"
+
 def suggest_modes(man, *, gmem, gpu_count, bud, meta, llm_name, d, variant,
                   vram_eff, engine, mode, replicas, comfy_devices,
                   comfy_enabled, free_video, max_len, args):
@@ -509,8 +529,10 @@ def compute(args, man, gpu_count, gpu_mem):
             sys.exit(f"错误：视频选项 '{video_name}' 在当前 LLM/卡数下不可用（显存不足或被独占）")
         tier = next(t for n, t, _, _, _ in menu if n == video_name)
         max_res = 720 if tier == "720" else 480
+        vram_mode, vram_why = comfy_vram_mode(videos[video_name], free_video, max_res)
     else:
         max_res = None
+        vram_mode, vram_why = "normal", "不启动 ComfyUI"
         comfy_enabled = 0 if mode == "flagship" else comfy_enabled
     if video_name == "none" and not args.yes and args.video is None:
         comfy_enabled = 0
@@ -593,6 +615,7 @@ def compute(args, man, gpu_count, gpu_mem):
         "LLM_DEVICES": llm_devices, "LLM_QUANT": ("--quantization fp8" if variant == "fp8" and not (d.get("repo_fp8") and os.path.isdir(f"models/llm/{llm_name}-fp8") and os.listdir(f"models/llm/{llm_name}-fp8")) else ""),
         "LLAMA_TENSOR_SPLIT": tensor_split or "", "LLAMA_INCLUDE": d.get("gguf_include", ""),
         "COMFY_ENABLED": comfy_enabled, "COMFY_DEVICES": comfy_devices,
+        "COMFY_VRAM_MODE": vram_mode,
         "VIDEO_NAME": video_name, "VIDEO_MAX_RES": max_res or "",
         "LLM_API_KEY": api_key,
         "HF_ENDPOINT": "https://hf-mirror.com",
@@ -609,7 +632,7 @@ def compute(args, man, gpu_count, gpu_mem):
           + (f", ×{replicas} 副本" if replicas > 1 else "")
           + (f", tensor-split={tensor_split}" if tensor_split else "")
           + f", 单请求 ctx≈{max_len:,})")
-    print(f"  视频: {video_name}" + (f"（上限 {max_res}p, GPU [{comfy_devices}]）" if video_name != "none" else "（不启动 ComfyUI）"))
+    print(f"  视频: {video_name}" + (f"（上限 {max_res}p, GPU [{comfy_devices}], 驻留 {vram_mode}：{vram_why}）" if video_name != "none" else "（不启动 ComfyUI）"))
     return env
 
 def yq_devices(ids):  # ["0","1"] -> YAML list
@@ -622,6 +645,10 @@ def write_compose(env, llm_def):
     environment:
       - HF_ENDPOINT=${HF_ENDPOINT}"""
     if env["COMFY_ENABLED"] and env["VIDEO_NAME"] != "none":
+        # 驻留策略由本机显存派生（comfy_vram_mode）：整条流水线放得下才常驻显存，
+        # 否则默认阶段间卸到 CPU——48GB 卡跑 H3 时 --highvram 会把文本编码器
+        # 和 DiT+LoRA 叠在一起 OOM，实测见模型切换说明。
+        vram_arg = " --highvram" if env.get("COMFY_VRAM_MODE") == "highvram" else ""
         lines.append(f"""  comfyui:
     build: ./docker/comfyui
     image: ai-comfyui:local
@@ -632,7 +659,7 @@ def write_compose(env, llm_def):
       - {ROOT}/models/comfy:/opt/ComfyUI/models
       - {ROOT}/data:/data
     command: >-
-      python3 main.py --listen 0.0.0.0 --port 8188 --highvram
+      python3 main.py --listen 0.0.0.0 --port 8188{vram_arg}
       --output-directory /data/output --input-directory /data/input
     deploy:
       resources:

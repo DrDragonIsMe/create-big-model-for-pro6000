@@ -455,6 +455,23 @@ def begin_live_tokens(name):
     st["generation_rate"] = 0.0
 
 
+def refresh_live_counters(name):
+    """查询时就地重算在飞请求的速率与累计。
+
+    SSE 增量是逐 chunk 连续进账的，没必要等后台 2s 采样节拍；否则 1s 刷新的监控端
+    有一半的帧读到旧值，生成中的 t/s 会跳成 0、Σgen 也会一格一格地跳。
+    """
+    st = token_metrics_cache.get(name)
+    if not st or not st.get("live_start"):
+        return None
+    now = time.time()
+    elapsed = max(now - st["live_start"], 1e-6)
+    st["generation_rate"] = max(0.0, st.get("live_seen", 0.0) / elapsed)
+    st["generation_total"] = max(st.get("generation_total") or 0.0,
+                                 st.get("live_base_total", 0.0) + st.get("live_seen", 0.0))
+    return st
+
+
 def add_live_tokens(name, count):
     if count <= 0:
         return
@@ -834,14 +851,14 @@ def _remove_backend_containers(b):
 
 
 def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env=None,
-                 engine="vllm", gguf_include=None, plan=None, cname=None):
+                 engine="vllm", gguf_include=None, plan=None, cname=None, image=None):
     kwargs = {}
     if len(gpus) > 1:
         kwargs["ipc_mode"] = "host"
     if engine == "llamacpp":
         # llama.cpp 不做多副本：单容器吃整组卡，cname 忽略
         _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args, kwargs,
-                      plan=plan, env=env)
+                      plan=plan, env=env, image=image)
         return
     tp = len(gpus)
     cmd = [f"/models/{dirname}", "--served-model-name", name,
@@ -889,7 +906,7 @@ def _find_mmproj(dirname):
 
 
 def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=None,
-                  kwargs=None, plan=None, env=None):
+                  kwargs=None, plan=None, env=None, image=None):
     """启动 llama.cpp 后端（llama-server，OpenAI 兼容）。GGUF 多分片只传第一个文件，
     llama.cpp 按命名约定自动续载其余分片。flag 以 2026 版 llama-server --help 实测为准：
     -ngl 默认 auto（按显存自动分层）；工具调用由默认启用的 Jinja 聊天解析自动提取；
@@ -944,7 +961,7 @@ def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=
         test=["CMD", "curl", "-f", "http://localhost:8000/health"],
         interval=30000000000, timeout=5000000000, retries=3, start_period=30000000000)
     dcli.containers.run(
-        LLAMACPP_IMAGE, command=cmd, name=f"ai-llamacpp-{name}", detach=True,
+        image or LLAMACPP_IMAGE, command=cmd, name=f"ai-llamacpp-{name}", detach=True,
         device_requests=[docker.types.DeviceRequest(
             device_ids=[str(g) for g in gpus], capabilities=[["gpu"]])],
         network=NETWORK, shm_size="16g",
@@ -1248,7 +1265,8 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
             for grp, node in zip(groups, cnodes):
                 await asyncio.to_thread(_run_backend, name, dirname, grp, util, max_len,
                                         think, gw.get("extra_args"), gw.get("env"),
-                                        engine, d.get("gguf_include"), plan, node)
+                                        engine, d.get("gguf_include"), plan, node,
+                                        image=gw.get("image"))
                 launched.append(node)
         except Exception:
             # 某副本连容器都没拉起来：删掉已拉起的副本，别留登记之外占着显存的孤儿容器
@@ -1391,7 +1409,9 @@ async def status(request: Request):
     out_backends = {}
     for name, backend in backends.items():
         item = dict(backend)
-        stat = token_stats.get(name)
+        stat = refresh_live_counters(name)
+        if stat is None:
+            stat = token_stats.get(name)
         if stat:
             item["tokens"] = {
                 "prompt_total": stat.get("prompt_total"),

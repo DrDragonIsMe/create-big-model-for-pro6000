@@ -13,6 +13,9 @@ data/abtest/
 data/vllm-cache/
 .jobs/
 
+# llama.cpp 源码：构建镜像时由宿主机浅克隆（见 docker/llamacpp/Dockerfile 注释），可重新获取
+docker/llamacpp/llama.cpp/
+
 # Python
 __pycache__/
 *.py[cod]
