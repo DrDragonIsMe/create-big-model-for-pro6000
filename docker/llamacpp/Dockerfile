@@ -5,12 +5,13 @@
 FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git cmake build-essential libcurl4-openssl-dev \
+      git cmake build-essential libcurl4-openssl-dev curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY llama.cpp /src/llama.cpp
 RUN cmake -S /src/llama.cpp -B /src/llama.cpp/build \
-       -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF \
+       -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real \
+       -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF \
     && cmake --build /src/llama.cpp/build --config Release -j"$(nproc)" --target llama-server \
     && cp /src/llama.cpp/build/bin/llama-server /usr/local/bin/ \
     && rm -rf /src/llama.cpp

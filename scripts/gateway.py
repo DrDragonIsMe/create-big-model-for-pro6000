@@ -651,9 +651,16 @@ def _apply_backend_metrics(name, backend, metrics=None, error=False):
     item["prefill_elapsed"] = elapsed
     item["prefill_seen_at"] = now
     if backend.get("engine") == "llamacpp":
-        total = max(float(generated), item.get("generation_total") or 0.0)
+        prev_total = item.get("generation_total") or 0.0
+        # 容器重建后 llama.cpp 的 counter 从 0 重新累计：新值若远小于旧值
+        # （正常回落最多小几个 token，不是砍半）说明后端重启过，重置基线，
+        # 否则 max() 会把 generation_total 永久冻结在旧容器的累计值上，
+        # 监控端差分 t/s 恒为 0
+        if generated < prev_total * 0.5:
+            prev_total = 0.0
+        total = max(float(generated), prev_total)
         if item.get("live_start"):
-            item["live_base_total"] = max(item.get("live_base_total", 0.0),
+            item["live_base_total"] = max(item["live_base_total"], 0.0,
                                           float(generated))
             total = max(total, item["live_base_total"] + item.get("live_seen", 0.0))
         item["generation_total"] = total
