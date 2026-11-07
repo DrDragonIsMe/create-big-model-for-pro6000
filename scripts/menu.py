@@ -12,9 +12,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from check_llm_config import yarn_override_limit
 import hwprofile  # 探测 + 派生预算：meta 里那批绝对 GB 的唯一替代口径
 
+LAST_LLM_FILE = os.environ.get("AI_LAST_LLM_FILE", os.path.join(ROOT, "data/gateway/state.json"))
+DEFAULT_LLM = "qwen3.8-flash-next"
+
 def load_manifest():
     with open("models.json", encoding="utf-8") as f:
         return json.load(f)
+
+def automatic_llm(llms):
+    try:
+        with open(LAST_LLM_FILE, encoding="utf-8") as f:
+            name = json.load(f).get("last_loaded_llm")
+    except (OSError, ValueError, AttributeError):
+        name = None
+    if name in llms:
+        return name, True
+    return DEFAULT_LLM, False
 
 def llm_downloaded(name):
     d = os.path.join("models/llm", name)
@@ -256,6 +269,11 @@ def compute(args, man, gpu_count, gpu_mem):
 
     # ---------- 第 1 级：LLM ----------
     llm_name = args.llm
+    if llm_name == "":
+        llm_name, remembered = automatic_llm(llms)
+        args.llm = llm_name
+        source = "上次成功加载" if remembered else "无历史记录，使用默认"
+        print(f"\n自动选择文本模型：{llm_name}（{source}）")
     if llm_name is not None and llm_name not in llms:
         sys.exit(f"错误：清单里没有 LLM '{llm_name}'（可用 manage.sh list 查看，或 manage.sh add 新增）")
     if gpu_count == 1:
@@ -727,7 +745,8 @@ def sync_meta(man, prof):
 
 def main():
     ap = argparse.ArgumentParser(description="AI 服务启动配置")
-    ap.add_argument("--llm", help="LLM 名称（非交互）")
+    ap.add_argument("--llm", nargs="?", const="",
+                    help="LLM 名称；省略名称时用上次成功加载的模型，无记录则用 qwen3.8-flash-next")
     ap.add_argument("--video", help="视频任务名称或 none（非交互）")
     ap.add_argument("--variant", help="强制变体，如 fp8/bf16/ud1.8")
     ap.add_argument("--replicas", type=int, default=1,

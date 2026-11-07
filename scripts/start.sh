@@ -32,7 +32,7 @@ show_help() {
     cat << 'HELPEOF'
 用法:
   ./start.sh                    交互模式（菜单选模型，自动检测 GPU 数）
-  ./start.sh --llm <模型> --video <视频|none> [-y]   非交互一键启动（模型名见下方清单）
+  ./start.sh --llm [模型] --video <视频|none> [-y]  省略模型名用上次成功加载的模型（无记录则用旗舰）
   ./start.sh --switch video|llm [模型名]             快速切换文本/视频（网关常驻，无需重启）
   ./start.sh --down / --clean                        停止全部 / 停止并删除容器
   ./start.sh --help, -h                              显示本帮助
@@ -78,7 +78,7 @@ PY
     cat << 'HELPEOF'
 
 选项:
-  --llm <模型>      文本模型名（上面清单任选；默认 qwen3.8-27b；none=不启动文本）
+  --llm [模型]      省略模型名时用上次成功加载的模型，无记录则用 qwen3.8-flash-next
   --video <模型>    视频模型名（上面清单任选；默认 wan2.2-s2v；none=不启动视频）
   -y, --yes         跳过确认提示（非交互模式）
   --switch <目标>   切换服务对象（网关常驻，只决定显存归谁；也可写 -switch）
@@ -291,9 +291,15 @@ echo "==> 准备镜像"
 # 网关镜像随 scripts/gateway.py 显式重建：compose up 的隐式构建在镜像已存在时会复用旧代码
 docker build -q -f docker/gateway/Dockerfile -t ai-gateway:local . >/dev/null
 if [[ "${LLM_ENGINE}" == "vllm" ]]; then
-  docker pull vllm/vllm-openai:latest
+  if docker image inspect vllm/vllm-openai:latest >/dev/null 2>&1; then
+    echo "✓ 本地已有 vLLM 镜像，跳过拉取"
+  else
+    docker pull vllm/vllm-openai:latest
+  fi
 else
-  if ! docker pull ghcr.io/ggml-org/llama.cpp:server-cuda 2>/dev/null; then
+  if docker image inspect ghcr.io/ggml-org/llama.cpp:server-cuda >/dev/null 2>&1; then
+    echo "✓ 本地已有 llama.cpp 镜像，跳过拉取"
+  elif ! docker pull ghcr.io/ggml-org/llama.cpp:server-cuda 2>/dev/null; then
     echo "预构建 llama.cpp 镜像拉取失败，改本地编译兜底镜像（约 10-20 分钟）…"
     docker build -t ghcr.io/ggml-org/llama.cpp:server-cuda ./docker/llamacpp
   fi

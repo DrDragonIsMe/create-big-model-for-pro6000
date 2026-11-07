@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""算力集群网关统一管理 CLI；仅使用现有 VPN/HTTP 接口。"""
+"""算力集群网关统一管理 CLI；直连集群 HTTP 端口，不经出网代理。
+
+连接优先级：nebula（192.168.100.x）→ tailscale（100.x）自动回退；dgx 无 nebula 面，只用 tailscale。"""
 
 import argparse
 import concurrent.futures
@@ -11,21 +13,24 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0"
+VERSION = "1.1"
 NODES = {
     "home-pro6000-dual": {
         "aliases": ("home",),
-        "url": "http://100.95.107.118:8000",
+        "url": "http://192.168.100.113:8000",
+        "fallback_url": "http://100.95.107.118:8000",
         "protocol": "gateway-negotiation-v1",
     },
     "workstation-4090-dual": {
         "aliases": ("111", "4090"),
-        "url": "http://100.78.215.20:8000",
+        "url": "http://192.168.100.111:8000",
+        "fallback_url": "http://100.78.215.20:8000",
         "protocol": "gateway-negotiation-v1",
     },
     "tju-pro6000-single": {
         "aliases": ("tju",),
-        "url": "http://100.119.153.75:8000",
+        "url": "http://192.168.100.114:8000",
+        "fallback_url": "http://100.119.153.75:8000",
         "protocol": "gateway-negotiation-v1",
     },
     "dgx-spark-pair": {
@@ -88,17 +93,13 @@ def error_message(payload, fallback):
     return fallback
 
 
-def request(args, node, path, method="GET", body=None, timeout=None):
-    base = gateway_url(args, node)
-    url = base + path
-    data = None
-    headers = {"Accept": "application/json"}
-    if body is not None:
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _do_request(node, url, data, headers, method, timeout):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout or args.timeout) as response:
+        with OPENER.open(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
             status = response.status
     except urllib.error.HTTPError as exc:
@@ -112,10 +113,10 @@ def request(args, node, path, method="GET", body=None, timeout=None):
     except urllib.error.URLError as exc:
         reason = exc.reason
         if isinstance(reason, (TimeoutError, socket.timeout)):
-            raise CLIError(node, url, "timeout", f"请求超时（{timeout or args.timeout} 秒）") from None
+            raise CLIError(node, url, "timeout", f"请求超时（{timeout} 秒）") from None
         raise CLIError(node, url, "network", f"连接失败：{reason}") from None
-    except (TimeoutError, socket.timeout) as exc:
-        raise CLIError(node, url, "timeout", f"请求超时（{timeout or args.timeout} 秒）") from None
+    except (TimeoutError, socket.timeout):
+        raise CLIError(node, url, "timeout", f"请求超时（{timeout} 秒）") from None
     except OSError as exc:
         raise CLIError(node, url, "network", f"连接失败：{exc}") from None
     try:
@@ -123,6 +124,26 @@ def request(args, node, path, method="GET", body=None, timeout=None):
     except json.JSONDecodeError:
         raise CLIError(node, url, "protocol", "响应不是合法 JSON") from None
     return payload, status
+
+
+def request(args, node, path, method="GET", body=None, timeout=None):
+    base = gateway_url(args, node)
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    timeout = timeout or args.timeout
+    try:
+        return _do_request(node, base + path, data, headers, method, timeout)
+    except CLIError as exc:
+        # nebula 面连不上时回退 tailscale；超时只对幂等 GET 回退（POST 超时可能已在服务端执行）；HTTP 层错误绝不重试
+        fallback = NODES[node].get("fallback_url")
+        retryable = exc.kind == "network" or (exc.kind == "timeout" and method == "GET")
+        if (not args.url and fallback and retryable
+                and fallback.rstrip("/") != base):
+            return _do_request(node, fallback.rstrip("/") + path, data, headers, method, timeout)
+        raise
 
 
 def get_models(args, node):
@@ -160,7 +181,11 @@ def print_data(data):
 def print_nodes():
     for node, spec in NODES.items():
         aliases = ",".join(spec["aliases"])
-        print(f"{node:<26} {aliases:<12} {spec['url']:<34} {spec['protocol']}")
+        url = spec["url"]
+        fallback = spec.get("fallback_url")
+        if fallback:
+            url = f"{url} → {fallback}"
+        print(f"{node:<26} {aliases:<12} {url:<58} {spec['protocol']}")
 
 
 def print_status(node, data):
@@ -332,7 +357,7 @@ def parse_gpus(value):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="ai",
-        description="算力集群统一管理 CLI（直接访问现有 VPN/HTTP 网关，不改变 SSH 信任关系）",
+        description="算力集群统一管理 CLI（直连集群 HTTP 端口，不改变 SSH 信任关系；nebula 优先、tailscale 自动回退）",
         epilog="示例：ai status --all；ai --node tju load qwen3.8-27b --async；ai --node tju ops <id> --watch",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")

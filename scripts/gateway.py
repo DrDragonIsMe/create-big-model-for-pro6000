@@ -57,8 +57,19 @@ NETWORK = os.environ.get("GW_NETWORK", "ai_default")
 PRELOAD = [m for m in os.environ.get("PRELOAD", "").split(",") if m]
 NEED_MARGIN_MB = 512  # vLLM 要求 空闲 >= util×total，再加安全余量，避免放行后启动崩溃
 COMFY_HOST = os.environ.get("COMFY_HOST", "host.docker.internal")  # 网关访问 ComfyUI 的宿主地址
+STATE_FILE = os.environ.get("GATEWAY_STATE_FILE", "/data/gateway/state.json")
 
 log = lambda *a: print("[gateway]", *a, flush=True)
+
+def remember_loaded(name):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"last_loaded_llm": name, "loaded_at": time.time()}, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log(f"记录最近加载模型失败（不影响推理）: {e}")
 
 dcli = docker.DockerClient(base_url="unix:///var/run/docker.sock")
 http = httpx.AsyncClient(timeout=httpx.Timeout(3600.0, connect=10.0))
@@ -864,7 +875,8 @@ def _remove_backend_containers(b):
 
 
 def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env=None,
-                 engine="vllm", gguf_include=None, plan=None, cname=None, image=None):
+                 engine="vllm", gguf_include=None, plan=None, cname=None, image=None,
+                 max_num_seqs=None):
     kwargs = {}
     if len(gpus) > 1:
         kwargs["ipc_mode"] = "host"
@@ -878,7 +890,7 @@ def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env
            "--tensor-parallel-size", str(tp),
            "--gpu-memory-utilization", str(util),
            "--max-model-len", str(max_len),
-           "--max-num-seqs", "128",
+           "--max-num-seqs", str(max_num_seqs or 128),
            "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_xml"]
     if think:
         # 仅思考模型可加 reasoning parser；非思考模型强开会把正文吞进 reasoning_content
@@ -1041,6 +1053,7 @@ async def wait_ready(name, cname, timeout=900):
         try:
             r = await http.get(url, timeout=5.0)
             if r.status_code == 200:
+                remember_loaded(name)
                 return
         except Exception:
             pass
@@ -1279,7 +1292,8 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
                 await asyncio.to_thread(_run_backend, name, dirname, grp, util, max_len,
                                         think, gw.get("extra_args"), gw.get("env"),
                                         engine, d.get("gguf_include"), plan, node,
-                                        image=gw.get("image"))
+                                        image=gw.get("image"),
+                                        max_num_seqs=gw.get("max_num_seqs"))
                 launched.append(node)
         except Exception:
             # 某副本连容器都没拉起来：删掉已拉起的副本，别留登记之外占着显存的孤儿容器

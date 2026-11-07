@@ -19,6 +19,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./models.json:/opt/models.json:ro
+      - ./data/gateway:/data/gateway
       # 容器内路径必须等于宿主机路径：网关要把该路径原样传给后端容器的 bind
       - ${HOST_ROOT:-/home/pc/AI}/models/llm:${HOST_ROOT:-/home/pc/AI}/models/llm:ro
     deploy:

@@ -5,7 +5,8 @@
     "dual_llm_util": 0.88,
     "video_reserve_gb": 8,
     "coexist_video_reserve_gb": 46,
-    "safety_gap_gb": 4
+    "safety_gap_gb": 4,
+    "gpu_count": 2
   },
   "llm": {
     "qwen3.8-27b": {
@@ -25,7 +26,7 @@
       "gw": {
         "gpus": "1",
         "util": 0.92,
-        "max_len": 900000,
+        "max_len": 861696,
         "env": {
           "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
         },
@@ -143,14 +144,15 @@
       "gw": {
         "gpus": "0,1",
         "util": 0.92,
-        "max_len": 1000000,
+        "max_len": 262144,
         "env": {
           "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
         },
         "extra_args": [
           "--hf-overrides",
           "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}"
-        ]
+        ],
+        "max_num_seqs": 64
       },
       "capabilities": {
         "input_modalities": [
@@ -224,14 +226,14 @@
       "ctx_default": 131072,
       "max_ctx": 1048576,
       "think": true,
-      "desc": "DeepSeek V4.1 Flash 1017：552B主干+196B Engram MoE，UD-Q2_K_XL 335G，双卡+内存 offload，Engram 表 SSD mmap；原生总池1M上下文（无需YaRN），parallel=4 每slot 256K，支持图像/视频理解，使用120a-real编译的master版llama.cpp",
-      "menu_brief": "[视觉·图+视频] 【能力天花板】DS V4.1 Flash 2bit 335G，双卡独占+内存 offload，4×256K并发上下文，复杂编程/推理攻关用，偏慢",
+      "desc": "DeepSeek V4.1 Flash 1017：552B主干+196B Engram MoE，UD-Q2_K_XL 335G，双卡+内存 offload，Engram 表 SSD mmap；原生总池1M上下文（无需YaRN），parallel=2 每slot 512K，支持图像/视频理解，使用120a-real编译的master版llama.cpp",
+      "menu_brief": "[视觉·图+视频] 【能力天花板】DS V4.1 Flash 2bit 335G，双卡独占+内存 offload，2×512K并发上下文，复杂编程/推理攻关用，偏慢",
       "gw": {
         "gpus": "0,1",
         "util": 0.92,
         "max_len": 1048576,
         "image": "ai-llamacpp:master",
-        "parallel": 4,
+        "parallel": 2,
         "extra_args": [
           "--split-mode",
           "layer",
