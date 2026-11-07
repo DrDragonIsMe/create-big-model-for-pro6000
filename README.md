@@ -62,6 +62,8 @@ python3 sysmonitor/sysmon_web.py        # 实时监控 Web 版：浏览器看板
 
 DGX 是独立栈，只支持 `nodes` / `status` / `models` 只读查询；`load` / `unload` / `switch` / `modes` / `ops` 会明确报告不支持管理协议。任何节点不可达都会打印真实 HTTP/网络原因；`--all` 查询继续覆盖其他节点，全部完成后如有失败退出码为 1（用法错误为 2）。
 
+`ai` 只管运行态，**不同步代码**：其它节点上的 `~/AI` 是没有 `.git` 的文件副本，且网关代码是 COPY 进镜像的——改了 `gateway*.py` 光推文件不重建镜像，节点仍在跑旧代码。同步与生效流程见 `部署文档.md` 12.1 节。
+
 非交互启动示例：
 ```bash
 ./scripts/start.sh --llm qwen3.8-27b --video wan2.2-s2v -y
@@ -198,6 +200,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - 多模型放置策略：装得下就并存（每卡按已加载模型的 util 预算扣减，为其保留 KV cache 空间）；任何卡都装不下才卸最久未用的空闲模型；正忙的模型绝不驱逐，直接返回 503 让客户端稍后重试
 - 客户端 agent 细粒度协商（2026-10-20 新增）：首次连接先 `GET /v1/gateway/capabilities` 学习能力与协议 → `GET /v1/gateway/gpus` 查 GPU 数量与占用 → `POST /v1/gateway/load {"model":...,"gpus":[0],"wait":false}` 指定 GPU 异步加载 → 轮询 `GET /v1/gateway/ops/{id}` 拿加载/切换状态（`transitions[]`）。推理请求也可带 `X-Gateway-Load-Async:1`（+可选 `X-Gateway-GPUs:0`）免预加载、202 异步协商。2026-10-26 起再加一步**布局协商**：`GET /v1/gateway/modes` 查每个模型的摆放模式（dual/tp/replica/pool/auto）、现行布局与 ctx 上限，`load` 带 `"mode":"…"` 或 `"replicas":N` 当场切摆放（可加推理头 `X-Gateway-Mode`）；网关对 models.json 只读，新 ctx 持久化按目录给的 `host_command` 在宿主执行。详见 `模型切换说明.md` 第 5.3 / 5.8 节。
 - 编程 agent 直连（2026-11-07 新增）：OpenAI Codex CLI 走 `/v1/responses`（`wire_api = "responses"`，0.167 起已移除 `"chat"`），Claude Code 走 `/v1/messages`（`ANTHROPIC_BASE_URL` 填网关根地址，不要带 `/v1`）。两者的 system 消息形态都由 `gateway_protocols.py` 归一化，直连即可，不需要中间转换代理；规则见 `gateway-response-protocol.md` 第 2.1 / 3.1 节
+- 改网关代码后的生效边界：`gateway.py` / `gateway_protocols.py` 是 `COPY` 进 `ai-gateway:local` 镜像的（不像 `console`、`sysmonitor` 那样 bind-mount），所以本机 `docker restart` 也不会换代码，必须 `docker build -f docker/gateway/Dockerfile -t ai-gateway:local .` 再 compose recreate；其它同构节点还要先把文件推过去（那边是没有 `.git` 的副本），见 `部署文档.md` 12.1 节
 - 自动卸载只由文本请求触发；视频请求直连 ComfyUI 不经过网关，跑大视频任务前需手动腾显存：`curl -X POST http://localhost:8000/v1/gateway/unload_all`（正忙/加载中的模型跳过并在 `busy` 字段列出，网关保持常驻、请求来了自动重载）
 - 详细设计见方案文档（plans/miles-morales-siryn-batgirl.md）
 
