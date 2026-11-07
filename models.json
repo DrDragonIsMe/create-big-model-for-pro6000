@@ -33,6 +33,21 @@
           "--hf-overrides",
           "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}"
         ]
+      },
+      "capabilities": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "streaming": true,
+        "tool_calls": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "vision": true,
+        "video_input": false
       }
     },
     "qwen3.6-35b-a3b": {
@@ -60,6 +75,22 @@
           "--hf-overrides",
           "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}"
         ]
+      },
+      "capabilities": {
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "streaming": true,
+        "tool_calls": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "vision": true,
+        "video_input": true
       }
     },
     "qwen3-coder-next": {
@@ -80,6 +111,20 @@
         "gpus": "1",
         "util": 0.92,
         "max_len": 262144
+      },
+      "capabilities": {
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "streaming": true,
+        "tool_calls": true,
+        "structured_outputs": true,
+        "reasoning": false,
+        "vision": false,
+        "video_input": false
       }
     },
     "qwen3.8-flash-next": {
@@ -106,6 +151,22 @@
           "--hf-overrides",
           "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": 4.0, \"original_max_position_embeddings\": 262144}}}"
         ]
+      },
+      "capabilities": {
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "streaming": true,
+        "tool_calls": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "vision": true,
+        "video_input": true
       }
     },
     "qwen3.8-flash-next-iq3s": {
@@ -134,6 +195,22 @@
           "--yarn-orig-ctx",
           "262144"
         ]
+      },
+      "capabilities": {
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "streaming": true,
+        "tool_calls": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "vision": true,
+        "video_input": true
       }
     },
     "deepseek-v4.1-flash": {
@@ -177,6 +254,22 @@
           "--min-p",
           "0.0"
         ]
+      },
+      "capabilities": {
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "streaming": true,
+        "tool_calls": true,
+        "structured_outputs": true,
+        "reasoning": true,
+        "vision": true,
+        "video_input": true
       }
     },
     "qwen3-coder-30b-a3b": {
@@ -204,6 +297,20 @@
           "--hf-overrides",
           "{\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 2.0, \"original_max_position_embeddings\": 262144}}"
         ]
+      },
+      "capabilities": {
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "streaming": true,
+        "tool_calls": true,
+        "structured_outputs": true,
+        "reasoning": false,
+        "vision": false,
+        "video_input": false
       }
     }
   },

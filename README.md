@@ -13,6 +13,11 @@ cd ~/AI
 # 远程切换（局域网客户端无需 SSH，等价 --switch）：
 curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"video"}'
 curl -X POST http://<服务器IP>:8000/v1/gateway/switch -H 'Content-Type: application/json' -d '{"target":"llm"}'
+# 模型目录：每模型 capabilities、实际 context_length、原生上下文与 loaded 状态：
+curl http://<服务器IP>:8000/v1/models
+# OpenAI Responses / Anthropic Messages（均支持非流式与 SSE）：
+curl http://<服务器IP>:8000/v1/responses -H 'Content-Type: application/json' -d '{"model":"qwen3.8-27b","input":"你好","max_output_tokens":128}'
+curl http://<服务器IP>:8000/v1/messages -H 'Content-Type: application/json' -d '{"model":"qwen3.8-27b","max_tokens":128,"messages":[{"role":"user","content":"你好"}]}'
 # 客户端 agent 首次连接先学习网关能力/协商协议（GPU 数量、按卡加载、状态轮询）：
 curl http://<服务器IP>:8000/v1/gateway/capabilities    # 说明接口：能力、协商步骤、模型目录
 curl http://<服务器IP>:8000/v1/gateway/gpus            # GPU 发现：数量、每卡占用、谁占了卡

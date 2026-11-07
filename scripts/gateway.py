@@ -2,8 +2,9 @@
 """AI 模型网关（常驻能力，非临时补救）
 
 暴露三种兼容 API（端口 8000）：
-• OpenAI   — /v1/models, /v1/chat/completions（原有）
-• Anthropic — /v1/messages, /v1/messages/count_tokens, /v1/messages/{model}（新增）
+• OpenAI   — /v1/models（含 capabilities/context_length）、/v1/chat/completions、/v1/responses
+• Anthropic — /v1/messages、/v1/messages/count_tokens、/v1/messages/{model}，
+             以及 Anthropic 风格 /v1/responses（anthropic-version 或 x-api-format 选择）
 • 管理     — /v1/gateway/status（状态）、/v1/gateway/unload_all（腾显存）、
              /v1/gateway/switch（远程切换文本/视频，等价 start.sh --switch）
 • 协商     — /v1/gateway/capabilities（说明接口，供客户端 agent 首次连接时学习）、
@@ -42,6 +43,11 @@ import docker
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from gateway_protocols import (
+    ProtocolError, anthropic_to_chat, chat_to_anthropic, chat_to_response,
+    responses_to_chat, stream_anthropic, stream_responses,
+)
 
 MODELS_JSON = os.environ.get("MODELS_JSON", "/opt/models.json")
 HOST_ROOT = os.environ.get("HOST_ROOT", "/home/pc/AI")
@@ -1397,16 +1403,50 @@ def adopt_existing():
             log(f"认领 {name} 失败（忽略，不影响网关启动）: {e}")
 
 
+def model_context_length(d):
+    gw = d.get("gw", {})
+    return int(gw.get("max_len", d.get("max_ctx", d.get("ctx_default", 32768))))
+
+
+def model_capabilities(d):
+    capabilities = {
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "streaming": True,
+        "tool_calls": True,
+        "structured_outputs": True,
+        "reasoning": bool(d.get("think")),
+        "vision": False,
+        "video_input": False,
+    }
+    capabilities.update(d.get("capabilities") or {})
+    capabilities["api_endpoints"] = [
+        "/v1/chat/completions", "/v1/responses", "/v1/messages",
+    ]
+    return capabilities
+
+
+def model_descriptor(name, d):
+    return {
+        "id": name,
+        "object": "model",
+        "created": 0,
+        "owned_by": "ai-gateway",
+        "loaded": backends.get(name, {}).get("status") == "ready",
+        "context_length": model_context_length(d),
+        "native_context_length": int(d.get("max_ctx", d.get("ctx_default", 32768))),
+        "capabilities": model_capabilities(d),
+    }
+
+
 @app.get("/v1/models")
 async def list_models():
     man = await asyncio.to_thread(load_manifest)
     data = []
-    for name in man:
+    for name, descriptor in man.items():
         if not model_dir(name):
             continue
-        data.append({"id": name, "object": "model", "created": 0,
-                     "owned_by": "ai-gateway",
-                     "loaded": backends.get(name, {}).get("status") == "ready"})
+        data.append(model_descriptor(name, descriptor))
     return {"object": "list", "data": data}
 
 
@@ -1650,23 +1690,20 @@ async def gateway_capabilities():
         if not model_dir(name):
             continue
         d = man[name]
-        gw = d.get("gw", {})
         b = backends.get(name)
         models[name] = {
+            **model_descriptor(name, d),
             "engine": d.get("engine", "vllm"),
             "min_gpus": int(d.get("min_gpus", 1)),
-            "context_window": int(gw.get("max_len", d.get("max_ctx",
-                                                          d.get("ctx_default", 32768)))),
             "think": bool(d.get("think")),
             "desc": d.get("desc", ""),
-            "loaded": bool(b and b["status"] == "ready"),
             "backend_status": b["status"] if b else "unloaded",
             "gpus": list(b["gpus"]) if b else None,
         }
     gpus = await _gpu_discovery()
     return {
         "name": "ai-gateway",
-        "version": "2.1",
+        "version": "3.0",
         "description": "局域网 AI 模型网关：OpenAI / Anthropic / Responses 兼容推理 + 按 GPU 协商加载。",
         "protocol": "gateway-negotiation-v1",
         "capabilities": {
@@ -1678,7 +1715,9 @@ async def gateway_capabilities():
             "video_switch": True,
             "layout_modes": True,        # GET /v1/gateway/modes + load 的 mode/replicas
             "runtime_replica_override": True,
-            "api_styles": ["openai-chat", "anthropic-messages", "openai-responses"],
+            "api_styles": ["openai-chat", "anthropic-messages", "openai-responses",
+                           "anthropic-responses"],
+            "response_style_selection": "默认 OpenAI；Anthropic 使用 anthropic-version、x-api-format: anthropic 或 ?format=anthropic",
         },
         "endpoints": [
             {"method": "GET", "path": "/v1/gateway/capabilities",
@@ -1702,7 +1741,7 @@ async def gateway_capabilities():
             {"method": "GET", "path": "/v1/gateway/status",
              "purpose": "实时状态：各后端 in_flight/tokens、GPU 空闲、ComfyUI（支持 ?model= 过滤）"},
             {"method": "GET", "path": "/v1/models",
-             "purpose": "OpenAI 兼容模型列表（含 loaded 标记）"},
+             "purpose": "模型列表：capabilities、实际/原生上下文长度与 loaded 标记"},
             {"method": "POST", "path": "/v1/chat/completions",
              "purpose": "OpenAI 推理（未加载自动加载；带 X-Gateway-Load-Async 可 202 异步协商）"},
             {"method": "POST", "path": "/v1/messages",
@@ -2324,1569 +2363,223 @@ async def _buffered_openai_response(name, r):
 
 
 # ============================================================
-# Anthropic Messages API 兼容层
+# OpenAI Responses / Anthropic Messages 兼容层
 # ============================================================
 
-def _anthropic_image_to_openai(block: dict):
-    """将 Anthropic image 块转为 OpenAI image_url 块；无法转换时返回 None。
-
-    Anthropic: {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"..."}}
-               {"type":"image","source":{"type":"url","url":"https://..."}}
-    OpenAI:    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}
-    """
-    source = block.get("source") or {}
-    stype = source.get("type", "")
-    if stype == "base64":
-        media = source.get("media_type", "image/jpeg")
-        data = source.get("data", "")
-        if data:
-            return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}
-    elif stype == "url":
-        url = source.get("url", "")
-        if url:
-            return {"type": "image_url", "image_url": {"url": url}}
-    return None
+response_cache = {}
+RESPONSE_CACHE_SIZE = 128
 
 
-def _openai_image_to_anthropic(block: dict):
-    """将 OpenAI image_url 块转为 Anthropic image 块（Responses 往返转换用）。"""
-    iu = block.get("image_url") or {}
-    if isinstance(iu, str):
-        url = iu
-    else:
-        url = iu.get("url", "") if isinstance(iu, dict) else ""
-    if not url:
-        return None
-    if url.startswith("data:"):
-        try:
-            header, _, data = url.partition(",")
-            media = header[5:].split(";")[0] if header.startswith("data:") else "image/jpeg"
-            if data:
-                return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
-        except Exception:
-            return None
-        return None
-    return {"type": "image", "source": {"type": "url", "url": url}}
+class UpstreamError(Exception):
+    def __init__(self, status, payload):
+        self.status = status
+        self.payload = payload
 
 
-def _tool_result_content_text(content):
-    """Anthropic tool_result 的 content 可能是字符串或块列表，压成纯文本。"""
-    if isinstance(content, list):
-        texts = []
-        for b in content:
-            if isinstance(b, dict):
-                if b.get("type") == "text" and b.get("text"):
-                    texts.append(b["text"])
-                elif b.get("type") == "image":
-                    img = _anthropic_image_to_openai(b)
-                    if img:
-                        texts.append(img["image_url"]["url"])
-                else:
-                    t = b.get("text")
-                    if t:
-                        texts.append(t)
-            else:
-                texts.append(str(b))
-        return "\n".join(texts)
-    return content or ""
+def _protocol_error(message, style="openai", status=400, error_type="invalid_request_error"):
+    if style == "anthropic":
+        return JSONResponse({"type": "error", "error": {"type": error_type, "message": str(message)}},
+                            status_code=status)
+    return JSONResponse({"error": {"message": str(message), "type": error_type}}, status_code=status)
 
 
-def _anthropic_to_openai(body: dict, manifest: dict) -> tuple[str, dict]:
-    """将 Anthropic 请求体转为 OpenAI 格式。
-
-    返回 (model_name, openai_body)。
-    """
-    name = body.get("model", "")
-    system = body.get("system", "")
-    messages_in = body.get("messages", [])
-    tools_in = body.get("tools")
-    # --- 构建 OpenAI messages ---
-    oa_msgs: list[dict] = []
-    if system:
-        oa_msgs.append({"role": "system", "content": system})
-
-    # 将 Anthropic messages 转为 OpenAI messages，同时处理 tool_use/tool_result 的历史
-    # Anthropic 要求 tool_use 和 tool_result 成对出现，我们按顺序组装
-    i = 0
-    while i < len(messages_in):
-        msg = messages_in[i]
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-
-        if role == "assistant":
-            # 合并连续的 assistant 文本和 tool_use blocks
-            parts: list[dict] = []
-            while i < len(messages_in) and messages_in[i].get("role") == "assistant":
-                msg = messages_in[i]
-                c = msg.get("content", "")
-                if isinstance(c, str):
-                    if c.strip():
-                        parts.append({"type": "text", "text": c})
-                elif isinstance(c, list):
-                    parts.extend(c)
-                i += 1
-            # 组装 assistant 消息
-            text_blocks = [p for p in parts if p.get("type") == "text"]
-            tool_blocks = [p for p in parts if p.get("type") == "tool_use"]
-            if text_blocks:
-                content_text = "\n".join(p["text"] for p in text_blocks)
-            else:
-                content_text = None
-
-            if tool_blocks:
-                tool_calls = []
-                for tb in tool_blocks:
-                    tool_calls.append({
-                        "id": tb.get("id", f"call_{len(tool_calls)}"),
-                        "type": "function",
-                        "function": {
-                            "name": tb.get("name", ""),
-                            "arguments": json.dumps(tb.get("input", {})),
-                        },
-                    })
-                # 如果有文本内容 + tool_calls，OpenAI 要求分开
-                if content_text and tool_calls:
-                    # 文本作为前文，tool_calls 作为另一个 assistant block
-                    oa_msgs.append({"role": "assistant", "content": content_text})
-                    oa_msgs.append({"role": "assistant", "tool_calls": tool_calls})
-                elif content_text:
-                    oa_msgs.append({"role": "assistant", "content": content_text})
-                else:
-                    oa_msgs.append({"role": "assistant", "tool_calls": tool_calls})
-            elif content_text:
-                oa_msgs.append({"role": "assistant", "content": content_text})
-            continue
-
-        if role == "user":
-            c = msg.get("content", "")
-            if isinstance(c, list):
-                # 查找是否有 tool_result，同时收集 text / image 块
-                text_parts = []
-                image_parts = []
-                has_tool_result = False
-                for block in c:
-                    if block.get("type") == "text" and block.get("text"):
-                        text_parts.append(block["text"])
-                    elif block.get("type") == "image":
-                        img = _anthropic_image_to_openai(block)
-                        if img:
-                            image_parts.append(img)
-                    elif block.get("type") == "tool_result":
-                        has_tool_result = True
-                if has_tool_result:
-                    # 有 tool_result 时，直接透传 content blocks 给 OpenAI
-                    # OpenAI 的 assistant 消息中 tool_call 已被提取，tool_result 由 user 承载
-                    # 将 tool_result 转成 OpenAI tool_message
-                    tool_results = [b for b in c if b.get("type") == "tool_result"]
-                    other_parts = [b for b in c if b.get("type") != "tool_result"]
-                    other_blocks = []
-                    for b in other_parts:
-                        if b.get("type") == "text" and b.get("text"):
-                            other_blocks.append({"type": "text", "text": b["text"]})
-                        elif b.get("type") == "image":
-                            img = _anthropic_image_to_openai(b)
-                            if img:
-                                other_blocks.append(img)
-                    if other_blocks:
-                        # 纯文本保持字符串形态，含图时用多模态块列表
-                        if all(b.get("type") == "text" for b in other_blocks):
-                            oa_msgs.append({"role": "user",
-                                            "content": "\n".join(b["text"] for b in other_blocks)})
-                        else:
-                            oa_msgs.append({"role": "user", "content": other_blocks})
-                    for tr in tool_results:
-                        oa_msgs.append({
-                            "role": "tool",
-                            "tool_call_id": tr.get("tool_use_id", f"call_{len(oa_msgs)}"),
-                            "content": _tool_result_content_text(tr.get("content", "")),
-                        })
-                elif text_parts or image_parts:
-                    if image_parts:
-                        blocks = []
-                        if text_parts:
-                            blocks.append({"type": "text", "text": "\n".join(text_parts)})
-                        blocks.extend(image_parts)
-                        oa_msgs.append({"role": "user", "content": blocks})
-                    else:
-                        oa_msgs.append({"role": "user", "content": "\n".join(text_parts)})
-                else:
-                    oa_msgs.append({"role": "user", "content": str(c)})
-            else:
-                oa_msgs.append({"role": "user", "content": c})
-            i += 1
-
-    # --- 转换 tools ---
-    oa_tools = None
-    if tools_in:
-        oa_tools = []
-        for t in tools_in:
-            schema = t.get("input_schema", {})
-            if "parameters" not in schema:
-                # Anthropic 的 input_schema 可能直接是参数 schema
-                schema = {"type": "object", **schema}
-            oa_tools.append({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": schema,
-                },
-            })
-
-    # --- 转换 tool_choice ---
-    tc = body.get("tool_choice")
-    oa_tc = None
-    if tc is not None:
-        if isinstance(tc, str):
-            # "auto", "any", "none"
-            oa_tc = tc if tc != "any" else "required"
-        elif isinstance(tc, dict):
-            if tc.get("type") == "tool":
-                oa_tc = {"type": "function", "function": {"name": tc["name"]}}
-
-    # --- 构建 body ---
-    oa_body: dict = {
-        "model": name,
-        "messages": oa_msgs,
-        "max_tokens": body.get("max_tokens", 4096),
-        "stream": body.get("stream", False),
-    }
-    if body.get("temperature") is not None:
-        oa_body["temperature"] = body["temperature"]
-    if body.get("top_p") is not None:
-        oa_body["top_p"] = body["top_p"]
-    if body.get("top_k") is not None:
-        # OpenAI 不直接支持 top_k，但有些后端支持，保留
-        oa_body["top_k"] = body["top_k"]
-    if oa_tools:
-        oa_body["tools"] = oa_tools
-    if oa_tc is not None:
-        oa_body["tool_choice"] = oa_tc
-
-    # 处理 thinking 字段 — 转为 system prompt 指令
-    thinking = body.get("thinking")
-    if thinking:
-        budget = thinking.get("type") == "enabled" and thinking.get("budget_tokens") or 1024
-        thinking_hint = (
-            f"You will engage in extended thinking before responding. "
-            f"Plan your response carefully. Think through the problem step by step. "
-            f"Maximum thinking budget: {budget} tokens."
-        )
-        # Prepend thinking hint to system prompt
-        if oa_msgs and oa_msgs[0].get("role") == "system":
-            oa_msgs[0]["content"] = thinking_hint + "\n\n" + oa_msgs[0]["content"]
+def _upstream_error(error, style):
+    payload = error.payload
+    if style == "anthropic":
+        source = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(source, dict):
+            message = source.get("message", str(source))
         else:
-            oa_msgs.insert(0, {"role": "system", "content": thinking_hint})
-
-    return name, oa_body
-
-
-def _openai_to_anthropic_content(openai_msg: dict) -> list[dict]:
-    """将 OpenAI assistant message 转为 Anthropic content blocks。"""
-    blocks: list[dict] = []
-    content = openai_msg.get("content")
-    if content is not None and content != "":
-        blocks.append({"type": "text", "text": content})
-
-    tool_calls = openai_msg.get("tool_calls", [])
-    for tc in tool_calls:
-        fn = tc.get("function", {})
-        try:
-            input_dict = json.loads(fn.get("arguments", "{}"))
-        except Exception:
-            input_dict = {}
-        blocks.append({
-            "type": "tool_use",
-            "id": tc.get("id", f"call_{len(blocks)}"),
-            "name": fn.get("name", ""),
-            "input": input_dict,
-        })
-
-    if not blocks:
-        blocks.append({"type": "text", "text": ""})
-    return blocks
+            message = str(payload)
+        return _protocol_error(message, style, error.status, "api_error")
+    if isinstance(payload, dict) and "error" in payload:
+        return JSONResponse(payload, status_code=error.status)
+    return _protocol_error(str(payload), style, error.status, "api_error")
 
 
-def _build_anthropic_response(data: dict) -> dict:
-    """将 OpenAI 非流式响应转为 Anthropic 响应体。"""
-    choice = data["choices"][0]
-    msg = choice["message"]
-
-    stop_map = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
-    stop_reason = stop_map.get(choice.get("finish_reason", "stop"), "end_turn")
-
-    content = _openai_to_anthropic_content(msg)
-
-    # 尝试从 reasoning 中提取 thinking 内容
-    thinking_content = msg.get("reasoning_content", "")
-
-    resp = {
-        "id": data.get("id", "msg_fake"),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": data.get("model", ""),
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": 0,  # vLLM 不直接返回
-            "output_tokens": 0,
-        },
-    }
-
-    # 如果有 reasoning，添加 thinking block
-    if thinking_content:
-        # 在 content 最前面插入 thinking block
-        content.insert(0, {"type": "thinking", "thinking": thinking_content})
-        resp["content"] = content
-
-    return resp
+def _release_chat_backend(backend, peer):
+    backend["in_flight"] -= 1
+    peer["in_flight"] -= 1
+    backend["last_used"] = time.time()
 
 
-def _stream_anthropic(data_iter, model_name: str):
-    """Generator: 将 OpenAI SSE 流转为 Anthropic SSE 流。
-
-    每 yield 一行 "data: ..." JSON。
-    """
-    # 状态跟踪
-    block_id = 0
-    input_json_accum = ""
-    message_id = f"msg_{model_name}_{int(time.time() * 1000)}_{block_id:04d}"
-    # 首行: message_start
-    yield f'data: {json.dumps({
-        "type": "message_start",
-        "message": {
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": model_name,
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-        },
-    })}\n\n'
-
-    text_accum = ""
-    thinking_accum = ""
-    has_tool_use = False
-    current_tool_id = None
-    current_tool_name = None
-
+async def _send_chat(name, manifest, body):
+    if not name:
+        raise ProtocolError("缺少 model 字段")
+    if name not in manifest or not await asyncio.to_thread(model_dir, name):
+        raise ProtocolError(f"模型 '{name}' 不存在或未下载")
+    body = json.loads(clamp_max_tokens(name, manifest, json.dumps(body, ensure_ascii=False).encode()))
+    if body.get("stream"):
+        options = body.setdefault("stream_options", {})
+        if isinstance(options, dict):
+            options["include_usage"] = True
     try:
-        for raw in data_iter:
-            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-            if not line.startswith("data: "):
-                continue
-            payload_str = line[6:].strip()
-            if payload_str == "[DONE]":
-                break
-            try:
-                payload = json.loads(payload_str)
-            except Exception:
-                continue
+        backend = await ensure_loaded(name, manifest)
+    except ResourceError as e:
+        raise UpstreamError(503, {"error": {"message": str(e), "type": "insufficient_resources"}})
+    except Exception as e:
+        raise UpstreamError(502, {"error": {"message": f"模型加载失败: {e}", "type": "backend_error"}})
+    backend["in_flight"] += 1
+    peer = _pick_peer(backend)
+    peer["in_flight"] = peer.get("in_flight", 0) + 1
+    backend["last_used"] = time.time()
+    url = f"http://{peer['container']}:8000/v1/chat/completions"
+    try:
+        req = http.build_request("POST", url, content=json.dumps(body, ensure_ascii=False).encode(),
+                                 headers={"content-type": "application/json"})
+        response = await http.send(req, stream=True)
+    except Exception as e:
+        _release_chat_backend(backend, peer)
+        raise UpstreamError(502, {"error": {"message": f"转发失败: {e}", "type": "api_error"}})
+    if response.status_code >= 400:
+        raw = await response.aread()
+        await response.aclose()
+        _release_chat_backend(backend, peer)
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {"error": {"message": raw.decode(errors="replace")[:1000], "type": "api_error"}}
+        log(f"{name} 兼容接口上游 {response.status_code}: {raw.decode(errors='replace')[:500]}")
+        raise UpstreamError(response.status_code, payload)
+    return backend, peer, response
 
-            choices = payload.get("choices", [])
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-            finish = choices[0].get("finish_reason")
 
-            # --- text delta ---
-            text_delta = delta.get("content")
-            reasoning = delta.get("reasoning_content", "")
-            if text_delta:
-                if not text_accum and not has_tool_use:
-                    # 开启 content_block_start
-                    block_id += 1
-                    yield f'data: {json.dumps({
-                        "type": "content_block_start",
-                        "index": block_id - 1,
-                        "content_block": {"type": "text", "text": ""},
-                    })}\n\n'
-                text_accum += text_delta
-                yield f'data: {json.dumps({
-                    "type": "content_block_delta",
-                    "index": block_id - 1,
-                    "delta": {"type": "text_delta", "text": text_delta},
-                })}\n\n'
-            if reasoning:
-                if not thinking_accum and not has_tool_use:
-                    block_id += 1
-                    yield f'data: {json.dumps({
-                        "type": "content_block_start",
-                        "index": block_id - 1,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    })}\n\n'
-                thinking_accum += reasoning
-                yield f'data: {json.dumps({
-                    "type": "content_block_delta",
-                    "index": block_id - 1,
-                    "delta": {"type": "thinking_delta", "thinking": reasoning},
-                })}\n\n'
-
-            # --- tool call delta ---
-            tool_calls = delta.get("tool_calls", [])
-            if tool_calls:
-                for tc in tool_calls:
-                    idx = tc.get("index", 0)
-                    if not has_tool_use or block_id == idx:
-                        has_tool_use = True
-                    fn = tc.get("function", {})
-                    tc_id = tc.get("id", f"call_{block_id}")
-                    tc_name = fn.get("name", "")
-                    tc_args = fn.get("arguments", "")
-
-                    if not has_tool_use or (not current_tool_id):
-                        # 开启 content_block_start for tool_use
-                        block_id += 1
-                        yield f'data: {json.dumps({
-                            "type": "content_block_start",
-                            "index": block_id - 1,
-                            "content_block": {"type": "tool_use", "id": tc_id, "name": tc_name},
-                        })}\n\n'
-                        current_tool_id = tc_id
-                        current_tool_name = tc_name
-                        input_json_accum = ""
-
-                    if tc_args:
-                        input_json_accum += tc_args
-                        yield f'data: {json.dumps({
-                            "type": "content_block_delta",
-                            "index": block_id - 1,
-                            "delta": {"type": "input_json_delta", "partial_json": tc_args},
-                        })}\n\n'
-
-            # --- finish ---
-            if finish:
-                stop_map = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
-                stop_reason = stop_map.get(finish, "end_turn")
-                # 关闭 text block
-                if text_accum:
-                    yield f'data: {json.dumps({
-                        "type": "content_block_stop",
-                        "index": 0 if not has_tool_use else (1 if thinking_accum else 0),
-                    })}\n\n'
-                # 关闭 thinking block
-                if thinking_accum:
-                    yield f'data: {json.dumps({
-                        "type": "content_block_stop",
-                        "index": 0 if not text_accum and not has_tool_use else 1,
-                    })}\n\n'
-                # 关闭 tool_use block
-                if has_tool_use:
-                    yield f'data: {json.dumps({
-                        "type": "content_block_stop",
-                        "index": block_id - 1,
-                    })}\n\n'
-                # message_stop
-                yield f'data: {json.dumps({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": 1},  # 粗略估计
-                })}\n\n'
+async def _read_chat_response(backend, peer, response):
+    try:
+        raw = await response.aread()
+        return json.loads(raw)
+    except Exception as e:
+        raise UpstreamError(502, {"error": {"message": f"读取后端响应失败: {e}", "type": "api_error"}})
     finally:
-        pass
+        await response.aclose()
+        _release_chat_backend(backend, peer)
 
-    yield "data: [DONE]\n\n"
+
+def _converted_stream(backend, peer, response, converter):
+    async def generate():
+        try:
+            async for chunk in converter:
+                yield chunk
+        finally:
+            await response.aclose()
+            _release_chat_backend(backend, peer)
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"cache-control": "no-cache", "x-accel-buffering": "no"})
+
+
+def _cache_response(response):
+    response_cache[response["id"]] = response
+    while len(response_cache) > RESPONSE_CACHE_SIZE:
+        response_cache.pop(next(iter(response_cache)))
+
+
+async def _json_request(request, style):
+    try:
+        body = await request.json()
+    except Exception:
+        raise ProtocolError("请求体不是合法 JSON")
+    if not isinstance(body, dict) or not body:
+        raise ProtocolError("请求体必须是非空 JSON 对象")
+    return body
 
 
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(request: Request):
-    """Anthropic token 计数接口（虚拟实现，返回粗略值）。"""
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error", "message": "请求体不是合法 JSON"}},
-            status_code=400)
-
-    name = body.get("model", "")
-    # 用 messages 字段粗略估算 token 数
-    messages = body.get("messages", [])
-    total_tokens = 0
-    for msg in messages:
-        c = msg.get("content", "")
-        if isinstance(c, str):
-            total_tokens += len(c) // 4  # 粗略估算
-        elif isinstance(c, list):
-            for block in c:
-                if isinstance(block, dict):
-                    total_tokens += len(json.dumps(block)) // 4
-    return {
-        "input_tokens": total_tokens,
-        "output_tokens": 0,
-    }
+        body = await _json_request(request, "anthropic")
+        text = json.dumps({k: v for k, v in body.items() if k != "stream"}, ensure_ascii=False)
+        ascii_count = sum(1 for char in text if ord(char) < 128)
+        return {"input_tokens": ascii_count // 3 + len(text) - ascii_count}
+    except ProtocolError as e:
+        return _protocol_error(e, "anthropic")
 
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
-    """Anthropic Messages API 入口。"""
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error", "message": "请求体不是合法 JSON"}},
-            status_code=400)
-
-    name = body.get("model", "")
-    if not name:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error", "message": "缺少 model 字段"}},
-            status_code=400)
-
-    man = await asyncio.to_thread(load_manifest)
-    if name not in man:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_model_error", "message": f"模型 '{name}' 不存在"}},
-            status_code=400)
-
-    # 转换请求体
-    _, oa_body = _anthropic_to_openai(body, man)
-    is_stream = oa_body.get("stream", False)
-
-    # 确保模型已加载
-    try:
-        b = await ensure_loaded(name, man)
-    except ResourceError as e:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "insufficient_resources", "message": str(e)}},
-            status_code=503)
-    except Exception as e:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "backend_error", "message": f"模型加载失败: {e}"}},
-            status_code=502)
-
-    b["in_flight"] += 1
-    p = _pick_peer(b)          # 多副本：挑在途最少的副本；单副本时 peers 只 1 个元素，分流退化为自己
-    p["in_flight"] = p.get("in_flight", 0) + 1
-    b["last_used"] = time.time()
-
-    qs = request.url.query
-    url = f"http://{p['container']}:8000/v1/chat/completions" + (f"?{qs}" if qs else "")
-    headers = {"content-type": "application/json"}
-    try:
-        req = http.build_request("POST", url, content=json.dumps(oa_body).encode(), headers=headers)
-        r = await http.send(req, stream=True)
-    except Exception as e:
-        b["in_flight"] -= 1
-        p["in_flight"] -= 1
-        return JSONResponse(
-            {"type": "error", "error": {"type": "api_error", "message": f"转发失败: {e}"}},
-            status_code=502)
-
-    # 非流式：读取完整响应并转换
-    if not is_stream:
-        try:
-            oa_resp = json.loads(await r.aread())
-        except Exception:
-            b["in_flight"] -= 1
-            p["in_flight"] -= 1
-            return JSONResponse(
-                {"type": "error", "error": {"type": "api_error", "message": "读取响应失败"}},
-                status_code=502)
-        b["in_flight"] -= 1
-        p["in_flight"] -= 1
-        anth_resp = _build_anthropic_response(oa_resp)
-        return JSONResponse(anth_resp)
-
-    # 流式：转换 SSE 流
-    gen = _stream_anthropic(r.aiter_raw(), name)
-    return StreamingResponse(gen, media_type="text/event-stream",
-                             headers={"x-request-id": r.headers.get("x-request-id", "")})
+        body = await _json_request(request, "anthropic")
+        manifest = await asyncio.to_thread(load_manifest)
+        chat_body = anthropic_to_chat(body)
+        backend, peer, upstream = await _send_chat(body.get("model", ""), manifest, chat_body)
+        if chat_body.get("stream"):
+            return _converted_stream(backend, peer, upstream,
+                                     stream_anthropic(upstream.aiter_lines(), body["model"]))
+        data = await _read_chat_response(backend, peer, upstream)
+        return JSONResponse(chat_to_anthropic(data))
+    except ProtocolError as e:
+        return _protocol_error(e, "anthropic")
+    except UpstreamError as e:
+        return _upstream_error(e, "anthropic")
 
 
 @app.get("/v1/messages/{model_name}")
 async def anthropic_model_info(model_name: str):
-    """Anthropic 单模型信息接口。"""
-    man = await asyncio.to_thread(load_manifest)
-    if model_name not in man:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_model_error", "message": f"模型 '{model_name}' 不存在"}},
-            status_code=404)
-
-    d = man[model_name]
-    return {
-        "id": model_name,
-        "object": "model",
-        "created": 0,
-        "owned_by": "ai-gateway",
-        "context_window": d.get("max_ctx", d.get("ctx_default", 32768)),
-        "description": d.get("desc", ""),
-    }
+    manifest = await asyncio.to_thread(load_manifest)
+    if model_name not in manifest:
+        return _protocol_error(f"模型 '{model_name}' 不存在", "anthropic", 404, "invalid_model_error")
+    descriptor = model_descriptor(model_name, manifest[model_name])
+    descriptor["description"] = manifest[model_name].get("desc", "")
+    descriptor["context_window"] = descriptor["context_length"]
+    return descriptor
 
 
-# ============================================================
-# Anthropic Responses API ( /v1/responses )
-# Anthropic 2025 新一代接口，替代 /v1/messages
-# ============================================================
-
-def _responses_input_to_openai_items(input_items: list) -> list[dict]:
-    """将 Responses API input 数组转为 OpenAI messages。
-
-    Responses 的 input 是扁平的混合项：messages + function_call + function_call_output
-    需要重构成 OpenAI 的 role/content 格式。
-    """
-    items = list(input_items)  # 拷贝避免修改原数据
-    oa_msgs: list[dict] = []
-    i = 0
-    while i < len(items):
-        item = items[i]
-        item_type = item.get("type", "")
-
-        if item_type == "message":
-            # {"type": "message", "role": "user|assistant", "content": "..." | [...]}
-            role = item.get("role")
-            content = item.get("content", "")
-            if isinstance(content, str):
-                oa_msgs.append({"role": role, "content": content})
-            elif isinstance(content, list):
-                # 内容块列表 — 转换为 OpenAI 格式
-                texts = []
-                images = []
-                for block in content:
-                    if block.get("type") == "input_text":
-                        texts.append(block.get("text", ""))
-                    elif block.get("type") == "input_image":
-                        # OpenAI vision 格式：image_url 为字符串或 {url:...} 对象
-                        img_url = block.get("image_url", block.get("image", ""))
-                        if isinstance(img_url, dict):
-                            img_url = img_url.get("url", "")
-                        if img_url:
-                            entry = {"url": img_url}
-                            detail = block.get("detail")
-                            if detail:
-                                entry["detail"] = detail
-                            images.append({"type": "image_url", "image_url": entry})
-                    elif block.get("type") == "document":
-                        doc_url = block.get("document", "")
-                        texts.append(f"[文档: {doc_url}]")
-                if images:
-                    blocks = []
-                    if texts:
-                        blocks.append({"type": "text", "text": "\n".join(texts)})
-                    blocks.extend(images)
-                    oa_msgs.append({"role": role, "content": blocks})
-                else:
-                    oa_msgs.append({"role": role, "content": "\n".join(texts) or ""})
-            i += 1
-
-        elif item_type == "function_call":
-            # 独立的 tool_use item — 与之前的 assistant message 合并
-            call_id = item.get("call_id", f"call_{len(oa_msgs)}")
-            name = item.get("name", "")
-            arguments = item.get("arguments", "{}")
-            # 查找最后一个 assistant 消息并追加 tool_calls
-            found = False
-            for m in reversed(oa_msgs):
-                if m.get("role") == "assistant":
-                    tc = {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
-                    m.setdefault("tool_calls", []).append(tc)
-                    found = True
-                    break
-            if not found:
-                # 没有前文 assistant message，新建一个
-                oa_msgs.append({
-                    "role": "assistant",
-                    "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}],
-                    "content": "",
-                })
-            i += 1
-
-        elif item_type == "function_call_output":
-            # 独立的 tool_result item — 转成 tool role message
-            oa_msgs.append({
-                "role": "tool",
-                "tool_call_id": item.get("call_id", ""),
-                "content": item.get("output", ""),
-            })
-            i += 1
-
-        else:
-            # 未知类型，跳过
-            i += 1
-
-    return oa_msgs
-
-
-def _responses_tools_to_openai(tools_in: list) -> list[dict]:
-    """转换 Responses tools 为 OpenAI tools 格式。"""
-    oa_tools = []
-    for t in tools_in:
-        if t.get("type", "").startswith("web_search") or t.get("name") == "web_search":
-            continue  # web_search 暂不支持
-        schema = t.get("input_schema", {}) or t.get("parameters", {})
-        if "parameters" not in schema:
-            schema = {"type": "object", **schema}
-        oa_tools.append({
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "parameters": schema,
-            },
-        })
-    return oa_tools
-
-
-def _responses_tool_choice_to_openai(tc):
-    """转换 Responses tool_choice 为 OpenAI 格式。"""
-    if isinstance(tc, str):
-        if tc == "auto":
-            return "auto"
-        elif tc == "required":
-            return "required"
-    if isinstance(tc, dict):
-        tc_type = tc.get("type", "")
-        if tc_type == "auto":
-            return "auto"
-        elif tc_type == "required":
-            return "required"
-        elif tc_type == "function":
-            return {"type": "function", "function": {"name": tc["name"]}}
-    return None
-
-
-def _responses_reasoning_to_think(reasoning):
-    """转换 Responses reasoning 为 thinking 字符串。"""
-    if not reasoning:
-        return None
-    effort = reasoning.get("effort", "minimal")
-    budget_tokens = reasoning.get("max_media_inputs", 0)
-    return {
-        "type": "enabled",
-        "budget_tokens": {"high": 16000, "medium": 8000, "low": 4000, "minimal": 1024}.get(effort, 1024),
-    }
-
-
-def _detect_responses_format(body: dict) -> str:
-    """自动检测 Responses API 请求体格式。
-
-    返回 "anthropic" | "openai" | "unknown"。
-    通过字段特征判断，不依赖 HTTP 头。
-    """
-    # --- Anthropic 独有字段 ---
-    if body.get("anthropic_version"):
+def _responses_style(request, body):
+    explicit = (request.query_params.get("format")
+                or request.headers.get("x-api-format")
+                or request.headers.get("x-response-format"))
+    if explicit:
+        value = explicit.lower()
+        if value in ("anthropic", "claude"):
+            return "anthropic"
+        if value in ("openai", "openai-responses"):
+            return "openai"
+    if request.headers.get("anthropic-version") or body.get("anthropic_version") \
+            or "output_config" in body:
         return "anthropic"
-    if "output_config" in body:
-        return "anthropic"
-
-    # --- OpenAI 独有字段 ---
-    if "output_schema" in body:
-        return "openai"
-    if "parallel_tool_calls" in body:
-        return "openai"
-    if "store" in body:
-        return "openai"
-
-    # --- tools 数组结构区分 ---
-    tools = body.get("tools")
-    if tools and isinstance(tools, list) and len(tools) > 0:
-        for t in tools:
-            if isinstance(t, dict):
-                if "input_schema" in t:
-                    return "anthropic"
-                fn = t.get("function")
-                if isinstance(fn, dict) and "parameters" in fn:
-                    return "openai"
-
-    # --- input 结构区分 ---
-    inp = body.get("input")
-    if isinstance(inp, list):
-        for item in inp:
-            if isinstance(item, dict):
-                itype = item.get("type", "")
-                if itype == "input_message":
-                    return "anthropic"
-                if itype == "function_call" or itype == "function_call_output":
-                    # 两者都用，但 Anthropic 的 function_call 有 call_id, OpenAI 也有
-                    # 看其他字段：Anthropic 用 input_message 包裹，OpenAI 直接在 input 数组里
-                    continue
-                if itype == "file":
-                    return "openai"  # OpenAI file item
-
-    return "unknown"
-
-
-def _responses_to_anthropic_messages(body: dict, manifest: dict) -> tuple[str, dict]:
-    """将 Responses API 请求体转为 Anthropic Messages 格式（再经现有 _anthropic_to_openai 转 OpenAI）。
-
-    返回 (model_name, anthropic_body)。
-    """
-    name = body.get("model", "")
-
-    # --- input → messages ---
-    input_items = body.get("input", [])
-    oa_msgs = _responses_input_to_openai_items(input_items)
-
-    # --- instructions → system ---
-    instructions = body.get("instructions", "")
-
-    # --- 构建 Anthropic body ---
-    anth_body = {
-        "model": name,
-        "messages": [],
-        "max_tokens": body.get("max_output_tokens", body.get("max_tokens", 4096)),
-        "stream": body.get("stream", False),
-    }
-
-    if body.get("temperature") is not None:
-        anth_body["temperature"] = body["temperature"]
-    if body.get("top_p") is not None:
-        anth_body["top_p"] = body["top_p"]
-
-    # system → system
-    if instructions:
-        anth_body["system"] = instructions
-
-    # 把 OpenAI 格式 messages 转回 Anthropic messages 格式
-    # 因为我们复用 _anthropic_to_openai，所以需要将 OpenAI messages 转回 Anthropic 格式
-    anth_msgs = []
-    for m in oa_msgs:
-        role = m["role"]
-        content = m.get("content", "")
-        if role == "tool":
-            # tool message → 需要先有 tool_use，再跟 tool_result
-            anth_msgs.append({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": m.get("tool_call_id", ""), "content": content}],
-            })
-        elif role == "assistant" and m.get("tool_calls"):
-            # assistant 有 tool_calls
-            parts = []
-            if content and content != "":
-                parts.append({"type": "text", "text": content})
-            for tc in m.get("tool_calls", []):
-                fn = tc.get("function", {})
-                try:
-                    input_dict = json.loads(fn.get("arguments", "{}"))
-                except Exception:
-                    input_dict = {}
-                parts.append({
-                    "type": "tool_use",
-                    "id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "input": input_dict,
-                })
-            anth_msgs.append({"role": "assistant", "content": parts if parts else ""})
-        else:
-            if isinstance(content, list):
-                # 内容块列表：OpenAI image_url → Anthropic image（供 _anthropic_to_openai 再用）
-                anth_blocks = []
-                for b in content:
-                    if b.get("type") == "image_url":
-                        img = _openai_image_to_anthropic(b)
-                        if img:
-                            anth_blocks.append(img)
-                    else:
-                        anth_blocks.append(b)
-                anth_msgs.append({"role": role, "content": anth_blocks})
-            else:
-                anth_msgs.append({"role": role, "content": content})
-    anth_body["messages"] = anth_msgs
-
-    # tools
-    tools_in = body.get("tools", [])
-    if tools_in:
-        anth_tools = []
-        for t in tools_in:
-            schema = t.get("input_schema", {}) or t.get("parameters", {})
-            anth_tools.append({
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "input_schema": schema if schema else {"type": "object"},
-            })
-        anth_body["tools"] = anth_tools
-
-    # tool_choice
-    tc = body.get("tool_choice")
-    oa_tc = _responses_tool_choice_to_openai(tc) if tc else None
-    if oa_tc:
-        if isinstance(oa_tc, str):
-            anth_body["tool_choice"] = "auto" if oa_tc == "auto" else "any" if oa_tc == "required" else "none"
-        elif isinstance(oa_tc, dict):
-            anth_body["tool_choice"] = {"type": "tool", "name": oa_tc["function"]["name"]}
-
-    # reasoning → thinking
-    reasoning = body.get("reasoning")
-    if reasoning:
-        think = _responses_reasoning_to_think(reasoning)
-        if think:
-            budget = think["budget_tokens"]
-            thinking_hint = (
-                f"You will engage in extended thinking before responding. "
-                f"Plan your response carefully. Think through the problem step by step. "
-                f"Maximum thinking budget: {budget} tokens."
-            )
-            if anth_body.get("system"):
-                anth_body["system"] = thinking_hint + "\n\n" + anth_body["system"]
-            else:
-                # 插入 thinking 作为第一条 user 消息前的 system
-                # Anthropic: thinking 通过 system prompt 传递
-                if anth_msgs and anth_msgs[0].get("role") == "system":
-                    pass  # 已有 system
-                else:
-                    pass  # 没有 system，thinking 已在 body 层
-
-    # 返回后需经 _anthropic_to_openai 转 OpenAI
-    # 但 anth_body 已经是 Anthropic 格式了，调用 _anthropic_to_openai 即可
-    return name, anth_body
-
-
-def _build_responses_output(openai_data: dict) -> dict:
-    """将 OpenAI 非流式响应转为 Responses API 格式。"""
-    choice = openai_data["choices"][0]
-    msg = choice["message"]
-
-    output_items: list[dict] = []
-
-    # --- text content → output_text ---
-    content = msg.get("content", "")
-    if content:
-        output_items.append({
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": content}],
-        })
-
-    # --- tool_calls → function_call ---
-    for tc in msg.get("tool_calls", []):
-        fn = tc.get("function", {})
-        output_items.append({
-            "type": "function_call",
-            "call_id": tc.get("id", f"call_{len(output_items)}"),
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments", "{}"),
-        })
-
-    # --- reasoning_content → reasoning ---
-    reasoning_content = msg.get("reasoning_content", "")
-    reasoning_items = None
-    if reasoning_content:
-        reasoning_items = [{"type": "summary", "text": reasoning_content}]
-
-    stop_map = {"stop": "completed", "tool_calls": "tool_calls", "length": "max_output_tokens"}
-    status = stop_map.get(choice.get("finish_reason", "stop"), "completed")
-
-    # 尝试从 OpenAI id 派生 response id
-    response_id = openai_data.get("id", f"resp_{int(time.time() * 1000)}")
-
-    resp = {
-        "id": response_id,
-        "model": openai_data.get("model", ""),
-        "output": output_items,
-        "status": status,
-        "stop_reason": choice.get("finish_reason"),
-        "usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-        },
-    }
-
-    if reasoning_items:
-        resp["reasoning"] = reasoning_items
-
-    return resp
-
-
-def _stream_responses(openai_iter, model_name: str):
-    """Generator: 将 OpenAI SSE 流转换为 Responses API 流式 SSE。
-
-    Responses API 流式格式与 Messages API类似，但使用 response_* 前缀。
-    """
-    response_id = f"resp_{model_name}_{int(time.time() * 1000)}"
-    item_index = 0
-    accumulated_text = ""
-    accumulated_json = ""
-    current_call_id = None
-    current_name = ""
-
-    # 首行: response.created
-    yield f'data: {json.dumps({
-        "type": "response.created",
-        "response": {
-            "id": response_id,
-            "model": model_name,
-            "status": "in_progress",
-            "output": [],
-            "usage": {},
-        },
-    })}\n\n'
-
-    try:
-        for raw in openai_iter:
-            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-            if not line.startswith("data: "):
-                continue
-            payload_str = line[6:].strip()
-            if payload_str == "[DONE]":
-                # response.done
-                yield f'data: {json.dumps({
-                    "type": "response.done",
-                    "response": {
-                        "id": response_id,
-                        "model": model_name,
-                        "status": "completed",
-                        "output": [],
-                        "usage": {"output_tokens": 1},
-                    },
-                })}\n\n'
-                break
-            try:
-                payload = json.loads(payload_str)
-            except Exception:
-                continue
-
-            choices = payload.get("choices", [])
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-            finish = choices[0].get("finish_reason")
-
-            text = delta.get("content", "")
-            reasoning = delta.get("reasoning_content", "")
-            tool_calls = delta.get("tool_calls", [])
-
-            if text:
-                # response.output_text.delta
-                yield f'data: {json.dumps({
-                    "type": "response.output_text.delta",
-                    "response_id": response_id,
-                    "output_index": 0,
-                    "delta": text,
-                })}\n\n'
-                accumulated_text += text
-
-            if reasoning:
-                # Responses API 暂不处理 reasoning 流式
-                pass
-
-            if tool_calls:
-                for tc in tool_calls:
-                    idx = tc.get("index", 0)
-                    fn = tc.get("function", {})
-                    tc_id = tc.get("id", f"call_{item_index}")
-                    tc_name = fn.get("name", "")
-                    tc_args = fn.get("arguments", "")
-
-                    if not current_call_id:
-                        # function_call.created + .partial_create
-                        item_index += 1
-                        yield f'data: {json.dumps({
-                            "type": "response.function_call_arguments.delta",
-                            "response_id": response_id,
-                            "output_index": idx,
-                            "call_id": tc_id,
-                            "delta": "",
-                        })}\n\n'
-                        current_call_id = tc_id
-                        current_name = tc_name
-
-                    if tc_args:
-                        yield f'data: {json.dumps({
-                            "type": "response.function_call_arguments.delta",
-                            "response_id": response_id,
-                            "output_index": idx,
-                            "call_id": tc_id,
-                            "delta": tc_args,
-                        })}\n\n'
-                        accumulated_json += tc_args
-
-            if finish:
-                stop_map = {"stop": "completed", "tool_calls": "tool_calls", "length": "max_output_tokens"}
-                if finish == "tool_calls" and current_call_id:
-                    # function_call.done
-                    yield f'data: {json.dumps({
-                        "type": "response.function_call_arguments.done",
-                        "response_id": response_id,
-                        "output_index": item_index,
-                        "call_id": current_call_id,
-                        "arguments": accumulated_json,
-                    })}\n\n'
-                # response.done
-                yield f'data: {json.dumps({
-                    "type": "response.done",
-                    "response": {
-                        "id": response_id,
-                        "model": model_name,
-                        "status": stop_map.get(finish, "completed"),
-                        "output": [],
-                        "usage": {"output_tokens": 1},
-                    },
-                })}\n\n'
-    finally:
-        pass
-
-    yield "data: [DONE]\n\n"
-
-
-# ============================================================
-# OpenAI Responses API 转换器
-# Responses → Chat Completions 已在上面处理
-# 这里是 Chat Completions → Responses 输出转换
-# ============================================================
-
-def _openai_chat_to_responses_output(oa_data: dict) -> dict:
-    """将 OpenAI Chat Completions 非流式响应转为 OpenAI Responses 格式。"""
-    choice = oa_data["choices"][0]
-    msg = choice["message"]
-
-    output_items: list[dict] = []
-    accumulated_text = ""
-
-    # text content → response/output_text
-    content = msg.get("content", "")
-    if content:
-        output_items.append({
-            "type": "response.output_text.delta",
-            "delta": content,
-        })
-        accumulated_text = content
-
-    # reasoning → response/reasoning
-    reasoning = msg.get("reasoning_content", "")
-    if reasoning:
-        output_items.append({
-            "type": "response.reasoning.delta",
-            "delta": reasoning,
-        })
-
-    # tool_calls → response/function_call
-    for tc in msg.get("tool_calls", []):
-        fn = tc.get("function", {})
-        output_items.append({
-            "type": "response.function_call",
-            "call_id": tc.get("id", f"call_{len(output_items)}"),
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments", "{}"),
-        })
-
-    stop_map = {"stop": "completed", "tool_calls": "tool_calls", "length": "max_output_tokens"}
-    status = stop_map.get(choice.get("finish_reason", "stop"), "completed")
-
-    resp_id = oa_data.get("id", f"resp_{int(time.time() * 1000)}")
-
-    return {
-        "id": resp_id,
-        "object": "response",
-        "model": oa_data.get("model", ""),
-        "status": status,
-        "output": output_items,
-        "stop_tokens": [],
-        "usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-        },
-    }
-
-
-def _openai_chat_stream_to_responses(data_iter, model_name: str):
-    """Generator: 将 OpenAI Chat Completions SSE 流转换为 OpenAI Responses 流。"""
-    response_id = f"resp_{model_name}_{int(time.time() * 1000)}"
-    item_index = 0
-    accumulated_text = ""
-    accumulated_json = ""
-    current_call_id = None
-
-    yield f'data: {json.dumps({
-        "type": "response.created",
-        "response": {
-            "id": response_id,
-            "object": "response",
-            "model": model_name,
-            "status": "in_progress",
-            "output": [],
-        },
-    })}\n\n'
-
-    try:
-        for raw in data_iter:
-            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-            if not line.startswith("data: "):
-                continue
-            payload_str = line[6:].strip()
-            if payload_str == "[DONE]":
-                yield f'data: {json.dumps({
-                    "type": "response.done",
-                    "response": {
-                        "id": response_id,
-                        "object": "response",
-                        "model": model_name,
-                        "status": "completed",
-                        "output": [],
-                        "usage": {"output_tokens": 1},
-                    },
-                })}\n\n'
-                break
-            try:
-                payload = json.loads(payload_str)
-            except Exception:
-                continue
-
-            choices = payload.get("choices", [])
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-            finish = choices[0].get("finish_reason")
-
-            text = delta.get("content", "")
-            reasoning = delta.get("reasoning_content", "")
-            tool_calls = delta.get("tool_calls", [])
-
-            if text:
-                yield f'data: {json.dumps({
-                    "type": "response.output_text.delta",
-                    "response_id": response_id,
-                    "output_index": item_index,
-                    "delta": text,
-                })}\n\n'
-                accumulated_text += text
-
-            if reasoning:
-                yield f'data: {json.dumps({
-                    "type": "response.reasoning.delta",
-                    "response_id": response_id,
-                    "output_index": item_index,
-                    "delta": reasoning,
-                })}\n\n'
-
-            if tool_calls:
-                for tc in tool_calls:
-                    idx = tc.get("index", 0)
-                    fn = tc.get("function", {})
-                    tc_id = tc.get("id", f"call_{item_index}")
-                    tc_name = fn.get("name", "")
-                    tc_args = fn.get("arguments", "")
-
-                    if not current_call_id:
-                        # function_call.start
-                        item_index += 1
-                        current_call_id = tc_id
-                        accumulated_json = ""
-
-                    if tc_args:
-                        yield f'data: {json.dumps({
-                            "type": "response.function_call_arguments.delta",
-                            "response_id": response_id,
-                            "output_index": item_index - 1,
-                            "call_id": tc_id,
-                            "delta": tc_args,
-                        })}\n\n'
-                        accumulated_json += tc_args
-
-            if finish:
-                if finish == "tool_calls" and current_call_id:
-                    yield f'data: {json.dumps({
-                        "type": "response.function_call_arguments.done",
-                        "response_id": response_id,
-                        "output_index": item_index - 1,
-                        "call_id": current_call_id,
-                        "arguments": accumulated_json,
-                    })}\n\n'
-
-                stop_map = {"stop": "completed", "tool_calls": "tool_calls", "length": "max_output_tokens"}
-                yield f'data: {json.dumps({
-                    "type": "response.done",
-                    "response": {
-                        "id": response_id,
-                        "object": "response",
-                        "model": model_name,
-                        "status": stop_map.get(finish, "completed"),
-                        "output": [],
-                        "usage": {"output_tokens": 1},
-                    },
-                })}\n\n'
-    finally:
-        pass
-
-    yield "data: [DONE]\n\n"
+    for tool in body.get("tools") or []:
+        if isinstance(tool, dict) and "input_schema" in tool:
+            return "anthropic"
+    for item in body.get("input") or []:
+        if isinstance(item, dict) and item.get("type") == "input_message":
+            return "anthropic"
+    return "openai"
 
 
 @app.post("/v1/responses")
 async def responses_api(request: Request):
-    """统一 Responses API 入口，按请求体结构自动检测格式。
-
-    通过 body 字段特征判断，不依赖 HTTP 头：
-    • Anthropic: anthropic_version / output_config / input_schema / input_message
-    • OpenAI: output_schema / parallel_tool_calls / store / parameters / file
-    """
+    style = "openai"
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error", "message": "请求体不是合法 JSON"}},
-            status_code=400)
-
-    # 类型检查：必须是 JSON object，不能是 array / number / string / null
-    if not isinstance(body, dict):
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error",
-                "message": "请求体必须是 JSON 对象，不是 " + type(body).__name__}},
-            status_code=400)
-
-    # 空对象也直接拒绝
-    if not body:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error",
-                "message": "请求体不能为空"}},
-            status_code=400)
-
-    fmt = _detect_responses_format(body)
-    if fmt == "anthropic":
-        return await _handle_anthropic_responses(request, body)
-    elif fmt == "openai":
-        return await _handle_openai_responses(request, body)
-    else:
-        # 无法识别：先尝试 Anthropic，失败再试 OpenAI
-        r = await _handle_anthropic_responses(request, body)
-        if isinstance(r, JSONResponse) and r.status_code == 400:
-            # 400 可能是格式不匹配，不立即返回，给 OpenAI 一次机会
-            pass
-        else:
-            return r
-        return await _handle_openai_responses(request, body)
-
-
-async def _handle_anthropic_responses(request: Request, body: dict):
-    """Anthropic Responses API 处理函数。
-
-    body 已由路由层解析并传入。
-    """
-    name = body.get("model", "")
-    if not name:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error", "message": "缺少 model 字段"}},
-            status_code=400)
-
-    # 校验 input 必须存在且非空
-    inp = body.get("input")
-    if not inp:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error",
-                "message": "缺少 input 字段，Responses API 需要提供输入内容"}},
-            status_code=400)
-
-    man = await asyncio.to_thread(load_manifest)
-    if name not in man:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_model_error", "message": f"模型 '{name}' 不存在"}},
-            status_code=400)
-
-    try:
-        anth_body = _responses_to_anthropic_messages(body, man)
-        model_name, oa_body = _anthropic_to_openai(anth_body, man)
-    except Exception as e:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "invalid_request_error", "message": f"请求格式错误: {e}"}},
-            status_code=400)
-
-    is_stream = oa_body.get("stream", False)
-
-    try:
-        b = await ensure_loaded(model_name, man)
-    except ResourceError as e:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "insufficient_resources", "message": str(e)}},
-            status_code=503)
-    except Exception as e:
-        return JSONResponse(
-            {"type": "error", "error": {"type": "backend_error", "message": f"模型加载失败: {e}"}},
-            status_code=502)
-
-    b["in_flight"] += 1
-    p = _pick_peer(b)          # 多副本：挑在途最少的副本；单副本时 peers 只 1 个元素，分流退化为自己
-    p["in_flight"] = p.get("in_flight", 0) + 1
-    b["last_used"] = time.time()
-
-    url = f"http://{p['container']}:8000/v1/chat/completions"
-    qs = request.url.query
-    if qs:
-        url += f"?{qs}"
-    headers = {"content-type": "application/json"}
-    try:
-        req = http.build_request("POST", url, content=json.dumps(oa_body).encode(), headers=headers)
-        r = await http.send(req, stream=True)
-    except Exception as e:
-        b["in_flight"] -= 1
-        p["in_flight"] -= 1
-        return JSONResponse(
-            {"type": "error", "error": {"type": "api_error", "message": f"转发失败: {e}"}},
-            status_code=502)
-
-    if not is_stream:
-        try:
-            oa_resp = json.loads(await r.aread())
-        except Exception:
-            b["in_flight"] -= 1
-            p["in_flight"] -= 1
-            return JSONResponse(
-                {"type": "error", "error": {"type": "api_error", "message": "读取响应失败"}},
-                status_code=502)
-        b["in_flight"] -= 1
-        p["in_flight"] -= 1
-        resp = _build_responses_output(oa_resp)
-        return JSONResponse(resp)
-
-    gen = _stream_responses(r.aiter_raw(), model_name)
-    return StreamingResponse(gen, media_type="text/event-stream")
-
-
-async def _handle_openai_responses(request: Request, body: dict):
-    """OpenAI Responses API 处理函数。
-
-    body 已由路由层解析并传入。
-    将 OpenAI Responses 格式 → OpenAI Chat Completions → OpenAI Responses 格式。
-    """
-    name = body.get("model", "")
-    if not name:
-        return JSONResponse(
-            {"error": {"message": "缺少 model 字段", "type": "invalid_request_error"}},
-            status_code=400)
-
-    # 校验 input 必须存在且非空
-    inp = body.get("input")
-    if not inp:
-        return JSONResponse(
-            {"error": {"message": "缺少 input 字段，Responses API 需要提供输入内容",
-                       "type": "invalid_request_error"}},
-            status_code=400)
-
-    man = await asyncio.to_thread(load_manifest)
-    if name not in man:
-        return JSONResponse(
-            {"error": {"message": f"模型 '{name}' 不存在", "type": "invalid_model_error"}},
-            status_code=400)
-
-    is_stream = body.get("stream", False)
-    max_output_tokens = body.get("max_output_tokens")
-    output_schema = body.get("output_schema")
-
-    # --- input → OpenAI messages ---
-    input_items = body.get("input", [])
-    oa_msgs = _responses_input_to_openai_items(input_items)
-
-    # --- instructions → system ---
-    instructions = body.get("instructions", "")
-
-    # --- output_schema → response_format ---
-    oa_response_format = None
-    if output_schema:
-        oa_response_format = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": output_schema.get("name", "structured_output"),
-                "schema": output_schema.get("schema"),
-                "strict": output_schema.get("strict", False),
-            },
-        }
-
-    # --- 构建 OpenAI Chat Completions body ---
-    oa_body = {
-        "model": name,
-        "messages": oa_msgs,
-        "stream": is_stream,
-    }
-    if max_output_tokens is not None:
-        oa_body["max_tokens"] = max_output_tokens
-    if body.get("temperature") is not None:
-        oa_body["temperature"] = body["temperature"]
-    if body.get("top_p") is not None:
-        oa_body["top_p"] = body["top_p"]
-    if oa_response_format:
-        oa_body["response_format"] = oa_response_format
-
-    # tools (OpenAI Responses 与 Chat Completions 格式一致)
-    tools_in = body.get("tools", [])
-    if tools_in:
-        oa_tools = []
-        for t in tools_in:
-            if t.get("type", "").startswith("web_search") or t.get("name") == "web_search":
-                continue
-            schema = t.get("input_schema", {}) or t.get("parameters", {})
-            oa_tools.append({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": schema if schema else {"type": "object"},
-                },
-            })
-        if oa_tools:
-            oa_body["tools"] = oa_tools
-
-    # tool_choice
-    tc = body.get("tool_choice")
-    oa_tc = _responses_tool_choice_to_openai(tc) if tc else None
-    if oa_tc is not None:
-        oa_body["tool_choice"] = oa_tc
-
-    # --- 确保模型加载 ---
-    try:
-        b = await ensure_loaded(name, man)
-    except ResourceError as e:
-        return JSONResponse(
-            {"error": {"message": str(e), "type": "insufficient_resources"}},
-            status_code=503)
-    except Exception as e:
-        return JSONResponse(
-            {"error": {"message": f"模型加载失败: {e}", "type": "backend_error"}},
-            status_code=502)
-
-    b["in_flight"] += 1
-    p = _pick_peer(b)          # 多副本：挑在途最少的副本；单副本时 peers 只 1 个元素，分流退化为自己
-    p["in_flight"] = p.get("in_flight", 0) + 1
-    b["last_used"] = time.time()
-
-    url = f"http://{p['container']}:8000/v1/chat/completions"
-    qs = request.url.query
-    if qs:
-        url += f"?{qs}"
-    headers = {"content-type": "application/json"}
-    try:
-        req = http.build_request("POST", url, content=json.dumps(oa_body).encode(), headers=headers)
-        r = await http.send(req, stream=True)
-    except Exception as e:
-        b["in_flight"] -= 1
-        p["in_flight"] -= 1
-        return JSONResponse(
-            {"error": {"message": f"转发失败: {e}", "type": "api_error"}},
-            status_code=502)
-
-    # --- 非流式：Chat Completions → Responses ---
-    if not is_stream:
-        try:
-            oa_resp = json.loads(await r.aread())
-        except Exception:
-            b["in_flight"] -= 1
-            p["in_flight"] -= 1
-            return JSONResponse(
-                {"error": {"message": "读取响应失败", "type": "api_error"}},
-                status_code=502)
-        b["in_flight"] -= 1
-        p["in_flight"] -= 1
-        resp = _openai_chat_to_responses_output(oa_resp)
-        return JSONResponse(resp)
-
-    # --- 流式：转发为 Responses SSE ---
-    gen = _openai_chat_stream_to_responses(r.aiter_raw(), name)
-    return StreamingResponse(gen, media_type="text/event-stream")
+        body = await _json_request(request, style)
+        style = _responses_style(request, body)
+        manifest = await asyncio.to_thread(load_manifest)
+        chat_body = responses_to_chat(body)
+        backend, peer, upstream = await _send_chat(body.get("model", ""), manifest, chat_body)
+        if chat_body.get("stream"):
+            return _converted_stream(backend, peer, upstream,
+                                     stream_responses(upstream.aiter_lines(), body["model"]))
+        data = await _read_chat_response(backend, peer, upstream)
+        response = chat_to_response(data)
+        _cache_response(response)
+        return JSONResponse(response)
+    except ProtocolError as e:
+        return _protocol_error(e, style)
+    except UpstreamError as e:
+        return _upstream_error(e, style)
 
 
 @app.get("/v1/responses/{response_id}")
-async def anthropic_get_response(response_id: str):
-    """获取 Responses API 的响应详情（仅返回元数据，无状态）。"""
-    return {
-        "id": response_id,
-        "object": "response",
-        "status": "completed",
-        "model": "unknown",
-    }
+async def get_response(response_id: str):
+    response = response_cache.get(response_id)
+    if response is None:
+        return _protocol_error(f"响应 '{response_id}' 不存在或已过期", status=404, error_type="not_found")
+    return response
 
 
-@app.post("/v1/responses/prefetch")
-async def anthropic_prefetch():
-    """Responses prefetch 接口（无需持久化，直接返回 200）。"""
-    return {"id": "none", "status": "skipped"}
+@app.delete("/v1/responses/{response_id}")
+async def delete_response(response_id: str):
+    if response_cache.pop(response_id, None) is None:
+        return _protocol_error(f"响应 '{response_id}' 不存在或已过期", status=404, error_type="not_found")
+    return {"id": response_id, "object": "response.deleted", "deleted": True}
 
 
 @app.api_route("/v1/{path:path}", methods=["POST"])
