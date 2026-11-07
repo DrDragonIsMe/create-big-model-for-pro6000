@@ -101,6 +101,8 @@
 
 `role` 支持 `system`、`developer`、`user`、`assistant`；`developer` 会转换为系统指令。
 
+后端模型的 chat template 只接受一条置顶系统指令，因此开头连续的 `system`/`developer` 消息（连同 `instructions` 字段带来的那条）会按原顺序合并成一条。OpenAI Codex CLI 每个请求都发两条前置 `developer` 消息（基础指令 + 权限说明），不合并会被后端以 `System message must be at the beginning.` 拒绝。
+
 ### 2.2 工具调用请求
 
 ```json
@@ -303,6 +305,8 @@
   "stream": false
 }
 ```
+
+`system` 支持字符串或文本块数组（`cache_control` 会被忽略）。Claude Code 还会在 `messages` 里内联 `role: "system"` 条目（会话提醒等），这类条目会提取文本并入置顶系统指令，而不是按不支持的角色返回 400 `Anthropic 不支持角色: system`。
 
 ### 3.2 返回
 
@@ -521,6 +525,7 @@ Anthropic 风格：
 
 ## 8. 当前边界
 
+- 系统指令统一归一化为唯一一条置顶消息：Responses 开头连续的 `system`/`developer` 按序合并，Anthropic `messages` 内联的 `system` 并入置顶。中途 system 的位置语义不保留——后端 chat template 只认一条置顶系统指令。
 - 不支持托管 `web_search`、文件/PDF、音频输入，相关请求会明确返回 400。
 - 不支持 `previous_response_id` 会话续接，客户端应发送完整 `input` 历史。
 - 非流式 Responses 的 GET/DELETE 仅使用进程内缓存，客户端不应把它当作持久会话存储。

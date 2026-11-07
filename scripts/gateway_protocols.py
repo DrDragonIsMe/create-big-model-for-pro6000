@@ -189,6 +189,18 @@ def _apply_common_chat_options(body, out, responses=False):
         out["tool_choice"] = choice
 
 
+def _merge_leading_system(messages):
+    # 后端 chat 模板只接受一条置顶 system（Codex 会把基础指令和权限说明发成
+    # 两条 developer 消息，合并成一条才不会 400 "System message must be at the beginning."）
+    i = 0
+    while i < len(messages) and messages[i].get("role") == "system":
+        i += 1
+    if i < 2:
+        return messages
+    merged = "\n\n".join(text for msg in messages[:i] for text in _text_parts(msg.get("content")))
+    return [{"role": "system", "content": merged}, *messages[i:]]
+
+
 def responses_to_chat(body):
     if body.get("previous_response_id"):
         raise ProtocolError("previous_response_id 需要服务端会话存储；请改为发送完整 input 历史")
@@ -236,6 +248,7 @@ def responses_to_chat(body):
     instructions = body.get("instructions")
     if instructions:
         messages.insert(0, {"role": "system", "content": _openai_content(instructions)})
+    messages = _merge_leading_system(messages)
     if not messages:
         raise ProtocolError("input 不能为空")
     out = {"model": body.get("model", ""), "messages": messages,
@@ -249,6 +262,7 @@ def anthropic_to_chat(body):
     if not isinstance(source, list) or not source:
         raise ProtocolError("messages 必须是非空数组")
     messages = []
+    inline_system = []
     system = body.get("system")
     if system:
         messages.append({"role": "system", "content": "\n".join(_text_parts(system))})
@@ -287,8 +301,18 @@ def anthropic_to_chat(body):
                 else:
                     pending.append(block)
             flush_pending()
+        elif role == "system":
+            # Claude Code 会在 messages 里内联 system 条目；后端只认置顶那一条，
+            # 所以提取文本并入前导 system，而不是当不支持的角色拒掉。
+            inline_system.extend(_text_parts(content))
         else:
             raise ProtocolError(f"Anthropic 不支持角色: {role}")
+    if inline_system:
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = "\n\n".join([messages[0]["content"], *inline_system])
+        else:
+            messages.insert(0, {"role": "system", "content": "\n\n".join(inline_system)})
+    messages = _merge_leading_system(messages)
     out = {"model": body.get("model", ""), "messages": messages,
            "stream": bool(body.get("stream", False))}
     _apply_common_chat_options(body, out)

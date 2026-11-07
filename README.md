@@ -197,6 +197,7 @@ YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_M
 - 网关会钳制过大的 `max_tokens`（vLLM 对 prompt+输出超上下文一律 400，客户端会误判为"上下文溢出"提前 compact）；钳制设有保底预算（思考模型 16384 / 非思考 4096），低于保底说明上下文真满了，放开让 vLLM 原生 400 透传触发 compact，避免思考模型预算被钳光后只吐 thinking 报错
 - 多模型放置策略：装得下就并存（每卡按已加载模型的 util 预算扣减，为其保留 KV cache 空间）；任何卡都装不下才卸最久未用的空闲模型；正忙的模型绝不驱逐，直接返回 503 让客户端稍后重试
 - 客户端 agent 细粒度协商（2026-10-20 新增）：首次连接先 `GET /v1/gateway/capabilities` 学习能力与协议 → `GET /v1/gateway/gpus` 查 GPU 数量与占用 → `POST /v1/gateway/load {"model":...,"gpus":[0],"wait":false}` 指定 GPU 异步加载 → 轮询 `GET /v1/gateway/ops/{id}` 拿加载/切换状态（`transitions[]`）。推理请求也可带 `X-Gateway-Load-Async:1`（+可选 `X-Gateway-GPUs:0`）免预加载、202 异步协商。2026-10-26 起再加一步**布局协商**：`GET /v1/gateway/modes` 查每个模型的摆放模式（dual/tp/replica/pool/auto）、现行布局与 ctx 上限，`load` 带 `"mode":"…"` 或 `"replicas":N` 当场切摆放（可加推理头 `X-Gateway-Mode`）；网关对 models.json 只读，新 ctx 持久化按目录给的 `host_command` 在宿主执行。详见 `模型切换说明.md` 第 5.3 / 5.8 节。
+- 编程 agent 直连（2026-11-07 新增）：OpenAI Codex CLI 走 `/v1/responses`（`wire_api = "responses"`，0.167 起已移除 `"chat"`），Claude Code 走 `/v1/messages`（`ANTHROPIC_BASE_URL` 填网关根地址，不要带 `/v1`）。两者的 system 消息形态都由 `gateway_protocols.py` 归一化，直连即可，不需要中间转换代理；规则见 `gateway-response-protocol.md` 第 2.1 / 3.1 节
 - 自动卸载只由文本请求触发；视频请求直连 ComfyUI 不经过网关，跑大视频任务前需手动腾显存：`curl -X POST http://localhost:8000/v1/gateway/unload_all`（正忙/加载中的模型跳过并在 `busy` 字段列出，网关保持常驻、请求来了自动重载）
 - 详细设计见方案文档（plans/miles-morales-siryn-batgirl.md）
 
