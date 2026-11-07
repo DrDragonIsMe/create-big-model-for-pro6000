@@ -331,10 +331,23 @@
   "stop_sequence": null,
   "usage": {
     "input_tokens": 55,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
     "output_tokens": 30
   }
 }
 ```
+
+Anthropic usage 字段语义（网关映射自 vLLM 的 prompt_tokens 自动前缀缓存统计）：
+
+| 字段 | 含义 |
+|---|---|
+| `input_tokens` | 未命中缓存的 prompt token 数（= prompt_tokens − cached_tokens） |
+| `cache_read_input_tokens` | 命中 vLLM 自动前缀缓存的 prompt token 数 |
+| `cache_creation_input_tokens` | 恒为 0（vLLM 无显式 cache 写入概念） |
+| `output_tokens` | 补全 token 数 |
+
+当前上下文占用 = `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`，即完整 prompt_tokens。客户端（如 Claude Code 状态栏）依赖这些字段计算上下文比例，网关在流式与非流式路径均须回填。
 
 工具调用内容块：
 
@@ -476,7 +489,7 @@ data: {"type":"response.output_text.delta","delta":"你","output_index":0}
 - `thinking_delta`
 - `input_json_delta`
 
-结束依据是 `message_stop`。最终输出 token 数从 `message_delta.usage.output_tokens` 读取。
+结束依据是 `message_stop`。最终 usage 从 `message_delta.usage` 读取，含 `input_tokens`、`cache_read_input_tokens`、`output_tokens`（语义同第 4 节表格；`message_start` 里的 usage 全为 0，只是占位）。
 
 ## 6. 错误格式
 

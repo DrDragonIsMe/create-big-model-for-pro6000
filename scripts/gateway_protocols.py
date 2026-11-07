@@ -319,11 +319,26 @@ def anthropic_to_chat(body):
     return out
 
 
+def _split_prompt_tokens(usage):
+    """vLLM usage → Anthropic 语义：prompt 全量拆成 未命中缓存的 input + cache_read。
+
+    cached_tokens 仅在命中自动前缀缓存时出现；cache_creation vLLM 不报，恒 0。
+    Claude Code 的上下文占用 = input + cache_read + cache_creation = prompt_tokens。
+    """
+    prompt = usage.get("prompt_tokens", 0) or 0
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+    cached = min(cached, prompt)
+    return prompt - cached, cached
+
+
 def _usage(usage, anthropic=False):
     usage = usage or {}
     if anthropic:
-        return {"input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0)}
+        input_tokens, cache_read = _split_prompt_tokens(usage)
+        return {"input_tokens": input_tokens,
+                "output_tokens": usage.get("completion_tokens", 0),
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": cache_read}
     return {
         "input_tokens": usage.get("prompt_tokens", 0),
         "output_tokens": usage.get("completion_tokens", 0),
@@ -636,6 +651,9 @@ async def stream_anthropic(lines, model_name):
         yield stopped
     stop = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}.get(
         finish or ("tool_calls" if tools else "stop"), "end_turn")
+    input_tokens, cache_read = _split_prompt_tokens(usage or {})
     yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
-                                 "usage": {"output_tokens": (usage or {}).get("completion_tokens", 0)}})
+                                 "usage": {"input_tokens": input_tokens,
+                                           "cache_read_input_tokens": cache_read,
+                                           "output_tokens": (usage or {}).get("completion_tokens", 0)}})
     yield _sse("message_stop", {"type": "message_stop"})
