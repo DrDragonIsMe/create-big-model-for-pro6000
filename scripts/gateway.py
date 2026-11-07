@@ -892,6 +892,12 @@ def _run_backend(name, dirname, gpus, util, max_len, think, extra_args=None, env
            "--max-model-len", str(max_len),
            "--max-num-seqs", str(max_num_seqs or 128),
            "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_xml"]
+    # vLLM 默认不报 usage.prompt_tokens_details.cached_tokens，Anthropic 协议的
+    # cache_read_input_tokens 就没数据可回填（Claude Code 状态栏恒 0/256k）。
+    # extra_args 里已手传同名 flag（含 --no- 形式）时不重复注入。
+    _ea = [str(a) for a in (extra_args or [])]
+    if not any("enable-prompt-tokens-details" in a for a in _ea):
+        cmd += ["--enable-prompt-tokens-details"]
     if think:
         # 仅思考模型可加 reasoning parser；非思考模型强开会把正文吞进 reasoning_content
         cmd += ["--reasoning-parser", "qwen3"]
