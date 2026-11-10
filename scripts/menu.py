@@ -246,7 +246,7 @@ def suggest_modes(man, *, gmem, gpu_count, bud, meta, llm_name, d, variant,
             print("  · " + r)
         print("─" * 62)
 
-def compute(args, man, gpu_count, gpu_mem):
+def compute(args, man, gpu_count, gpu_mem, ram_gb=0):
     meta = man["meta"]
     gmem = round(gpu_mem[0] / 1024)  # GB，同型号卡取首卡
     # 各角色预算从探测结果派生，meta 只在人类显式写过且量纲对得上时当覆盖项
@@ -294,7 +294,10 @@ def compute(args, man, gpu_count, gpu_mem):
             fit = pick_variant(d, budget)
             # 旗舰池模式：单卡/半池预算都装不下时，按整机池再判一次
             # （如 2×48GB 上的 84GB GGUF 走跨卡分层，与 compute 的 flagship 准入同口径）
-            pool_fit = None if (fit or gpu_count < 2) else pick_variant(d, pool_cap(gpu_count, gmem))
+            pool_budget = pool_cap(gpu_count, gmem)
+            if d.get("host_offload"):
+                pool_budget += max(0, ram_gb - 16)
+            pool_fit = None if (fit or gpu_count < 2) else pick_variant(d, pool_budget)
             full_cap = gmem - meta["safety_gap_gb"] - 2
             full_fit = pick_variant(d, full_cap) if (gpu_count == 1 and not fit) else None
             selectable = bool(fit) or bool(full_fit) or bool(pool_fit)
@@ -346,6 +349,8 @@ def compute(args, man, gpu_count, gpu_mem):
             # 下面 186 行的池准入形同虚设（只有手传 --variant 才进得去）
             if pick_variant(d, vbudget) is None:
                 vbudget = pool_cap(gpu_count, gmem)
+        if d.get("host_offload") and gpu_count >= 2:
+            vbudget += max(0, ram_gb - 16)
         variant = pick_variant(d, vbudget)
         if variant is None and gpu_count == 1:
             # 单卡独占：single 预算内装不下，退而求其次吃满整卡（视频不可共存）
@@ -769,7 +774,7 @@ def main():
     report_occupancy(hwprofile.foreign_occupancy(),
                      args.strict or os.environ.get("AI_STRICT") == "1")
     sync_meta(man, prof)
-    compute(args, man, prof["gpu_count"], [prof["gmem_mib"]])
+    compute(args, man, prof["gpu_count"], [prof["gmem_mib"]], prof["ram_gb"])
 
 if __name__ == "__main__":
     main()
