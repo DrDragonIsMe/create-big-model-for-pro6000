@@ -227,12 +227,12 @@
    "ctx_default": 131072,
    "max_ctx": 1048576,
    "think": true,
-   "desc": "DeepSeek V4.1 Flash 1017：552B主干+196B Engram MoE，UD-Q2_K_XL 335G，双卡+内存 offload，Engram 表 SSD mmap；原生支持1M上下文（无需YaRN），当前总池512K、parallel=2 每slot 256K，支持图像/视频理解，使用120a-real编译的master版llama.cpp",
-   "menu_brief": "[视觉·图+视频] 【能力天花板】DS V4.1 Flash 2bit 335G，双卡独占+内存 offload，2×256K并发上下文，复杂编程/推理攻关用，偏慢",
+   "desc": "DeepSeek V4.1 Flash 1017：552B主干+196B Engram MoE，UD-Q2_K_XL 335G，双卡+内存 offload，Engram 表 SSD mmap；原生支持1M上下文（无需YaRN），总池1M（原生）、parallel=2 每slot 512K，支持图像/视频理解，使用120a-real编译的master版llama.cpp",
+   "menu_brief": "[视觉·图+视频] 【能力天花板】DS V4.1 Flash 2bit 335G，双卡独占+内存 offload，2×512K并发上下文，复杂编程/推理攻关用，偏慢",
    "gw": {
     "gpus": "0,1",
     "util": 0.92,
-    "max_len": 524288,
+    "max_len": 1048576,
     "image": "ai-llamacpp:master",
     "parallel": 2,
     "extra_args": [

@@ -1544,7 +1544,13 @@ def adopt_existing():
 
 def model_context_length(d):
     gw = d.get("gw", {})
-    return int(gw.get("max_len", d.get("max_ctx", d.get("ctx_default", 32768))))
+    n = int(gw.get("max_len", d.get("max_ctx", d.get("ctx_default", 32768))))
+    if d.get("engine") == "llamacpp":
+        # llama.cpp --parallel N 把 ctx 总池平分为 N 个槽，单请求只占一槽；
+        # 广告总池会让按 context_length 决定 compact 时机的客户端超限被拒
+        # （实测 263629 tokens 撞 262144 槽上限）。广告值 = 单请求真实上限。
+        n //= max(1, int(gw.get("parallel", 1)))
+    return n
 
 
 def model_capabilities(d):

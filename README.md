@@ -127,7 +127,7 @@ sudo ./scripts/install-prereqs.sh   # ① Docker + NVIDIA Container Toolkit（�
 | qwen3.8-27b | 900K | 官方 YaRN factor 4.0；vLLM 实测 KV 上限 907088，1M 差 ~6GB |
 | qwen3-coder-30b-a3b | 512K | 稠密注意力 KV 开销大，factor 2.0；需 FP8 变体（bf16 下 512K 放不下） |
 | qwen3-coder-next | 256K | 官方无 YaRN 方案，且 FP8 权重占满单卡，KV 无余量 |
-| deepseek-v4.1-flash | 总池 512K；每 slot 256K | 原生支持 1M；当前 `parallel=2` 平分为 2 个并发槽；双卡 + 内存 offload |
+| deepseek-v4.1-flash | 总池 1M（原生）；每 slot 512K | `parallel=2` 平分为 2 个并发槽；单请求上限 = 总池 ÷ 槽数；双卡 + 内存 offload |
 
 YaRN 通过 `gw.extra_args`（`--hf-overrides`）+ `gw.env`（`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`）
 按模型注入。注意静态 YaRN 在短文本上可能有轻微质量损失（官方注），且超长 prompt 的
