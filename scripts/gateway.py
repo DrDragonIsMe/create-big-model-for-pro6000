@@ -759,6 +759,116 @@ def _find_gguf(dirname, pattern=None):
 _SHARD_RE = re.compile(r"^(?P<prefix>.*)-(\d+)-of-(?P<n>\d+)\.gguf$", re.IGNORECASE)
 
 
+def _physical_cores():
+    """宿主物理核数：/proc/cpuinfo 按 (physical id, core id) 去重，并尊重 cpuset 亲和性。
+    容器内 /proc 反映的是宿主；SMT 兄弟核对 ggml 常为负收益，按物理核取。"""
+    try:
+        pairs, cur = {}, None
+        with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("processor"):
+                    cur = int(line.split(":", 1)[1])
+                    pairs[cur] = [None, None]
+                elif line.startswith("physical id") and cur is not None:
+                    pairs[cur][0] = line.split(":", 1)[1].strip()
+                elif line.startswith("core id") and cur is not None:
+                    pairs[cur][1] = line.split(":", 1)[1].strip()
+        try:
+            allowed = os.sched_getaffinity(0)
+        except (AttributeError, OSError):
+            allowed = set(pairs)
+        cores = {tuple(v) for k, v in pairs.items() if k in allowed and None not in v}
+        if cores:
+            return len(cores)
+    except (OSError, ValueError):
+        pass
+    return max(1, (os.cpu_count() or 8) // 2)
+
+
+def _host_cpu_flags():
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("flags"):
+                    return set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return None
+
+
+def _host_gpu_arch_families():
+    """宿主 GPU 的 CUDA 架构族集合（如 {'120'}，由 compute_cap '12.0' 去点号得来）；
+    拿不到返回 None（不做判断）。"""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10).stdout
+        fams = {ln.strip().replace(".", "") for ln in out.splitlines()
+                if ln.strip() and ln.strip()[0].isdigit()}
+        return fams or None
+    except Exception:
+        return None
+
+
+def _cuda_arch_hint(cap):
+    """compute_cap 去点号（'120'）→ CMAKE_CUDA_ARCHITECTURES 建议值。"""
+    return f"{cap}a-real" if cap.startswith(("90", "100", "120")) else cap
+
+
+_BUILD_INFO_CACHE: dict = {}
+
+
+def _llamacpp_build_info(image):
+    """读本地编译镜像里 /etc/ai-llamacpp-build.env 的构建元数据（带缓存）。
+    旧镜像/预构建镜像没有该文件 → 空 dict（调用方视为不拦）。
+    用 docker SDK 起一次性容器读文件（网关容器里没有 docker CLI）。"""
+    if image in _BUILD_INFO_CACHE:
+        return _BUILD_INFO_CACHE[image]
+    info = {}
+    try:
+        out = dcli.containers.run(
+            image, remove=True, network_mode="none",
+            entrypoint=["sh", "-c", "cat /etc/ai-llamacpp-build.env 2>/dev/null || true"])
+        for ln in out.decode("utf-8", "ignore").splitlines():
+            k, _, v = ln.partition("=")
+            if k.startswith("AI_LLAMACPP_"):
+                info[k] = v.strip()
+    except Exception:
+        pass
+    _BUILD_INFO_CACHE[image] = info
+    return info
+
+
+def check_llamacpp_image(image):
+    """本地编译的 llamacpp 镜像与当前机器的适配检查 → (ok, reason, rebuild_hint)。
+    只在能确定不匹配时拦截；缺元数据/探测不到宿主信息一律放行（宁漏勿错）。
+    两类不匹配：GPU 架构族不同（换卡必重编）；编译机 CPU 指令集超出本机
+    （换 CPU 后典型症状是 invalid opcode 退出 132）。"""
+    info = _llamacpp_build_info(image)
+    if not info:
+        return True, "", ""
+    arch = info.get("AI_LLAMACPP_CUDA_ARCH", "")
+    fams = _host_gpu_arch_families()
+    if arch and fams:
+        build_fams = {m.group() for a in re.split(r"[;\s,]+", arch)
+                      for m in [re.match(r"\d+", a)] if m}
+        if build_fams and not (build_fams & fams):
+            hint_arch = ";".join(sorted({_cuda_arch_hint(f) for f in fams}))
+            return False, (f"镜像 CUDA 架构 {arch} 与本机 GPU compute_cap 族"
+                           f"（{','.join(sorted(fams))}）不匹配"), \
+                (f"docker build --no-cache --build-arg "
+                 f"CMAKE_CUDA_ARCHITECTURES={hint_arch} -t {image} ./docker/llamacpp")
+    bflags = set(info.get("AI_LLAMACPP_CPU_FLAGS", "").split())
+    hflags = _host_cpu_flags()
+    if bflags and hflags:
+        missing = sorted(bflags - hflags)
+        if missing:
+            return False, (f"镜像编译机指令集超出本机（缺 {', '.join(missing[:8])}"
+                           f"{'…' if len(missing) > 8 else ''}），运行可能 invalid opcode"), \
+                f"docker build --no-cache -t {image} ./docker/llamacpp"
+    return True, "", ""
+
+
 def _gguf_weights_gb(dirname, gguf_include=None):
     """模型权重总占用（GiB，1024 进制）：GGUF 全分片 + mmproj。
 
@@ -961,6 +1071,11 @@ def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=
     # 多卡分层：由 plan 拼 --split-mode/--tensor-split（单卡时 plan 里就是 None）。
     # extra_args 里已手传同名 flag 时以手传为准，不重复注入。
     _ea = [str(a) for a in (extra_args or [])]
+    if not any(a in ("-t", "--threads") for a in _ea):
+        # 未显式指定 -t 时按宿主物理核注入：写死值随机器而异（曾在 models.json 写 -t 16
+        # 拖慢 offload 模型近半），运行时自适应；models.json 显式给了 -t 则以显式值为准
+        _nthread = _physical_cores()
+        cmd += ["-t", str(_nthread), "-tb", str(_nthread)]
     if plan.get("split_mode") and not any(a.startswith("--split-mode") for a in _ea):
         cmd += ["--split-mode", str(plan["split_mode"])]
         if plan.get("tensor_split") and not any(a.startswith("--tensor-split") for a in _ea):
@@ -986,6 +1101,10 @@ def _run_llamacpp(name, dirname, gpus, max_len, think, gguf_include, extra_args=
     if plan.get("tight") and plan["parallel"] <= 1 and not plan.get("cache_type"):
         log(f"{name}: KV 预算紧张仅够单 slot；如需更高并发，可在 models.json 的 "
             f"gw 设 kv_quant=q8_0（KV 显存减半，轻微精度影响）或加卡")
+    image = image or LLAMACPP_IMAGE
+    ok, why, hint = check_llamacpp_image(image)
+    if not ok:
+        raise RuntimeError(f"llama.cpp 镜像与当前机器不匹配：{why}。请重编后重试：{hint}")
     _remove_container(f"ai-llamacpp-{name}")
     # 镜像自带的 HEALTHCHECK 探测 8080，而我们跑 8000——覆盖为 8000，避免误报 unhealthy
     hc = docker.types.Healthcheck(
