@@ -2760,6 +2760,9 @@ DSH_LIFT_THROTTLE = float(os.environ.get("DSH_LIFT_THROTTLE", "15"))
 # 上游 HTTP 能应答之后，remote.mux 的 WS handler 还要晚一点才挂上（实测刚拉起的头几百毫秒，
 # WS 握手会被上游直接断链）。这是"看似可用、其实未就绪"的窗口，所以只在握手阶段兜一下。
 DSH_WS_CONNECT_WAIT = float(os.environ.get("DSH_WS_CONNECT_WAIT", "10"))
+# DSH 上游客户端的超时。必须与全局 http 一致（长任务/SSE/大文件都靠它），只是这个 client
+# 改成"一请求一个"之后要在原地再写一遍 —— 见 dsh_proxy 的注释。
+_DSH_TIMEOUT = httpx.Timeout(3600.0, connect=10.0)
 DSH_HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                    "te", "trailer", "transfer-encoding", "upgrade", "content-length"}
 
@@ -2943,23 +2946,35 @@ async def _dsh_ws_establish(websocket, path, stack):
 
 
 async def dsh_proxy(request: Request, path: str = ""):
-    """DSH Web 的 HTTP 透传：请求体进、响应体按块出，SSE 与文件上传都不在网关侧攒整包。"""
+    """DSH Web 的 HTTP 透传：请求体进、响应体按块出，SSE 与文件上传都不在网关侧攒整包。
+
+    上游客户端必须"一个请求一个"，绝不能复用全局 http：httpx 的 client 自带 cookie jar，
+    会把上游下发给某个访客的会话 cookie 收下，再自动附给之后的每一个访客。实测后果是有人
+    登录一次之后，完全不带给凭据的访客请求 /dsh/ 也会从 401 变成 200 首页 —— 等于把登录态
+    广播给所有连得上 8000 的人，而 DSH 是能执行命令的 Web UI。一次性 client 的 jar 随请求
+    一起丢掉，跨访客串号就在结构上不可能发生（WS 侧本来就没有 jar，手工透传客户端头）。"""
     body = await request.body()
     url = _dsh_target(path, request.url.query)
     headers = _dsh_req_headers(request)
     up = None
+    client = None
     for attempt in (1, 2):
+        client = httpx.AsyncClient(timeout=_DSH_TIMEOUT)
         try:
-            up = await http.send(http.build_request(request.method, url, content=body,
-                                                    headers=headers), stream=True)
+            up = await client.send(client.build_request(request.method, url, content=body,
+                                                        headers=headers), stream=True)
             break
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             # 上游没在跑：先请宿主把它拉起来，就绪后重试一次；拉不起来才把 502 交回客户端
+            await client.aclose()
+            client = None
             if attempt == 1 and await _dsh_lift(f"{request.method} {request.url.path}"):
                 continue
             log(f"DSH 上游不可达 ({DSH_UPSTREAM}): {e}")
             break
         except Exception as e:
+            await client.aclose()
+            client = None
             log(f"DSH 转发失败 ({request.method} {request.url.path}): {e}")
             break
     if up is None:
@@ -2971,7 +2986,10 @@ async def dsh_proxy(request: Request, path: str = ""):
             async for chunk in up.aiter_raw():
                 yield chunk
         finally:
-            await up.aclose()
+            with suppress(Exception):
+                await up.aclose()
+            with suppress(Exception):
+                await client.aclose()          # 这个请求专属的连接，流走完才放
 
     resp = StreamingResponse(gen(), status_code=up.status_code)
     resp.raw_headers = _dsh_resp_headers(up)
