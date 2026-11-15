@@ -15,6 +15,11 @@
              推理请求还可带 X-Gateway-Load-Async:1（+可选 X-Gateway-GPUs:0）走 202 异步协商，
              网关把 loading→ready / failed 状态机（transitions）返回给客户端。
              详见 GET /v1/gateway/capabilities 的 negotiation 一节。
+• 透传     — DSH_PROXY_PREFIX 非空时（部署默认 /dsh）把该前缀下的 HTTP 与 WebSocket 原样反代到宿主上
+             的 DeepSeek Harness Web（DSH_PROXY_UPSTREAM）。dsh 拒绝绑定 wildcard 地址，只能绑单个具体
+             网卡地址，所以由网关这个 0.0.0.0 入口代它对外，本机仍只有 8000 一个监听口。
+             DSH_LIFT_SOCKET 指到宿主 systemd 触发 socket（容器内路径）时，上游没在跑就通知宿主拉起
+             dsh-web.service，等它监听后重试本请求——网关看不见宿主文件系统，也没有任何宿主执行权限。
 
 内部规则：
 1. /v1/models 暴露全部已下载模型，而不是只暴露当前加载的那个
@@ -36,12 +41,12 @@
 仅加入 ai_default 内网，不暴露宿主机端口。
 所有 docker/nvidia-smi 同步调用均经 asyncio.to_thread 包裹，不阻塞事件循环。
 """
-import asyncio, calendar, fnmatch, json, os, re, subprocess, time, urllib.request
-from contextlib import asynccontextmanager
+import asyncio, calendar, fnmatch, json, os, re, socket, subprocess, time, urllib.request
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 
 import docker
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway_protocols import (
@@ -2736,6 +2741,308 @@ async def route(path: str, request: Request):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON",
                                        "type": "invalid_request_error"}}, status_code=400)
     return await proxy(name, request)
+
+
+# ---------- DSH Web 透传（前缀反代）----------
+# dsh 的 --host 明确拒绝 wildcard：把能执行任意命令的 Web UI 绑到 0.0.0.0 等于对整个网络开放 RCE，
+# 只允许绑单个具体地址。网关本来就是本机 0.0.0.0 上的唯一入口，所以让 dsh 只绑 docker 桥地址
+# （宿主侧 172.17.0.1），由网关在 DSH_PROXY_PREFIX 下反代过去 —— 对外仍然只有 8000 一个端口。
+# DSH 前端是 <base href="./">，静态资源与 WS 地址都按 document.baseURI 解析，所以挂前缀不用改写 HTML；
+# 上行必须把客户端看到的 Host 头原样带给上游 —— DSH 把 authority 签进了会话 cookie 的值里，
+# 改写成 172.17.0.1:3080 会让浏览器域下的 cookie 与上游校验的 authority 不一致，登录态直接失效。
+DSH_PREFIX = os.environ.get("DSH_PROXY_PREFIX", "").strip().rstrip("/")
+DSH_UPSTREAM = os.environ.get("DSH_PROXY_UPSTREAM", "http://host.docker.internal:3080")
+DSH_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+# 上游没在跑时向宿主请求"把 DSH 拉起来"：容器内看到的 systemd socket 路径，空=只回 502 不自愈。
+DSH_LIFT_SOCKET = os.environ.get("DSH_LIFT_SOCKET", "")
+DSH_LIFT_TIMEOUT = float(os.environ.get("DSH_LIFT_TIMEOUT", "30"))
+DSH_LIFT_THROTTLE = float(os.environ.get("DSH_LIFT_THROTTLE", "15"))
+# 上游 HTTP 能应答之后，remote.mux 的 WS handler 还要晚一点才挂上（实测刚拉起的头几百毫秒，
+# WS 握手会被上游直接断链）。这是"看似可用、其实未就绪"的窗口，所以只在握手阶段兜一下。
+DSH_WS_CONNECT_WAIT = float(os.environ.get("DSH_WS_CONNECT_WAIT", "10"))
+DSH_HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                   "te", "trailer", "transfer-encoding", "upgrade", "content-length"}
+
+try:
+    from websockets.asyncio.client import connect as _dsh_ws_connect
+except ModuleNotFoundError:
+    try:
+        from websockets.client import connect as _dsh_ws_connect
+    except ModuleNotFoundError:
+        _dsh_ws_connect = None       # 缺 websockets 时 HTTP 照走，WS 路由拒绝握手而不是拖垮网关
+
+_dsh_lift_lock = asyncio.Lock()
+_dsh_lift_at = 0.0
+
+
+def _dsh_upstream_addr():
+    target = httpx.URL(DSH_UPSTREAM)
+    return target.host, target.port or (443 if target.scheme == "https" else 80)
+
+
+async def _dsh_up_ready(timeout=1.0, want_http=True):
+    """上游是否可用。
+
+    want_http=False 只看端口在不在监听（毫秒级，给常态热路径用）；
+    want_http=True 还要它真的能回 HTTP 状态行——dsh 是先 listen、后挂路由的，
+    中间那一瞬请求会被回 404，所以刚从没起来的状态把它判定为"就绪"时，
+    只验 TCP 会把第一个请求送进空窗（实测过：拉起来成功但首页 404）。
+    探测不带 cookie，401 就是它正常的回答，任何状态行都算可用。"""
+    host, port = _dsh_upstream_addr()
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    except Exception:
+        return False
+    writer.close()
+    with suppress(Exception):
+        await writer.wait_closed()
+    if not want_http:
+        return True
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as probe:
+            await probe.get(f"{DSH_UPSTREAM}/")
+    except Exception:
+        return False
+    return True
+
+
+async def _dsh_lift(reason):
+    """上游没在跑时请宿主把它拉起来，并等到它能应答 HTTP；返回是否可用。
+
+    触发方式是"连一下 systemd socket"——socket activation 只看连接这件事，不需要协议，
+    因此网关既不必看见宿主文件系统，也不必拿到任何宿主执行权限，具体启动命令留在
+    dsh-web.service 里。锁 + 节流只对"触发"这一步生效；等待就绪是每个请求自己都要做的，
+    否则并发请求里只有第一个能等到，其余会凭 502 各回各家。"""
+    global _dsh_lift_at
+    if not DSH_LIFT_SOCKET:
+        return False
+    if await _dsh_up_ready(want_http=False):
+        return True                                          # 常态：在跑，不抢锁
+    async with _dsh_lift_lock:
+        now = time.time()
+        if now - _dsh_lift_at >= DSH_LIFT_THROTTLE:
+            _dsh_lift_at = now
+            try:
+                _, writer = await asyncio.open_unix_connection(DSH_LIFT_SOCKET)
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()    # 立刻把 fd 还掉，别在事件循环里留半关连接
+            except Exception as e:
+                log(f"DSH 触发拉起失败 ({DSH_LIFT_SOCKET}): {e} —— "
+                    f"宿主侧查 systemctl --user status dsh-lift.socket")
+                return False
+            log(f"DSH 上游未运行（{reason}），已触发宿主侧拉起，最多等 {DSH_LIFT_TIMEOUT:.0f}s")
+        else:
+            log(f"DSH 上游未运行（{reason}），{DSH_LIFT_THROTTLE:.0f}s 内已触发过，这次只等就绪")
+        deadline = time.time() + DSH_LIFT_TIMEOUT
+        while time.time() < deadline:
+            await asyncio.sleep(0.5)
+            if await _dsh_up_ready():
+                log(f"DSH 已就绪 ({DSH_UPSTREAM})")
+                return True
+        log(f"DSH 拉起超时：{DSH_LIFT_TIMEOUT:.0f}s 内 {DSH_UPSTREAM} 仍未应答")
+        return False
+
+
+def _dsh_target(path, query):
+    url = f"{DSH_UPSTREAM.rstrip('/')}/{path.lstrip('/')}"
+    return f"{url}?{query}" if query else url
+
+
+def _dsh_req_headers(conn):
+    headers, cookies = {}, []
+    for raw_k, raw_v in conn.headers.raw:
+        k, v = raw_k.decode("latin-1"), raw_v.decode("latin-1")
+        if k in DSH_HOP_HEADERS:
+            continue
+        if k == "cookie":
+            cookies.append(v)        # 多条 Cookie 头要合并：dict 赋值会把前面的覆盖掉
+            continue
+        headers[k] = v
+    if cookies:
+        headers["cookie"] = "; ".join(cookies)
+    # 客户端没提 Accept-Encoding 时必须显式压掉 httpx 的默认值：否则上游回 gzip 体，
+    # 而客户端声明的是 identity，只认自己声明过编码的客户端会当成坏响应。
+    headers.setdefault("accept-encoding", "identity")
+    return headers
+
+
+def _dsh_resp_headers(upstream):
+    # 返回 raw 列表而不是 dict：上游可能下发多个 Set-Cookie，压成 dict 只剩最后一个
+    return [(k.lower().encode("latin-1"), v.encode("latin-1"))
+            for k, v in upstream.headers.multi_items() if k.lower() not in DSH_HOP_HEADERS]
+
+
+async def _dsh_ws_handover(websocket, path):
+    """返回 (握手 URI, 预建 socket) 或 (上游 URI, None)。
+
+    WS 的 Host 只能由 URI 推导：往 additional_headers 里塞 host 不会覆写，而是多出一条重复 Host 头
+    （请求走私隐患）。所以明文上游用"客户端 authority 当 URI + 预建 socket 连真上游"来同时满足
+    Host=浏览器看到的地址（DSH 的 cookie 把 authority 签进值里）和 TCP 落到 dsh。
+    上游配成 https 时不能这么做——明文 socket 会绕过 TLS，交回 websockets 自己连，Host 便是上游域名。"""
+    target = httpx.URL(DSH_UPSTREAM)
+    query = websocket.url.query
+    tail = path.lstrip("/")
+    if target.scheme == "https":
+        base = f"wss://{target.host}" + (f":{target.port}" if target.port != 443 else "")
+        url = f"{base}{target.path.rstrip('/')}/{tail}"
+        return (f"{url}?{query}" if query else url), None
+    authority = next((v.decode("latin-1") for k, v in websocket.headers.raw
+                      if k.decode("latin-1") == "host"), "") or f"{target.host}:{target.port or 80}"
+    url = f"ws://{authority}/{tail}"
+    url = f"{url}?{query}" if query else url
+    sock = await asyncio.to_thread(socket.create_connection, (target.host, target.port or 80), 5)
+    return url, sock
+
+
+# 可重试的握手失败：连接级/协议级，多半是上游还在启动。InvalidStatus（上游明确回了
+# 401/403）不在其中 —— 那说明链路是通的、只是没权限，重试只是白等。
+_DSH_WS_RETRYABLE = {"InvalidMessage", "InvalidUpgrade", "ConnectionClosed",
+                     "ConnectionClosedError", "ConnectionClosedOK", "EOFError"}
+
+
+def _dsh_ws_still_starting(exc):
+    return isinstance(exc, (OSError, asyncio.TimeoutError)) or type(exc).__name__ in _DSH_WS_RETRYABLE
+
+
+async def _dsh_ws_establish(websocket, path, stack):
+    """和上游完成 WS 握手，返回已建立的上游连接（关闭交给 stack）。
+
+    失败分两类：上游还在启动（预建 socket 被拒、或握手时对面直接断线）就重试到
+    DSH_WS_CONNECT_WAIT 为止；鉴权/协议明确拒绝则原样抛出。重试期间客户端还没被 accept
+    （accept 必须等上游握手成功，否则子协议没法协商），所以 uvicorn 也不会提前给它答复。"""
+    headers = _dsh_req_headers(websocket)
+    reserved = ("host", "origin", "accept-encoding")
+    deadline = time.time() + DSH_WS_CONNECT_WAIT
+    attempt = 0
+    while True:
+        attempt += 1
+        sock = None
+        try:
+            url, sock = await _dsh_ws_handover(websocket, path)
+            return await stack.enter_async_context(_dsh_ws_connect(
+                url, sock=sock,
+                max_size=None, origin=headers.get("origin"),
+                # 客户端没请求子协议时 scope 给的是空列表，原样传下去会让上游握手 400
+                subprotocols=websocket.scope.get("subprotocols") or None,
+                additional_headers=[(k, v) for k, v in headers.items()
+                                    if k.lower() not in reserved
+                                    and not k.lower().startswith("sec-websocket-")]))
+        except Exception as e:
+            if sock is not None:      # 握手没成，websockets 不会替我们关传进去的 socket
+                with suppress(OSError):
+                    sock.close()
+            if not _dsh_ws_still_starting(e):
+                raise                                     # 鉴权/协议明确拒绝：重试没意义
+            if time.time() >= deadline:
+                log(f"DSH WS 等上游就绪超时（{attempt} 次）: {type(e).__name__}: {e}")
+                raise
+            if attempt == 1:                              # 只记第一次，避免刷屏
+                log(f"DSH WS 上游未就绪（{type(e).__name__}），等它挂好 handler")
+            await asyncio.sleep(0.5)
+
+
+async def dsh_proxy(request: Request, path: str = ""):
+    """DSH Web 的 HTTP 透传：请求体进、响应体按块出，SSE 与文件上传都不在网关侧攒整包。"""
+    body = await request.body()
+    url = _dsh_target(path, request.url.query)
+    headers = _dsh_req_headers(request)
+    up = None
+    for attempt in (1, 2):
+        try:
+            up = await http.send(http.build_request(request.method, url, content=body,
+                                                    headers=headers), stream=True)
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # 上游没在跑：先请宿主把它拉起来，就绪后重试一次；拉不起来才把 502 交回客户端
+            if attempt == 1 and await _dsh_lift(f"{request.method} {request.url.path}"):
+                continue
+            log(f"DSH 上游不可达 ({DSH_UPSTREAM}): {e}")
+            break
+        except Exception as e:
+            log(f"DSH 转发失败 ({request.method} {request.url.path}): {e}")
+            break
+    if up is None:
+        return JSONResponse({"error": {"message": f"DSH 上游不可达: {DSH_UPSTREAM}",
+                                       "type": "proxy_error"}}, status_code=502)
+
+    async def gen():
+        try:
+            async for chunk in up.aiter_raw():
+                yield chunk
+        finally:
+            await up.aclose()
+
+    resp = StreamingResponse(gen(), status_code=up.status_code)
+    resp.raw_headers = _dsh_resp_headers(up)
+    return resp
+
+
+async def dsh_ws(websocket: WebSocket, path: str = ""):
+    """WebSocket 桥：DSH 的实时流（/api/remote.mux）与远程终端都走这条链路。"""
+    if _dsh_ws_connect is None:
+        await websocket.close(code=1011)
+        return
+    # 上游没在监听时预建 socket 会直接抛；先走一次拉起，让打开页面的第一个 WS 也能唤醒 DSH
+    if DSH_LIFT_SOCKET and not await _dsh_lift(f"websocket {path}"):
+        await websocket.close(code=1011)
+        return
+    async with AsyncExitStack() as stack:
+        try:
+            up = await _dsh_ws_establish(websocket, path, stack)
+        except Exception as e:
+            log(f"DSH WS 桥失败: {type(e).__name__}: {e}")
+            try:
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+            return
+        try:
+            await websocket.accept(subprotocol=up.subprotocol)
+
+            async def client_to_upstream():
+                while True:
+                    msg = await websocket.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        return
+                    data = msg.get("bytes")
+                    await up.send(data if data is not None else msg.get("text", ""))
+
+            async def upstream_to_client():
+                async for msg in up:
+                    if isinstance(msg, (bytes, bytearray)):
+                        await websocket.send_bytes(bytes(msg))
+                    else:
+                        await websocket.send_text(msg)
+
+            tasks = [asyncio.create_task(client_to_upstream()),
+                     asyncio.create_task(upstream_to_client())]
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:      # 单边异常要留痕，否则表现为"实时流静默断掉"无从排查
+                    exc = t.exception()
+                    if exc is not None:
+                        log(f"DSH WS 结束: {type(exc).__name__}: {exc}")
+            finally:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            log(f"DSH WS 桥失败: {type(e).__name__}: {e}")
+            try:
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+
+
+if DSH_PREFIX:
+    # 只注册带 {path} 的模板：裸 /dsh 交给 Starlette 的 redirect_slashes 307 到 /dsh/，
+    # 相对资源才能按 baseURI 解析到 /dsh/assets/…；再补一条精确路由反而会把这个跳转吃掉。
+    app.add_api_route(f"{DSH_PREFIX}/{{path:path}}", dsh_proxy, methods=DSH_METHODS,
+                      include_in_schema=False)
+    app.add_api_websocket_route(f"{DSH_PREFIX}/{{path:path}}", dsh_ws)
+    log(f"DSH Web 透传: {DSH_PREFIX}/ -> {DSH_UPSTREAM}"
+        + ("" if _dsh_ws_connect else "（警告：镜像缺 websockets，WebSocket 不可用）"))
 
 
 async def _preload(m):

@@ -13,6 +13,16 @@ services:
     ports: ["0.0.0.0:8000:8000"]
     environment:
       - HOST_ROOT=${HOST_ROOT:-/home/pc/AI}
+      # DSH Web 透传：dsh 拒绝绑 0.0.0.0（wildcard 会把可执行命令的 Web UI 摊给所有网卡），
+      # 只能绑单个具体地址，所以它绑 docker 桥地址，由网关在 /dsh 前缀下代它对外——入口仍只有 8000。
+      # 置空 DSH_PROXY_PREFIX 即关闭透传。
+      - DSH_PROXY_PREFIX=${DSH_PROXY_PREFIX:-/dsh}
+      - DSH_PROXY_UPSTREAM=${DSH_PROXY_UPSTREAM:-http://host.docker.internal:3080}
+      # DSH 没在跑时由网关通知宿主拉起：连一下 systemd socket 即触发 dsh-lift.service。
+      # 挂目录而不是 socket 文件——socket 被 systemd 重建后，容器里看到的仍是新 inode。
+      # 置空 DSH_LIFT_SOCKET（并去掉下面的挂载）即退回"上游没跑就 502"。
+      - DSH_LIFT_SOCKET=${DSH_LIFT_SOCKET:-/run/dsh-lift/sock}
+      - DSH_LIFT_TIMEOUT=${DSH_LIFT_TIMEOUT:-30}
     extra_hosts:
       # 访问 ComfyUI（/free、/queue）：ai-comfyui-gpu1 不在 compose 网络，统一走宿主
       - "host.docker.internal:host-gateway"
@@ -20,6 +30,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./models.json:/opt/models.json:ro
       - ./data/gateway:/data/gateway
+      # 拉起触发器：宿主 ~/.dsh-lift（systemd user socket），容器内路径见 DSH_LIFT_SOCKET
+      - ${DSH_LIFT_DIR:-/home/pc/.dsh-lift}:/run/dsh-lift
       # 容器内路径必须等于宿主机路径：网关要把该路径原样传给后端容器的 bind
       - ${HOST_ROOT:-/home/pc/AI}/models/llm:${HOST_ROOT:-/home/pc/AI}/models/llm:ro
     deploy:
