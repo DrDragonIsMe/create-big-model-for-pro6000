@@ -159,6 +159,15 @@ def model_dir(name, d=None):
     不配 variant 时保持历史行为：官方 FP8 目录优先，回落主目录。
     variant 显式指定时严格取该精度——精度是配置意图，不能静默换成另一种，
     目录缺失就报未下载，由宿主机 menu.py / manage.sh 去补。"""
+    # 别名解析：如果 name 是别名，先映射到真实模型名
+    try:
+        with open(MODELS_JSON, encoding="utf-8") as f:
+            meta = json.load(f).get("meta", {})
+        aliases = meta.get("aliases", {})
+        if name in aliases:
+            name = aliases[name]
+    except Exception:
+        pass
     variant = ((d or {}).get("gw") or {}).get("variant")
     if d is None:
         # 4 处校验型调用点（/v1/models、capabilities、load、proxy）没带条目：
@@ -1238,15 +1247,28 @@ def clamp_max_tokens(name, man, body):
             payload[key] = max(min_out, allowed)
             log(f"{name}: {key} {mt} -> {payload[key]}（prompt 估 {est_prompt} tokens）"
                 + ("［保底预算，超出由后端 400 触发 compact］" if allowed < min_out else ""))
+    # 修正 reasoning_effort：claude 可能发 vllm 不支持的值
+    effort = payload.get("reasoning_effort")
+    if effort == "high":
+        payload["reasoning_effort"] = "xhigh"
+        log(f"{name}: reasoning_effort high -> xhigh")
     return json.dumps(payload).encode()
 
 
 async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
-    b = backends.get(name)
+    # 别名解析
+    try:
+        with open(MODELS_JSON, encoding="utf-8") as f:
+            meta = json.load(f).get("meta", {})
+        aliases = meta.get("aliases", {})
+        real_name = aliases.get(name, name)
+    except Exception:
+        real_name = name
+    b = backends.get(real_name)
     if b and b["status"] == "ready":
         return b
     async with ops_lock:
-        b = backends.get(name)
+        b = backends.get(real_name)
         if b and b["status"] == "ready":
             return b
         if b and b["status"] in ("loading", "adopted"):
@@ -1256,23 +1278,23 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
                            detail=f"{name} 已在加载/认领中，等待健康确认…",
                            target_gpus=b["gpus"])
             try:
-                await wait_ready(name, b["container"], timeout=180)
+                await wait_ready(real_name, b["container"], timeout=180)
                 b["status"] = "ready"
                 b["last_used"] = time.time()
                 log(f"{name} 健康确认通过")
                 return b
             except Exception:
                 await asyncio.to_thread(_remove_backend_containers, b)
-                backends.pop(name, None)
-        d = man[name]
+                backends.pop(real_name, None)
+        d = man[real_name]
         engine = d.get("engine", "vllm")
         gw = d.get("gw", {})
         gpus = [int(x) for x in gw.get("gpus", "1").split(",")]
         util = float(gw.get("util", 0.92))
         max_len = int(gw.get("max_len", d.get("max_ctx", d.get("ctx_default", 32768))))
         think = bool(d.get("think"))
-        cname = f"ai-{engine}-{name}"
-        dirname = model_dir(name, d)
+        cname = f"ai-{engine}-{real_name}"
+        dirname = model_dir(real_name, d)
         if not dirname:
             raise RuntimeError(f"模型 {name} 未下载")
 
@@ -1419,7 +1441,7 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
         launched = []
         try:
             for grp, node in zip(groups, cnodes):
-                await asyncio.to_thread(_run_backend, name, dirname, grp, util, max_len,
+                await asyncio.to_thread(_run_backend, real_name, dirname, grp, util, max_len,
                                         think, gw.get("extra_args"), gw.get("env"),
                                         engine, d.get("gguf_include"), plan, node,
                                         image=gw.get("image"),
@@ -1430,7 +1452,7 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
             for node in launched:
                 await asyncio.to_thread(_remove_container, node)
             raise
-        backends[name] = {"container": cnodes[0], "gpus": gpus, "util": util,
+        backends[real_name] = {"container": cnodes[0], "gpus": gpus, "util": util,
                           "in_flight": 0, "last_used": time.time(), "status": "loading",
                           "engine": engine,
                           "slots": plan["parallel"] if plan else None,
@@ -1438,7 +1460,7 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
                           "peers": [{"container": c, "gpus": g, "in_flight": 0}
                                     for c, g in zip(cnodes, groups)]}
         # 所有副本都拉起后再并发等就绪：ops_lock 全程持有，串行等会把冷启动墙钟翻倍
-        res = await asyncio.gather(*(wait_ready(name, node, timeout=900) for node in cnodes),
+        res = await asyncio.gather(*(wait_ready(real_name, node, timeout=900) for node in cnodes),
                                    return_exceptions=True)
         ready, ready_groups, dead = [], [], []
         for node, grp, r in zip(cnodes, groups, res):
@@ -1449,20 +1471,20 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
                 ready_groups.append(grp)
         if not ready:
             # 全起不来：与单副本旧行为一致——摘掉登记并抛出，容器留着让人 docker logs 排查
-            backends.pop(name, None)
+            backends.pop(real_name, None)
             raise dead[0][1]
         for node, r in dead:
             # 部分副本失败不拖垮其它副本：删掉它释放显存，剩下的照常服务
             await asyncio.to_thread(_remove_container, node)
             log(f"{name} 副本 {node} 就绪失败，已删除（不影响其它 {len(ready)} 个副本）: {r}")
-        backends[name] = {"container": ready[0], "gpus": gpus, "util": util,
+        backends[real_name] = {"container": ready[0], "gpus": gpus, "util": util,
                           "in_flight": 0, "last_used": time.time(), "status": "loading",
                           "engine": engine, "slots": plan["parallel"] if plan else None,
                           "replicas": len(ready),
                           "peers": [{"container": c, "gpus": g, "in_flight": 0}
                                     for c, g in zip(ready, ready_groups)]}
-        backends[name]["status"] = "ready"
-        backends[name]["last_used"] = time.time()
+        backends[real_name]["status"] = "ready"
+        backends[real_name]["last_used"] = time.time()
         log(f"{name} 就绪"
             + (f"：{len(ready)} 副本 {list(zip(ready, ready_groups))}"
                if len(groups) > 1 else ""))
@@ -1472,7 +1494,7 @@ async def ensure_loaded(name, man, want_gpus=None, op=None, want_replicas=None):
                               + (f"，{len(ready)} 副本每副本 GPU {ready_groups}"
                                  if len(groups) > 1 else ""),
                        target_gpus=gpus)
-        return backends[name]
+        return backends[real_name]
 
 
 # ---------- HTTP ----------
@@ -2303,7 +2325,15 @@ async def gateway_ops_get(request_id: str):
 
 async def proxy(name, request: Request):
     man = await asyncio.to_thread(load_manifest)
-    if name not in man or not model_dir(name):
+    # 别名解析
+    try:
+        with open(MODELS_JSON, encoding="utf-8") as f:
+            meta = json.load(f).get("meta", {})
+        aliases = meta.get("aliases", {})
+        real_name = aliases.get(name, name)
+    except Exception:
+        real_name = name
+    if real_name not in man or not model_dir(real_name):
         return JSONResponse({"error": {"message": f"模型 '{name}' 不存在或未下载",
                                        "type": "invalid_request_error"}}, status_code=404)
     # 异步协商：客户端可带 X-Gateway-Load-Async:1（+ 可选 X-Gateway-GPUs:0）让未加载模型的
@@ -2556,7 +2586,15 @@ def _release_chat_backend(backend, peer):
 async def _send_chat(name, manifest, body):
     if not name:
         raise ProtocolError("缺少 model 字段")
-    if name not in manifest or not await asyncio.to_thread(model_dir, name):
+    # 别名解析
+    try:
+        with open(MODELS_JSON, encoding="utf-8") as f:
+            meta = json.load(f).get("meta", {})
+        aliases = meta.get("aliases", {})
+        real_name = aliases.get(name, name)
+    except Exception:
+        real_name = name
+    if real_name not in manifest or not await asyncio.to_thread(model_dir, real_name):
         raise ProtocolError(f"模型 '{name}' 不存在或未下载")
     body = json.loads(clamp_max_tokens(name, manifest, json.dumps(body, ensure_ascii=False).encode()))
     if body.get("stream"):
@@ -2564,7 +2602,7 @@ async def _send_chat(name, manifest, body):
         if isinstance(options, dict):
             options["include_usage"] = True
     try:
-        backend = await ensure_loaded(name, manifest)
+        backend = await ensure_loaded(real_name, manifest)
     except ResourceError as e:
         raise UpstreamError(503, {"error": {"message": str(e), "type": "insufficient_resources"}})
     except Exception as e:
@@ -2573,6 +2611,7 @@ async def _send_chat(name, manifest, body):
     peer = _pick_peer(backend)
     peer["in_flight"] = peer.get("in_flight", 0) + 1
     backend["last_used"] = time.time()
+    body["model"] = real_name
     url = f"http://{peer['container']}:8000/v1/chat/completions"
     try:
         req = http.build_request("POST", url, content=json.dumps(body, ensure_ascii=False).encode(),
